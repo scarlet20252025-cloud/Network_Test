@@ -29,6 +29,8 @@ param(
 
   [string]$RemoteHost = 'pcs',
   [int]$SocksPort = 10808,
+  # HTTP 代理端口：Windows 系统代理只认 HTTP，不能直接填 SOCKS 端口
+  [int]$HttpPort = 10809,
   [string]$ProxyMode = 'System'   # System = 切系统代理；App = 只建隧道，自己给应用配
 )
 
@@ -52,6 +54,18 @@ function Test-Admin {
 function Get-KeeperProc {
   Get-CimInstance Win32_Process -Filter "Name='powershell.exe' or Name='pwsh.exe'" |
     Where-Object { $_.CommandLine -like "*ssh-tunnel-keeper.ps1*" }
+}
+
+function Test-PortOpen {
+  param([int]$Port, [int]$TimeoutMs = 300)
+  # 与 Test-SocksAlive 同样的理由：不用 Test-NetConnection（关闭端口要等 14.3s）
+  try {
+    $c = New-Object Net.Sockets.TcpClient
+    $iar = $c.BeginConnect('127.0.0.1', $Port, $null, $null)
+    $ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+    $c.Close()
+    return [bool]$ok
+  } catch { return $false }
 }
 
 function Test-SocksAlive {
@@ -93,7 +107,9 @@ function Get-ProxyState {
 switch ($Action) {
 
   'On' {
-    if ((Get-ProxyState).Enabled -and (Get-ProxyState).Server -eq "127.0.0.1:$SocksPort" -and (Test-SocksAlive)) {
+    $ps = Get-ProxyState
+    $alreadyOn = $ps.Enabled -and ($ps.Server -eq "127.0.0.1:$SocksPort" -or $ps.Server -eq "http://127.0.0.1:$HttpPort") -and (Test-SocksAlive)
+    if ($alreadyOn) {
       Write-Host "借网已在运行中（SOCKS 127.0.0.1:$SocksPort 存活）" -ForegroundColor Green
       return
     }
@@ -116,15 +132,57 @@ switch ($Action) {
     }
     Write-Host "  SOCKS 127.0.0.1:$SocksPort 已就绪" -ForegroundColor DarkGray
 
+    # ---- 启动双协议代理（HTTP+SOCKS5 单端口）----
+    # 关键：Windows 系统代理只支持 HTTP 代理。把 ProxyServer 直接写成 SOCKS5 端口
+    # 会让所有读系统代理的程序（浏览器/.NET/git）把 SOCKS5 当 HTTP 代理连 —— 秒失败。
+    # 实测：ProxyServer=127.0.0.1:10808(SOCKS5) 时 curl -x http 返回 000/1.4ms。
+    $BridgeScript = Join-Path $ToolsDir 'dual-proxy.mjs'
+    $NodeExe = 'D:\nodejs\node.exe'
+    if (-not (Test-Path $NodeExe)) {
+      $nc = Get-Command node -ErrorAction SilentlyContinue
+      if ($nc) { $NodeExe = $nc.Source }
+    }
+
+    if ((Test-Path $BridgeScript) -and $NodeExe) {
+      $bridgeProc = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*dual-proxy.mjs*' }
+      if (-not $bridgeProc) {
+        Write-Step "启动双协议代理（HTTP+SOCKS5 单端口 $HttpPort）"
+        # 用 WMI 创建：完全脱离父进程，不会随当前控制台退出被回收
+        $cmdLine = "`"$NodeExe`" `"$BridgeScript`" --listen $HttpPort --socks $SocksPort"
+        $cr = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine }
+        if ($cr.ReturnValue -ne 0) { Write-Host "  启动失败 code=$($cr.ReturnValue)" -ForegroundColor Yellow }
+        Start-Sleep -Seconds 2
+      }
+      else {
+        Write-Host "  双协议代理已在运行（PID $($bridgeProc.ProcessId)）" -ForegroundColor DarkGray
+      }
+
+      # 等端口就绪
+      $bridgeOk = $false
+      for ($i = 0; $i -lt 15; $i++) {
+        if (Test-PortOpen -Port $HttpPort) { $bridgeOk = $true; break }
+        Start-Sleep -Milliseconds 400
+      }
+      if ($bridgeOk) { Write-Host "  HTTP 代理 127.0.0.1:$HttpPort 已就绪" -ForegroundColor DarkGray }
+      else { Write-Host "  ⚠ HTTP 代理未起来，系统代理将退回 SOCKS 端口（多数程序不可用）" -ForegroundColor Yellow }
+    }
+    else {
+      Write-Host "  ⚠ 未找到 dual-proxy.mjs 或 node，系统代理只能填 SOCKS 端口" -ForegroundColor Yellow
+      $bridgeOk = $false
+    }
+
     if ($ProxyMode -eq 'System') {
-      Write-Step "切换系统代理到 SOCKS 127.0.0.1:$SocksPort"
+      Write-Step "切换系统代理到 HTTP 127.0.0.1:$HttpPort"
       $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
       # 备份当前值，供 Off 还原
       if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir }
       $cur = Get-ProxyState
       Set-Content (Join-Path $StateDir 'proxy-backup.txt') -Value "$($cur.Enabled)|$($cur.Server)" -Encoding ASCII
       Set-ItemProperty $k -Name ProxyEnable -Value 1 -Type DWord
-      Set-ItemProperty $k -Name ProxyServer -Value "127.0.0.1:$SocksPort" -Type String
+      $sysProxy = "127.0.0.1:$SocksPort"
+      if ($bridgeOk) { $sysProxy = "http://127.0.0.1:$HttpPort" }
+      Set-ItemProperty $k -Name ProxyServer -Value $sysProxy -Type String
       # 广播 Internet Settings 变更，让 Explorer / 已运行的浏览器立刻感知
       # （部分程序只在收到 OPTIONS_CHANGED 时才重读注册表）
       $sig = @'

@@ -11,6 +11,26 @@
 WireGuard 只搭好了服务端，本机从未安装客户端、也从未连上过。
 详见 [docs/实测报告.md](docs/实测报告.md)。
 
+## 架构（v0.4）
+
+```
+浏览器/系统代理 ──HTTP──▶ dual-proxy(10809) ──SOCKS5──▶ ssh -D(10808) ──▶ 远端 ──▶ Internet
+                              │
+                              └── smart-resolve：github 系域名走候选 IP 池择优
+```
+
+**为什么需要 dual-proxy 这一层**：
+Windows 系统代理（`HKCU Internet Settings` 的 `ProxyServer`）**只支持 HTTP 代理**。
+把 `ProxyServer` 直接写成 SOCKS5 端口时，浏览器 / Electron / .NET / git 都会
+把 SOCKS5 当 HTTP 代理去连 —— 秒失败（实测 1.4ms 返回 000）。
+这就是「开了借网还是连不上 github」的真正原因。
+
+`dual-proxy.mjs` 在**单端口**上按首字节自动分流：
+- `0x05` → SOCKS5
+- `C` / `G` / `P` → HTTP（含 CONNECT 隧道）
+
+所以系统代理填 `http://127.0.0.1:10809` 能用，填 `socks5://127.0.0.1:10809` 也能用。
+
 ## ⚠️ 本仓库 git 操作必须走借网
 
 本机直连 github.com 已不通（21 秒超时）。仓库本地已配：
@@ -56,7 +76,12 @@ SSH 走的是**校内网直连**（3 跳，RTT 3–14ms），不经过 WireGuard
 | `tools/borrow-net.ps1` | 主控 CLI：`On` / `Off` / `Status` / `InstallStartup` / `UninstallStartup` |
 | `tools/ssh-tunnel-keeper.ps1` | 常驻保活，ssh 断了 5s 自动重连；单例锁 `borrow-net.keeper.lock` |
 | `tools/借网助手.ps1` | WinForms GUI（三态状态卡 + 出口 IP 对照 + 日志窗 + 托盘） |
+| `tools/dual-proxy.mjs` | **双协议代理**：HTTP + SOCKS5 单端口自动识别，解决系统代理只认 HTTP |
+| `tools/smart-resolve.mjs` | **IP 择优**：github 系域名候选 IP 池，绕过 DNS 返回的不可达 IP |
 | `tools/startup.ps1` | 登录自启管理：`Status`/`Install`/`Uninstall`/`Test`（启动文件夹方案，零权限） |
+| `tools/bw-probe.mjs` | 并发带宽测试，判断瓶颈是物理带宽还是 TCP 窗口 |
+| `tools/gh-probe.mjs` | github 稳定性统计采样（成功率 / 失败阶段分布） |
+| `tools/socks-layer-probe.mjs` | 分层定位 SOCKS 隧道失败在哪个阶段 |
 | `tools/net-quality.ps1` | 链路质量实测：可达性/抖动/丢包/吞吐/长连接/DNS |
 | `tools/egress-diag.ps1` | 逐源逐方式打印出口 IP 探测的耗时与错误 |
 | `tools/make-shortcut.ps1` | 生成桌面与开始菜单快捷方式（含自绘 ICO） |
