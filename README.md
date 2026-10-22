@@ -44,6 +44,7 @@ SSH 走的是**校内网直连**（3 跳，RTT 3–14ms），不经过 WireGuard
 | `tools/borrow-net.ps1` | 主控 CLI：`On` / `Off` / `Status` / `InstallStartup` / `UninstallStartup` |
 | `tools/ssh-tunnel-keeper.ps1` | 常驻保活，ssh 断了 5s 自动重连；单例锁 `borrow-net.keeper.lock` |
 | `tools/借网助手.ps1` | WinForms GUI（三态状态卡 + 出口 IP 对照 + 日志窗 + 托盘） |
+| `tools/startup.ps1` | 登录自启管理：`Status`/`Install`/`Uninstall`/`Test`（启动文件夹方案，零权限） |
 | `tools/net-quality.ps1` | 链路质量实测：可达性/抖动/丢包/吞吐/长连接/DNS |
 | `tools/egress-diag.ps1` | 逐源逐方式打印出口 IP 探测的耗时与错误 |
 | `tools/make-shortcut.ps1` | 生成桌面与开始菜单快捷方式（含自绘 ICO） |
