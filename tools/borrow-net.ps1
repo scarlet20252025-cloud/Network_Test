@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
   borrow-net.ps1 — 借网主控脚本（常驻版）
 
@@ -108,9 +108,18 @@ switch ($Action) {
 
   'On' {
     $ps = Get-ProxyState
-    $alreadyOn = $ps.Enabled -and ($ps.Server -eq "127.0.0.1:$SocksPort" -or $ps.Server -eq "http://127.0.0.1:$HttpPort") -and (Test-SocksAlive)
+
+    # 历史事故遗留：系统代理曾被写成 SOCKS5 端口（10808），浏览器全部打不开。
+    # 这里主动识别并修复，不把它当作「已开启」而直接 return。
+    if ($ps.Enabled -and $ps.Server -eq "127.0.0.1:$SocksPort") {
+      Write-Host "⚠ 检测到系统代理被写成 SOCKS5 端口（$($ps.Server)），浏览器会全部失败 —— 自动修复" -ForegroundColor Yellow
+      $ps = @{ Enabled = $false; Server = '' }
+    }
+
+    # 只有「系统代理指向 HTTP 端口」且「隧道存活」才算真的开着
+    $alreadyOn = $ps.Enabled -and $ps.Server -eq "http://127.0.0.1:$HttpPort" -and (Test-SocksAlive)
     if ($alreadyOn) {
-      Write-Host "借网已在运行中（SOCKS 127.0.0.1:$SocksPort 存活）" -ForegroundColor Green
+      Write-Host "借网已在运行中（SOCKS $SocksPort + HTTP $HttpPort 均存活）" -ForegroundColor Green
       return
     }
 
@@ -173,15 +182,26 @@ switch ($Action) {
     }
 
     if ($ProxyMode -eq 'System') {
-      Write-Step "切换系统代理到 HTTP 127.0.0.1:$HttpPort"
       $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+
+      # ⚠️ 硬性保护：HTTP 代理没起来时，绝对不写系统代理。
+      # 历史事故：回退写 "127.0.0.1:10808"(SOCKS5) 会让所有读系统代理的程序
+      # （浏览器 / .NET / Electron）把 SOCKS5 端口当 HTTP 代理连 —— 全部秒失败，
+      # 表现就是「开了借网浏览器完全不能上网」。宁可不动系统代理。
+      if (-not $bridgeOk) {
+        Write-Host "  ❌ HTTP 代理 $HttpPort 未就绪，已跳过系统代理切换" -ForegroundColor Red
+        Write-Host "     （不写 SOCKS 端口：系统代理只认 HTTP，写 SOCKS 会让浏览器全部打不开）" -ForegroundColor DarkGray
+        Write-Host "     隧道本身可用：应用可自行配 SOCKS5 127.0.0.1:$SocksPort" -ForegroundColor DarkGray
+        return
+      }
+
+      Write-Step "切换系统代理到 HTTP 127.0.0.1:$HttpPort"
       # 备份当前值，供 Off 还原
       if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir }
       $cur = Get-ProxyState
       Set-Content (Join-Path $StateDir 'proxy-backup.txt') -Value "$($cur.Enabled)|$($cur.Server)" -Encoding ASCII
       Set-ItemProperty $k -Name ProxyEnable -Value 1 -Type DWord
-      $sysProxy = "127.0.0.1:$SocksPort"
-      if ($bridgeOk) { $sysProxy = "http://127.0.0.1:$HttpPort" }
+      $sysProxy = "http://127.0.0.1:$HttpPort"
       Set-ItemProperty $k -Name ProxyServer -Value $sysProxy -Type String
       # 广播 Internet Settings 变更，让 Explorer / 已运行的浏览器立刻感知
       # （部分程序只在收到 OPTIONS_CHANGED 时才重读注册表）

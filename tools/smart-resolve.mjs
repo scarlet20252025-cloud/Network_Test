@@ -47,8 +47,8 @@ const POOL = {
     { ip: '20.27.177.113', ok: '5/5' },
   ],
   'gist.github.com': [
-    { ip: '140.82.121.4', ok: '5/5' },
-    { ip: '20.27.177.113', ok: '5/5' },
+    // 注意：gist 的 A 记录和 github.com 不是同一批，别复用 github.com 的池
+    { ip: '78.16.49.15', ok: '3/3' },
   ],
   'api.github.com': [
     { ip: '20.205.243.168', ok: '5/5' },
@@ -59,29 +59,58 @@ const POOL = {
     { ip: '20.205.243.165', ok: '5/5' },
   ],
   'raw.githubusercontent.com': [
-    { ip: '185.199.108.133', ok: '3/5' },
-    { ip: '185.199.109.133', ok: '3/5' },
-    { ip: '185.199.110.133', ok: '3/5' },
-    { ip: '185.199.111.133', ok: '3/5' },
+    // 2026-10-23 04:15 远端实测：108.133 = 0/3（黑洞），其余全通
+    { ip: '185.199.110.133', ok: '3/3' },
+    { ip: '185.199.111.133', ok: '3/3' },
+    { ip: '185.199.108.153', ok: '3/3' },
+    { ip: '185.199.109.153', ok: '3/3' },
+    { ip: '185.199.110.153', ok: '3/3' },
+    { ip: '185.199.111.153', ok: '3/3' },
+    { ip: '185.199.109.133', ok: '2/3' },
+    { ip: '185.199.108.133', ok: '0/3' }, // 排最后
   ],
   'objects.githubusercontent.com': [
-    { ip: '185.199.108.133', ok: '3/5' },
-    { ip: '185.199.109.133', ok: '3/5' },
-    { ip: '185.199.110.133', ok: '3/5' },
-    { ip: '185.199.111.133', ok: '3/5' },
+    { ip: '185.199.110.133', ok: '3/3' },
+    { ip: '185.199.111.133', ok: '3/3' },
+    { ip: '185.199.108.153', ok: '3/3' },
+    { ip: '185.199.109.153', ok: '3/3' },
+    { ip: '185.199.110.153', ok: '3/3' },
+    { ip: '185.199.111.153', ok: '3/3' },
+    { ip: '185.199.109.133', ok: '2/3' },
+    { ip: '185.199.108.133', ok: '0/3' },
   ],
 };
 
-/** 通配：任何 *.github.com / githubusercontent.com 都走候选池逻辑 */
-const WILDCARD_SUFFIX = ['github.com', 'githubusercontent.com', 'githubassets.com', 'github.io'];
+/**
+ * 通配后缀 → 实际使用的候选池键。
+ *
+ * ⚠️ 绝不能 fallback 到 github.com 的池。
+ * 事故：`gist.githubusercontent.com` 后缀匹配到 `githubusercontent.com`，
+ * 旧代码退回 `POOL['github.com']` → 拿 github.com 的 IP（140.82.x）去连
+ * gist.githubusercontent.com（真实 IP 185.199.x），SNI 和 IP 都不对，
+ * 全部超时（实测 25s 失败）。
+ *
+ * 正确映射（远端 DNS 实测确认同一批 IP）：
+ *   *.githubusercontent.com  → raw.githubusercontent.com 的池（185.199.x）
+ *   *.github.com             → github.com 的池（140.82.x / 20.x）
+ *   其他后缀无池 → null，让 ssh -D 用远端 DNS 正常解析
+ */
+const SUFFIX_POOL = {
+  'github.com': 'github.com',
+  'githubusercontent.com': 'raw.githubusercontent.com',
+  'githubassets.com': null,
+  'github.io': null,
+};
+
+const WILDCARD_SUFFIX = Object.keys(SUFFIX_POOL);
 
 function matchPool(host) {
   const h = host.toLowerCase();
   if (POOL[h]) return POOL[h];
-  // 通配：xxx.github.com 用 github.com 的池
   for (const suf of WILDCARD_SUFFIX) {
     if (h === suf || h.endsWith('.' + suf)) {
-      return POOL[suf] || POOL['github.com'];
+      const key = SUFFIX_POOL[suf];
+      return key ? (POOL[key] || null) : null;
     }
   }
   return null;
@@ -206,31 +235,159 @@ export function socksConnectToIp(ip, port, socksPort, timeoutMs = 15000) {
 }
 
 /**
- * 择优建连：按候选池顺序逐个尝试，第一个成功即返回。
+ * 进程内 IP 健康分缓存（带时间窗口衰减）。
+ *
+ * 为什么需要：POOL 里的 ok 值是「某一次采样」的快照，会过期。
+ * 实测 2026-10-23 04:00 远端直连采样：
+ *   140.82.121.4   0/2   ← 而池里排第 1
+ *   20.205.243.166 0/2   ← DNS 默认返回
+ *   其余 6 个       2/2
+ * 串行逐个试会先各浪费一次超时。
+ *
+ * ⚠️ 教训：第一版用累加计数，dual-proxy 是常驻进程，
+ * 跑几百次测试后 fail 累计到几百，所有 IP 的 score 都变负、顺序全乱，
+ * 表现为「前 9 次全失败，后 6 次全成功」这种诡异模式。
+ * 现在改为**只统计最近 WINDOW_MS 内的事件**，旧数据自动过期。
+ */
+const WINDOW_MS = 60000;
+const HEALTH = new Map(); // ip -> { events: [{ok, t}], lastFail }
+
+function recent(ip) {
+  const h = HEALTH.get(ip);
+  if (!h) return { ok: 0, fail: 0, lastFail: 0 };
+  const cutoff = Date.now() - WINDOW_MS;
+  const ev = h.events.filter((e) => e.t >= cutoff);
+  if (ev.length !== h.events.length) h.events = ev;
+  let ok = 0;
+  let fail = 0;
+  for (const e of ev) { if (e.ok) ok++; else fail++; }
+  const lastFail = ev.filter((e) => !e.ok).reduce((m, e) => Math.max(m, e.t), 0);
+  return { ok, fail, lastFail };
+}
+
+function score(ip, staticOk) {
+  const h = recent(ip);
+  if (h.ok === 0 && h.fail === 0) return staticOk;
+  // 成功加分、失败扣分；最近 15s 内失败过的额外扣（避免立刻又去试）
+  let s = staticOk + h.ok * 12 - h.fail * 18;
+  if (h.lastFail && Date.now() - h.lastFail < 15000) s -= 30;
+  return s;
+}
+
+function markOk(ip) {
+  const h = HEALTH.get(ip) || { events: [], lastFail: 0 };
+  h.events.push({ ok: true, t: Date.now() });
+  if (h.events.length > 20) h.events = h.events.slice(-20);
+  HEALTH.set(ip, h);
+}
+
+function markFail(ip) {
+  const h = HEALTH.get(ip) || { events: [], lastFail: 0 };
+  h.events.push({ ok: false, t: Date.now() });
+  if (h.events.length > 20) h.events = h.events.slice(-20);
+  h.lastFail = Date.now();
+  HEALTH.set(ip, h);
+}
+
+/**
+ * 择优建连：并行竞速（Happy Eyeballs 思路）。
+ *
+ * 为什么不是串行：串行遇到一个黑洞 IP 就要等满 perTryTimeout。
+ * 实测 github.com 池里 140.82.121.4 和 20.205.243.166 都是黑洞，
+ * 串行会先浪费 12s 才开始试第三个。
+ *
+ * 策略：
+ *   - 按健康分排序，先发第 1 个；
+ *   - 每隔 staggerMs 还没成功就再发下一个，最多 concurrency 个同时在飞；
+ *   - 任何一个成功立刻返回，其余销毁；
+ *   - **有总预算 totalTimeoutMs**（默认 8s）：到点全部判失败，不再无限等。
+ *     教训：第一版没有总预算，8 个 IP 各 6s + dual-proxy 再 fallback 20s，
+ *     最坏 38s，浏览器直接判超时，用户看到的就是「打不开」。
+ *
  * @param {string} host  域名（用于查候选池）
  * @param {number} port
- * @param {object} opts  { socksPort, perTryTimeout, maxTries }
+ * @param {object} opts  { socksPort, perTryTimeout, maxTries, concurrency, staggerMs, totalTimeoutMs }
  * @returns {Promise<{sock, ip, ms, tried}>}
  */
 export async function connectBest(host, port, opts = {}) {
   const socksPort = opts.socksPort || 10808;
-  const perTryTimeout = opts.perTryTimeout || 6000;
+  const perTryTimeout = opts.perTryTimeout || 3500;
   const maxTries = opts.maxTries || 8;
+  const concurrency = opts.concurrency || 4;
+  const staggerMs = opts.staggerMs || 400;
+  const totalTimeoutMs = opts.totalTimeoutMs || 8000;
 
   const ips = await resolveBest(host);
   if (!ips.length) throw new Error(`无法解析 ${host}`);
 
-  const tried = [];
-  for (const ip of ips.slice(0, maxTries)) {
-    try {
-      const r = await socksConnectToIp(ip, port, socksPort, perTryTimeout);
-      return { ...r, tried };
-    } catch (e) {
-      tried.push({ ip, err: e.message });
-    }
-  }
+  const pool = matchPool(host) || [];
+  const staticMap = new Map(pool.map((p) => [p.ip, parseInt(p.ok, 10) || 0]));
 
-  throw new Error(`${host} 所有候选 IP 均失败: ${tried.map((t) => `${t.ip}(${t.err})`).join('; ')}`);
+  // 按健康分排序（动态），取前 maxTries 个
+  const ranked = ips
+    .map((ip) => ({ ip, s: score(ip, staticMap.get(ip) || 0) }))
+    .sort((a, b) => b.s - a.s)
+    .slice(0, maxTries)
+    .map((x) => x.ip);
+
+  return new Promise((resolve, reject) => {
+    const tried = [];
+    let inflight = 0;
+    let nextIdx = 0;
+    let done = false;
+    let pump = null;
+    const t0 = Date.now();
+
+    // 总预算：到点无论还剩多少都判失败（避免用户侧超时）
+    const budget = setTimeout(() => failAll('总预算耗尽'), totalTimeoutMs);
+
+    const cleanup = () => {
+      if (pump) { clearInterval(pump); pump = null; }
+      clearTimeout(budget);
+    };
+
+    const failAll = (why = '') => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(new Error(
+        `${host} 所有候选 IP 均失败${why ? `(${why})` : ''}: ` +
+        tried.map((t) => `${t.ip}(${t.err})`).join('; ')
+      ));
+    };
+
+    // 泵：每隔 staggerMs 补充发射，直到候选用完
+    const launchOne = () => {
+      if (done || nextIdx >= ranked.length) return false;
+      const ip = ranked[nextIdx++];
+      inflight++;
+      socksConnectToIp(ip, port, socksPort, perTryTimeout)
+        .then((r) => {
+          if (done) { try { r.sock.destroy(); } catch {} return; }
+          done = true;
+          markOk(ip);
+          cleanup();
+          resolve({ ...r, tried, elapsed: Date.now() - t0 });
+        })
+        .catch((e) => {
+          markFail(ip);
+          tried.push({ ip, err: e.message });
+          inflight--;
+          if (done) return;
+          if (nextIdx >= ranked.length && inflight === 0) failAll();
+          // 失败立刻补位（但不超过 concurrency），不等下一个节拍
+          else if (inflight < concurrency) launchOne();
+        });
+      return true;
+    };
+
+    launchOne(); // 立即发第一个
+    pump = setInterval(() => {
+      if (done) { clearInterval(pump); return; }
+      if (inflight < concurrency) launchOne();
+      if (nextIdx >= ranked.length && inflight === 0) failAll();
+    }, staggerMs);
+  });
 }
 
-export { POOL, matchPool };
+export { POOL, matchPool, HEALTH };

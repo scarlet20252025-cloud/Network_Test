@@ -87,20 +87,22 @@ function record(kind, target, ms, ok, err) {
  * 背景：远端办公网到 github.com 的 DNS 只给 20.205.243.166，
  * 该 IP 实测 40% 可达；候选池里 7 个 IP 都是 100% 可达。
  */
-async function smartConnect(host, port, timeoutMs = 20000) {
+async function smartConnect(host, port, timeoutMs = 8000) {
   if (matchPool(host)) {
     try {
       const r = await connectBest(host, port, {
         socksPort: SOCKS_PORT,
-        perTryTimeout: Math.min(timeoutMs, 6000),
+        perTryTimeout: 3500,
+        totalTimeoutMs: 8000,
+        concurrency: 4,
       });
       return r.sock;
     } catch (e) {
-      // 候选池全失败则退回原路径，至少还有一次机会
-      log(`  ! 择优失败 ${host}:${port} ${e.message}，退回域名解析`);
+      // 候选池全失败则退回原路径，至少还有一次机会（但要短，别让用户干等）
+      log(`  ! 择优失败 ${host}:${port} ${e.message.slice(0, 120)}，退回域名解析`);
     }
   }
-  const r = await socksConnect(host, port, timeoutMs);
+  const r = await socksConnect(host, port, Math.min(timeoutMs, 8000));
   return r.sock;
 }
 
