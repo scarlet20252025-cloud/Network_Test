@@ -11,6 +11,18 @@
 WireGuard 只搭好了服务端，本机从未安装客户端、也从未连上过。
 详见 [docs/实测报告.md](docs/实测报告.md)。
 
+## ⚠️ 本仓库 git 操作必须走借网
+
+本机直连 github.com 已不通（21 秒超时）。仓库本地已配：
+
+```powershell
+git config http.proxy "socks5h://127.0.0.1:10808"
+git config https.proxy "socks5h://127.0.0.1:10808"
+```
+
+push/fetch 前必须先确保 keeper 在跑（`tools\startup.ps1 Status`）。
+另外本机 git 走 HTTP/2 会卡 TLS renegotiate，需加 `-c http.version=HTTP/1.1`。
+
 ## 快速开始
 
 ```powershell
