@@ -80,6 +80,11 @@ SSH 走的是**校内网直连**（3 跳，RTT 3–14ms），不经过 WireGuard
 | `tools/smart-resolve.mjs` | **IP 择优**：github 系域名候选 IP 池，绕过 DNS 返回的不可达 IP |
 | `tools/startup.ps1` | 登录自启管理：`Status`/`Install`/`Uninstall`/`Test`（启动文件夹方案，零权限） |
 | `tools/bw-probe.mjs` | 并发带宽测试，判断瓶颈是物理带宽还是 TCP 窗口 |
+| `tools/gh-stability.mjs` | github 稳定性对比（本机直连 vs 经隧道） |
+| `tools/longrun.mjs` | 长跑稳定性测试（多目标 × 多轮，输出 p50/p95） |
+| `tools/correlate.mjs` | 同时刻对比远端直连与隧道，区分波动源 |
+| `tools/push-with-retry.sh` | 借网环境下的 git 推送封装（三个必需参数 + 重试） |
+| `tools/test-smart-resolve.mjs` | smart-resolve 自检（候选池排序 + 择优建连） |
 | `tools/gh-probe.mjs` | github 稳定性统计采样（成功率 / 失败阶段分布） |
 | `tools/socks-layer-probe.mjs` | 分层定位 SOCKS 隧道失败在哪个阶段 |
 | `tools/net-quality.ps1` | 链路质量实测：可达性/抖动/丢包/吞吐/长连接/DNS |
@@ -96,13 +101,28 @@ SSH 走的是**校内网直连**（3 跳，RTT 3–14ms），不经过 WireGuard
 4. **PS 5.1 兼容** —— GUI 跑在 `powershell.exe`（5.1）下：
    不支持 `if` 作表达式、`Invoke-WebRequest -Proxy socks5://`、枚举字符串隐式转换。
 
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/实测报告.md](docs/实测报告.md) | 可达性 / 抖动 / 丢包 / 长连接 / DNS 的完整实测数据 |
+| [docs/性能瓶颈诊断.md](docs/性能瓶颈诊断.md) | 网卡/DNS/带宽瓶颈排查，含「1 MB/s 结论作废」的更正过程 |
+| [docs/稳定性验证.md](docs/稳定性验证.md) | 三个关键 bug 的根因与修复前后对比，30 轮长跑数据 |
+| [docs/踩坑记录.md](docs/踩坑记录.md) | 21 条实测踩出来的坑（PS 5.1 / 远端 / WinForms / git） |
+| [docs/远端部署.md](docs/远端部署.md) | 远端 sshd、WireGuard、端口转发的部署步骤 |
+| [docs/局域网共享方案.md](docs/局域网共享方案.md) | 局域网共享的预留设计（认证/ACL/性能预期），**尚未实施** |
+
 ## 已知边界
 
 1. 系统代理只覆盖读代理设置的程序（浏览器/.NET/多数下载工具）；不走代理的软件管不到。
    要全局接管需 tun2socks（动路由、有自环风险，未做）。
 2. 隧道链路是 SSH over 学校 WLAN。**若断网发生在 WLAN 接入层（拿不到 IP/路由），
    隧道同样起不来** —— 这是当前方案最大的单点。
-3. 吞吐受限于远端出口：远端自测 8 Mbps，经 SSH 借网约 1.05 MB/s。
+3. 吞吐取决于**下载源**，不是带宽上限：远端实测华为云 **90+ MB/s**（≈720 Mbps），
+   经借网 HTTP 代理 **36 MB/s**，本机直连仅 7.8 MB/s。
+   **清华 CERNET 源只有 1.12 MB/s —— 那是路由质量，别拿它当带宽上限。**
+4. `gist.github.com` 在远端办公网被封锁（`159.24.3.173` TCP 0/3），
+   与借网无关；gist 的 raw 内容（`gist.githubusercontent.com`）可正常访问。
 
 ## 踩坑速查
 
