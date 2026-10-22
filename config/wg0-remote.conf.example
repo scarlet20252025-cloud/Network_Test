@@ -1,0 +1,12 @@
+[Interface]
+# 远端 10.13.24.1 的隧道服务端配置
+# 部署位置：C:\Users\PCserver\wg0.conf
+# 服务名：WireGuardTunnel$wg0（StartMode=Auto）
+PrivateKey = <SERVER_PRIVATE_KEY>
+Address = 10.66.66.1/24
+ListenPort = 51820
+
+[Peer]
+# 本机客户端公钥
+PublicKey = <CLIENT_PUBLIC_KEY>
+AllowedIPs = 10.66.66.2/32
