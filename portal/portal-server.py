@@ -1469,7 +1469,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   <td>{'<span class="bad">已撤销</span>' if r['revoked'] else
        ('<span class="muted">已使用</span>' if r['used_by_ip'] else
         ('<span class="bad">已过期</span>' if r['expires_at'] < now() else
-         f'<span class="ok">{fmt_left(r["expires_at"])}</span>'))}</td>
+         f'<span class="ok">未使用 · 剩 {fmt_left(r["expires_at"])}</span>'))}</td>
   <td class="muted">{html.escape(r['used_by_ip']) or '—'}</td>
   <td class="muted">{fmt_ts(r['created_at'])}</td>
   <td>{'' if r['revoked'] else f'<form method="post" action="/admin/revoke" style="display:inline">{csrf_in}<input type="hidden" name="id" value="{r["id"]}"><button class="sm ghost" type="submit">撤销</button></form>'}</td>
@@ -2694,11 +2694,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'revoked')
             self.send_json({'ok': False, 'error': '这个密钥已被撤销'}, 401)
             return
-        # 同一台机器重复激活 = 幂等放行。
-        # 用户点两次、客户端网络重试、或者上次激活后 config.json 没写成功，
-        # 都会走到这里。把他拦在「一次性」门口毫无意义 —— 密钥本来就是绑 IP 的，
-        # 同一个 IP 再激活一次不会扩大任何权限，只会让用户以为软件坏了。
+        # 同一台机器重复激活 —— 只在「明显是重试」的时间窗内放行。
+        #
+        # 为什么要区分：
+        #   · 网络超时重发、用户连点两下、config.json 没写成功 —— 这些是秒级的，
+        #     拦下来只会让用户以为软件坏了，应该幂等成功
+        #   · 用户过几分钟再输一遍同一个密钥 —— 那是真的想重复用一次，
+        #     密钥是一次性的，必须拒绝，否则「一次性」就没有意义了
+        # 60 秒是够宽松的重试窗口，也是明显区别于「故意再用一次」的界限。
+        RETRY_WINDOW_SEC = 60
         same_machine = bool(inv['used_by_ip']) and inv['used_by_ip'] == ip
+        recent_retry = same_machine and (now() - int(inv['used_at'] or 0) <= RETRY_WINDOW_SEC)
+        if same_machine and not recent_retry:
+            rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'already-used-same-ip')
+            self.send_json({'ok': False,
+                            'error': '这个密钥已经用过了（一次性）。如果你需要更长的授权，请向管理员要新密钥。'}, 401)
+            return
         if inv['used_by_ip'] and not same_machine:
             rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'used-by-other')
             self.send_json({'ok': False,
