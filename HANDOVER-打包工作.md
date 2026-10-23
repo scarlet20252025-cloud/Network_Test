@@ -1493,6 +1493,117 @@ X-Ferry-Bytes: 2143228
 用户很容易点到那个失败的残片 —— 首页那句提示就是冲着这个来的。
 
 
+## 九点十六、输入密钥激活失败 —— 服务端 NameError 导致 500
+
+### 现象
+
+用户输入管理面板刚生成的密钥 `ECX7BWY2`，点激活「弹了一下服务端输入了看不懂的内容，
+然后一直未激活」。
+
+### 根因：`exp` / `days` 在 `handle_api_activate` 里是未定义变量
+
+第四个补丁（授权时长）把 `days` / `exp` 的**计算**加到了 `handle_admin_newcode`
+（约 2105 行），但 `handle_api_activate`（2466 行）的 `send_json` 里
+也用了这两个名字：
+
+```python
+self.send_json({
+    ...
+    'expiresAt': exp,        # ← NameError: name 'exp' is not defined
+    'daysLeft': days,        # ← 同上
+})
+```
+
+`days` 在 2105 行是**另一个函数的局部变量**，跨函数不可见。
+于是**用新密钥激活必然 500** —— Python 抛 `NameError`，`http.server` 返回
+一整页 traceback HTML。
+
+客户端 `Api.Activate` 拿到的是 HTML 而不是 JSON，解析失败，
+把响应体原样当成错误信息显示 —— 用户看到的就是「看不懂的内容」，
+而且因为它撑爆了一行 Label，只闪了一下就没了。
+
+**为什么之前没发现**：手动测试用的密钥已经 `used_by_ip` 非空，
+代码在「已用过」那一行就 return 了，**根本没走到 `send_json`**。
+直到用户拿真·新密钥才踩到。
+
+### 同类 bug：一次性密钥没有幂等
+
+第二个问题是设计缺陷：`invites.used_by_ip` 非空就一律拒绝，
+**包括同一台机器重复激活**。
+
+用户点两次、客户端网络重试、或者上次激活后 `config.json` 没写成功，
+都会走到这个门口 —— 而它拦得毫无意义：密钥本来就绑定 IP，
+同一个 IP 再激活一次**不会扩大任何权限**，只会让用户以为软件坏了。
+
+### 修法
+
+```python
+# 同一台机器重复激活 = 幂等放行
+same_machine = bool(inv['used_by_ip']) and inv['used_by_ip'] == ip
+if inv['used_by_ip'] and not same_machine:
+    return 401 "这个密钥已经在别的机器（x.x.x.x）上用过了"
+if inv['expires_at'] < now() and not same_machine:
+    return 401 "密钥已过期"
+```
+
+**注意**「别的机器」这条现在会**把对方 IP 显示出来** —— 用户至少知道
+「不是我这边的问题，是密钥被别人先用了」。
+
+### 顺带把授权时长真正写进库
+
+```python
+days = int(CFG.get('license_days') or 0)
+exp = 0 if days <= 0 else now() + days * 86400
+days_left = 0 if exp <= 0 else max(0, int((exp - now()) // 86400))
+
+# 建号
+INSERT INTO clients (..., expires_at) VALUES (..., exp)
+# 已有账号 = 续期
+UPDATE clients SET enabled = 1, last_seen = ?, expires_at = ? WHERE ip = ?
+```
+
+之前 `expires_at` 只在 `handle_admin_newcode` 里算、从没写进 `clients` 表 ——
+所以即使激活成功，客户端 `Api.License` 拿到的 `expiresAt` 永远是 0（显示"永久授权"）。
+
+### 客户端：不再把服务端 HTML 甩给用户
+
+```csharp
+if (code401 >= 500)
+    res.Error = "服务端出错了（HTTP " + code401 + "）。请稍后重试，或联系管理员看服务端日志。";
+else if (string.IsNullOrEmpty(res.Error))
+    res.Error = body.StartsWith("<")
+        ? "服务端返回了网页而不是数据（HTTP " + code401 + "）。请确认门户地址正确。"
+        : "服务端返回异常（HTTP " + code401 + "）";
+```
+
+用户看到「一坨看不懂的内容」等于没看到错误。500 是**服务端的问题**，
+不该让用户去猜 HTML 里写了什么。
+
+### 修复后实测（用户那个密钥，原样重试）
+
+```
+POST /api/activate  {"code":"ECX7BWY2"}
+→ 200
+{"ok": true, "token": "sngsb4-9ez7s9-vxzr26-mbhnpq", "ip": "10.141.59.235",
+ "expiresAt": 1795361481, "daysLeft": 30, "portalUrl": "http://10.13.24.1:8080"}
+
+GET /api/license?ip=10.141.59.235&token=sngsb4-...
+→ {"ok": true, "enabled": true, "expiresAt": 1795361481, "daysLeft": 30,
+   "hoursLeft": 720, "expired": false, "suspended": false}
+```
+
+**同一个密钥、同一台机器，直接成功了** —— 因为幂等放行。
+
+### 教训
+
+1. **补丁跨函数加变量时，一定要搜索这个变量名在整个文件里的所有使用处。**
+   我在 `handle_admin_newcode` 里定义了 `days`/`exp`，以为激活那边也用了同名的，
+   就没回头查 —— 而 Python 的局部变量不会跨函数共享，直接 NameError。
+2. **测试要用「真正会走到最后一行」的数据。** 我测的时候密钥已被用过，
+   在第二个 return 就结束了，`send_json` 那几行一行都没执行。
+3. **一次性凭据必须对「同一主体重复提交」幂等。**
+   现实里网络会重试、用户会连点、写盘会失败 —— 这些都不是攻击。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`

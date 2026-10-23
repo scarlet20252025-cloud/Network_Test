@@ -103,10 +103,22 @@ namespace Ferry
             }
             catch (WebException e)
             {
+                var code401 = 0;
+                try { if (e.Response is HttpWebResponse) code401 = (int)((HttpWebResponse)e.Response).StatusCode; }
+                catch (Exception) { }
+
                 var body = ErrorBody(e);
-                if (body.Length > 0) { Fill(res, body); if (string.IsNullOrEmpty(res.Error)) res.Error = "服务端返回异常"; }
-                else if (e.Status == WebExceptionStatus.Timeout) res.Error = "连接门户超时，检查是否在同一局域网";
-                else res.Error = "连不上门户：" + e.Message;
+                if (body.Length > 0) Fill(res, body);
+
+                // 服务端 500 时返回的是一整页 HTML / traceback，
+                // 直接显示给用户就是「一坨看不懂的内容」。这里统一换成可读文案，
+                // 原始内容只在没拿到任何 JSON 字段时兜底。
+                if (code401 >= 500)
+                    res.Error = "服务端出错了（HTTP " + code401 + "）。请稍后重试，或联系管理员看服务端日志。";
+                else if (string.IsNullOrEmpty(res.Error))
+                    res.Error = body.Length > 0 && body.TrimStart().StartsWith("<")
+                        ? "服务端返回了网页而不是数据（HTTP " + code401 + "）。请确认门户地址正确。"
+                        : "服务端返回异常（HTTP " + code401 + "）";
             }
             catch (Exception e)
             {

@@ -2505,26 +2505,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'revoked')
             self.send_json({'ok': False, 'error': '这个密钥已被撤销'}, 401)
             return
-        if inv['used_by_ip']:
-            rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'already-used')
-            self.send_json({'ok': False, 'error': '这个密钥已经用过了（一次性）'}, 401)
+        # 同一台机器重复激活 = 幂等放行。
+        # 用户点两次、客户端网络重试、或者上次激活后 config.json 没写成功，
+        # 都会走到这里。把他拦在「一次性」门口毫无意义 —— 密钥本来就是绑 IP 的，
+        # 同一个 IP 再激活一次不会扩大任何权限，只会让用户以为软件坏了。
+        same_machine = bool(inv['used_by_ip']) and inv['used_by_ip'] == ip
+        if inv['used_by_ip'] and not same_machine:
+            rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'used-by-other')
+            self.send_json({'ok': False,
+                            'error': '这个密钥已经在别的机器（%s）上用过了' % inv['used_by_ip']}, 401)
             return
-        if inv['expires_at'] < now():
+        if inv['expires_at'] < now() and not same_machine:
             rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'expired')
             self.send_json({'ok': False, 'error': '密钥已过期，请向管理员索取新的'}, 401)
             return
+
+        # 授权时长（本函数作用域内必须有 —— 之前漏了，直接 NameError → 500，
+        # 客户端拿到一坨看不懂的错误，用户以为密钥失效）
+        days = int(CFG.get('license_days') or 0)
+        exp = 0 if days <= 0 else now() + days * 86400
+        days_left = 0 if exp <= 0 else max(0, int((exp - now()) // 86400))
 
         # 通过：绑定 IP，建号或复活
         existing = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
         if existing:
             token = existing['token']
-            self.db.x('UPDATE clients SET enabled = 1, last_seen = ? WHERE ip = ?', (now(), ip))
+            # 续期：把 expires_at 往后推（重新激活 = 续一个月）
+            self.db.x('UPDATE clients SET enabled = 1, last_seen = ?, expires_at = ? WHERE ip = ?',
+                      (now(), exp, ip))
         else:
             token = new_token()
             self.db.x(
-                'INSERT INTO clients (ip, token, enabled, created_at, last_seen, invite_id) '
-                'VALUES (?,?,1,?,?,?)',
-                (ip, token, now(), now(), inv['id']))
+                'INSERT INTO clients (ip, token, enabled, created_at, last_seen, invite_id, expires_at) '
+                'VALUES (?,?,1,?,?,?,?)',
+                (ip, token, now(), now(), inv['id'], exp))
 
         self.db.x('UPDATE invites SET used_by_ip = ?, used_at = ? WHERE id = ?',
                   (ip, now(), inv['id']))
@@ -2539,7 +2553,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             'sshPort': CFG['ssh_port'],
             'httpPort': CFG['port'] + 1,
             'expiresAt': exp,
-            'daysLeft': days,
+            'daysLeft': days_left,
             'portalUrl': 'http://' + (CFG['public_host'] or '10.13.24.1') + ':' + str(CFG['port']),
         })
 
