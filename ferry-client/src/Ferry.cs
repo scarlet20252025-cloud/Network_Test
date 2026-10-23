@@ -91,18 +91,69 @@ namespace Ferry
         public static void RestoreDirect(Cfg cfg, string appDir)
         {
             var st = LoadState(appDir);
-            if (st != null)
+
+            if (st != null && st.PrevEnabled && !string.IsNullOrEmpty(st.PrevServer))
             {
-                SetProxy(st.PrevEnabled, st.PrevServer ?? "");
-                if (st.PrevEnabled && !string.IsNullOrEmpty(st.PrevServer))
-                    return; // 已经还原成用户原来的代理，别再往下清
+                // 关键：还原之前先确认用户原来那个代理**现在还活着**。
+                //
+                // 踩过的坑：用户原本用 Clash（127.0.0.1:7897），借网期间把 Clash 关了。
+                // 停止借网时把系统代理还原成 Clash 的地址，但那个端口已经没人监听 ——
+                // 结果就是「恢复直连之后彻底上不了网」，比借网失败还糟。
+                // 所以这里探一下；探不通就直接关掉系统代理，至少保证能上网。
+                if (IsProxyAlive(st.PrevServer))
+                {
+                    SetProxy(true, st.PrevServer);
+                    return;
+                }
+                SetProxy(false, "");
+                return;
             }
-            else if (!string.IsNullOrEmpty(cfg.FallbackProxy))
+
+            if (!string.IsNullOrEmpty(cfg.FallbackProxy) && IsProxyAlive(cfg.FallbackProxy))
             {
                 SetProxy(true, cfg.FallbackProxy);
                 return;
             }
+
             SetProxy(false, "");
+        }
+
+        /// <summary>
+        /// 系统代理地址（host:port 或 http://host:port）当前是否可连。
+        ///
+        /// 只探本机回环地址 —— 远端代理不可达不该由我们决定，
+        /// 而且探远端要等超时，会让「停止借网」按钮卡住。
+        /// </summary>
+        public static bool IsProxyAlive(string server)
+        {
+            if (string.IsNullOrEmpty(server)) return false;
+            try
+            {
+                var s = server.Trim();
+                // 注册表里可能是 "http=127.0.0.1:7897;https=127.0.0.1:7897" 这种多协议写法，
+                // 取第一条的端口即可（本地代理端口通常同一个）
+                int semi = s.IndexOf(';');
+                if (semi >= 0)
+                {
+                    s = s.Substring(0, semi);
+                    int eq = s.IndexOf('=');
+                    if (eq > 0) s = s.Substring(eq + 1);
+                }
+                if (s.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) s = s.Substring(7);
+                if (s.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) s = s.Substring(8);
+                var idx = s.LastIndexOf(':');
+                if (idx <= 0) return false;
+                var host = s.Substring(0, idx);
+                int port;
+                if (!int.TryParse(s.Substring(idx + 1), out port)) return false;
+                if (port <= 0 || port > 65535) return false;
+
+                // 非回环地址直接当作「可用」—— 探它要等超时，不值
+                if (host != "127.0.0.1" && host != "localhost" && host != "::1") return true;
+
+                return PortOpen(port, 400);
+            }
+            catch (Exception) { return false; }
         }
 
         // ── 原代理备份（state.json）────────────────────────────

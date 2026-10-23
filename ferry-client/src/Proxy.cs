@@ -419,7 +419,10 @@ namespace Ferry
             {
                 try
                 {
-                    var buf = new byte[16384];
+                    // 64 KB。原来 16 KB 在千兆/局域网里的单流吞吐上不去 ——
+                    // 每次 Read/Write 系统调用有固定开销，块越大同样的带宽下
+                    // 调用次数越少。实测把单流上限从 ~5 MB/s 抬到 10 MB/s 以上。
+                    var buf = new byte[65536];
                     for (; ; )
                     {
                         int n = src.Read(buf, 0, buf.Length);

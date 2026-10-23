@@ -196,7 +196,12 @@ namespace Ferry
         void BuildTray()
         {
             _tray = new NotifyIcon();
-            _tray.Icon = SystemIcons.Application;
+            // 用 exe 自己的图标。SystemIcons.Application 在 Win11 托盘里
+            // 经常渲染成一个空白方块 —— 那个是通用占位图，不是我们的图标。
+            Icon trayIcon = null;
+            try { trayIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch (Exception) { }
+            _tray.Icon = trayIcon != null ? trayIcon : SystemIcons.Application;
             _tray.Text = "渡口 Ferry";
             _tray.Visible = true;
             _tray.DoubleClick += delegate { ShowMain(); };

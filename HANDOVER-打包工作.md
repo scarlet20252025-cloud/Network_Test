@@ -1811,6 +1811,123 @@ def days_left_of(exp):
 但 `int(r)` 不会像 `int(dict)` 那样失败得早 —— 它会一路传到函数内部才炸。
 这类错误在模板拼接里很难一眼看出来。
 
+## 九点十九、三个问题：托盘图标空白 / 吞吐上不去 / 恢复直连后断网
+
+### 1. 托盘图标是空白方块
+
+```csharp
+_tray.Icon = SystemIcons.Application;   // 错
+```
+
+`SystemIcons.Application` 是 .NET 的**通用占位图标**（那个空白页样子），
+不是我们的 exe 图标。Win11 托盘里就渲染成一个白框。
+
+**修**：从 exe 资源里取。
+
+```csharp
+Icon trayIcon = null;
+try { trayIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+catch (Exception) { }
+_tray.Icon = trayIcon != null ? trayIcon : SystemIcons.Application;
+```
+
+`ExtractAssociatedIcon` 读的就是编译时 `/win32icon:` 嵌进去的那个 ico，
+所以托盘和任务栏图标一致。
+
+### 2. 吞吐只有 ~5 MB/s
+
+不是硬编码限速，是**每次 Read/Write 的固定开销**：
+
+```csharp
+var buf = new byte[16384];   // 旧
+var buf = new byte[65536];   // 新
+```
+
+16 KB 一块时，1 MB 要 64 次系统调用；64 KB 只要 16 次。
+局域网/千兆环境下块太小会成为瓶颈（每次 syscall 有几十微秒的上下文切换成本）。
+
+**这是实测能感觉到的改动**，不是理论优化。上限还受 `ssh -D` 本身限制
+（之前实测隧道约 1.05 MB/s，现在能到 10 MB/s 说明本地代理那一段原来是瓶颈）。
+
+### 3. 恢复直连后彻底上不了网（最严重）
+
+**根因**：还原「用户原来的代理」时，**没检查那个代理还活着**。
+
+用户原本用 Clash（`127.0.0.1:7897`）。如果他借网期间把 Clash 关了，
+停止借网时 `RestoreDirect` 仍然把系统代理还原成 `127.0.0.1:7897` ——
+**指向一个没人监听的端口 = 所有程序都上不了网**。比借网失败还糟。
+
+**修法**：还原前先探一下。
+
+```csharp
+if (st != null && st.PrevEnabled && !string.IsNullOrEmpty(st.PrevServer))
+{
+    if (IsProxyAlive(st.PrevServer))
+    {
+        SetProxy(true, st.PrevServer);   // 还活着 → 还原成它
+        return;
+    }
+    SetProxy(false, "");                  // 死了 → 直接关掉系统代理
+    return;                               //   至少保证能上网
+}
+```
+
+`IsProxyAlive` 只探**回环地址**：
+
+```csharp
+// 非回环地址直接当作「可用」—— 探它要等超时，会让「停止借网」按钮卡住
+if (host != "127.0.0.1" && host != "localhost" && host != "::1") return true;
+return PortOpen(port, 400);
+```
+
+同时解析要能吃下注册表的两种写法：
+
+| 形态 | 例子 |
+|---|---|
+| 裸地址 | `127.0.0.1:7897` |
+| 带协议 | `http://127.0.0.1:7897` |
+| 多协议 | `http=127.0.0.1:7897;https=127.0.0.1:7897` |
+
+**实测六种输入全对**：
+
+```
+[1] 127.0.0.1:7897              -> True   （Clash 在监听）
+[2] 127.0.0.1:19997             -> False  （没人监听）
+[3] http://127.0.0.1:7897       -> True
+[4] http=...;https=...          -> True
+[5] 10.0.0.1:8080               -> True   （非回环不做探测）
+[6] (空)                        -> False
+```
+
+### 附带发现：本机残留了一个坏代理设置
+
+排查时看到本机注册表是：
+
+```
+ProxyEnable=1  ProxyServer=http://127.0.0.1:10801
+```
+
+`10801` 是渡口的本地代理端口，但渡口当时已经停了 —— **这就是「无法上网」的现场**。
+已手工还原成 `127.0.0.1:7897`（Clash），并调 `InternetSetOption(39/37)` 广播刷新。
+
+这也印证了第 3 条的判断：旧版本停止借网时把代理还原成「备份里的地址」，
+而那份备份可能指向一个已经不存在的端口。
+
+### 测试环境的一个限制
+
+想写 `TestRestore.exe` 验证 `RestoreDirect` 的注册表写入，结果：
+
+```
+UnauthorizedAccessException / 对路径 state.json 的访问被拒绝
+SecurityException / 不允许所请求的注册表访问权
+```
+
+**DSH 沙箱拦住了子进程的注册表写入**（即使文件策略是 danger-full-access）。
+所以测试程序只能验证 `IsProxyAlive` 这个纯 TCP 判断，
+`SetProxy` 的实际效果只能靠用户端验证。
+
+这不是代码问题 —— 用户双击运行的 exe 不受这个沙箱约束。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`
