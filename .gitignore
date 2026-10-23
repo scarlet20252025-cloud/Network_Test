@@ -14,3 +14,6 @@ config/wg0-local.conf
 users.json
 client-configs/
 .proxy-state/
+
+# 临时测试/调试文件
+scratch/
