@@ -361,84 +361,330 @@ def ensure_admin_password():
 # ─────────────────────────── HTML ───────────────────────────
 
 BASE_CSS = """
+/* ── 主题变量：默认深色 ──────────────────────────────────
+   配色思路：中性灰底 + 一个强调色。强调色是「渡口」的意象 —— 水/夜航。
+   所有颜色都走变量，切主题时只换这一块，布局代码一行不动。 */
+:root, html[data-theme="dark"] {
+  --bg:#0f1216; --bg2:#151a20; --card:#1a2028; --card2:#212a33;
+  --fg:#e6edf3; --fg2:#9aa8b5; --line:#2a3441; --line2:#354252;
+  --accent:#3ddc97; --accent-d:#2fbf80; --accent-fg:#062018;
+  --err:#ff6b6b; --errbg:#2a1618; --ok:#3ddc97; --okbg:#12251d;
+  --warn:#ffd166; --warnbg:#2a2416;
+  --shadow:0 1px 3px rgba(0,0,0,.4);
+  --code:#101820;
+}
+html[data-theme="light"] {
+  --bg:#f4f6f8; --bg2:#eef1f4; --card:#ffffff; --card2:#fafbfc;
+  --fg:#2c3e50; --fg2:#6b7c8c; --line:#dde3e8; --line2:#c9d3dc;
+  --accent:#26a69a; --accent-d:#1f8f85; --accent-fg:#ffffff;
+  --err:#c62828; --errbg:#ffebee; --ok:#2e7d32; --okbg:#e8f5e9;
+  --warn:#f57f17; --warnbg:#fff8e1;
+  --shadow:0 1px 3px rgba(0,0,0,.06);
+  --code:#eef2f5;
+}
+/* 护眼：暖灰底，降低蓝光 */
+html[data-theme="sepia"] {
+  --bg:#1c1814; --bg2:#241f19; --card:#2a241d; --card2:#332c24;
+  --fg:#ecdfcc; --fg2:#b5a48c; --line:#3d3529; --line2:#4d4436;
+  --accent:#e0a458; --accent-d:#c98d42; --accent-fg:#1c1814;
+  --err:#ff7b72; --errbg:#2e1a17; --ok:#a3d977; --okbg:#1f2a17;
+  --warn:#f0c674; --warnbg:#2e2617;
+  --shadow:0 1px 3px rgba(0,0,0,.4);
+  --code:#241f19;
+}
+/* 深海：偏蓝，长时间阅读舒服 */
+html[data-theme="ocean"] {
+  --bg:#0a1420; --bg2:#0f1c2b; --card:#132234; --card2:#1a2c42;
+  --fg:#d8e6f3; --fg2:#8aa4bd; --line:#1e3349; --line2:#2a4560;
+  --accent:#4cc9f0; --accent-d:#38a8cc; --accent-fg:#04141c;
+  --err:#ff6b81; --errbg:#2a1620; --ok:#4cc9f0; --okbg:#0f2230;
+  --warn:#ffd166; --warnbg:#2a2416;
+  --shadow:0 1px 3px rgba(0,0,0,.45);
+  --code:#0d1a28;
+}
+
 *{box-sizing:border-box}
-body{font:15px/1.6 system-ui,-apple-system,"Microsoft YaHei",sans-serif;
-     margin:0;padding:0;background:#f4f6f8;color:#2c3e50}
-.wrap{max-width:820px;margin:0 auto;padding:28px 20px 60px}
-h1{font-size:22px;margin:0 0 6px}
-h2{font-size:15px;margin:26px 0 10px;color:#546e7a}
-.sub{color:#90a4ae;font-size:13px;margin-bottom:22px}
-.card{background:#fff;border-radius:14px;padding:22px 24px;
-      box-shadow:0 1px 3px rgba(0,0,0,.06);margin-bottom:16px}
-label{display:block;font-size:13px;color:#607d8b;margin:14px 0 6px}
+html,body{background:var(--bg);color:var(--fg)}
+body{font:15px/1.65 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+     margin:0;padding:0;-webkit-font-smoothing:antialiased}
+.wrap{max-width:860px;margin:0 auto;padding:26px 20px 40px}
+
+/* 顶栏 */
+.top{display:flex;align-items:center;justify-content:space-between;
+     gap:16px;margin-bottom:22px;padding-bottom:16px;border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:.5px}
+.brand .mark{width:30px;height:30px;border-radius:9px;background:var(--accent);
+             color:var(--accent-fg);display:flex;align-items:center;justify-content:center;
+             font-size:15px;font-weight:800}
+.brand .en{font-size:11px;color:var(--fg2);font-weight:500;letter-spacing:1.5px}
+
+/* 主题选择器 */
+.themes{display:flex;gap:6px}
+.themes button{width:26px;height:26px;padding:0;margin:0;border-radius:50%;
+  border:2px solid transparent;cursor:pointer;transition:transform .12s}
+.themes button:hover{transform:scale(1.12)}
+.themes button[data-on="1"]{border-color:var(--fg)}
+.t-dark{background:#1a2028}.t-light{background:#ffffff;border-color:#dde3e8!important}
+.t-sepia{background:#2a241d}.t-ocean{background:#132234}
+
+h1{font-size:22px;margin:0 0 6px;letter-spacing:.3px}
+h2{font-size:14px;margin:26px 0 10px;color:var(--fg2);
+   text-transform:uppercase;letter-spacing:1px;font-weight:600}
+.sub{color:var(--fg2);font-size:13.5px;margin-bottom:22px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+      padding:22px 24px;box-shadow:var(--shadow);margin-bottom:16px}
+label{display:block;font-size:13px;color:var(--fg2);margin:14px 0 6px;font-weight:500}
 input[type=text],input[type=password],input[type=number],textarea{
-  width:100%;padding:11px 13px;border:1px solid #dde3e8;border-radius:9px;
-  font-size:15px;font-family:inherit;background:#fafbfc;outline:none}
-input:focus,textarea:focus{border-color:#26a69a;background:#fff}
-button{background:#26a69a;color:#fff;border:0;border-radius:9px;
+  width:100%;padding:11px 13px;border:1px solid var(--line2);border-radius:9px;
+  font-size:15px;font-family:inherit;background:var(--card2);color:var(--fg);outline:none;
+  transition:border-color .12s,background .12s}
+input:focus,textarea:focus{border-color:var(--accent);background:var(--bg2)}
+input::placeholder{color:var(--fg2);opacity:.7}
+button{background:var(--accent);color:var(--accent-fg);border:0;border-radius:9px;
        padding:12px 22px;font-size:15px;font-weight:600;cursor:pointer;
-       font-family:inherit;margin-top:18px}
-button:hover{background:#1f8f85}
-button.ghost{background:#fff;color:#546e7a;border:1px solid #dde3e8}
-button.danger{background:#ef5350}
+       font-family:inherit;margin-top:18px;transition:background .12s}
+button:hover{background:var(--accent-d)}
+button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line2)}
+button.ghost:hover{background:var(--card2)}
+button.danger{background:var(--err);color:#fff}
 button.sm{padding:7px 13px;font-size:13px;margin:0}
+button.link{background:none;border:0;color:var(--accent);padding:0;margin:0;
+  font-size:13px;font-weight:500;text-decoration:underline;cursor:pointer}
+
 table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:9px 8px;border-bottom:1px solid #eef1f4}
-th{color:#90a4ae;font-weight:500;font-size:12px}
-code{background:#eef2f5;padding:2px 6px;border-radius:4px;
-     font-family:Consolas,Monaco,monospace;font-size:13px}
+th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--fg2);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.6px}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--card2)}
+
+code{background:var(--code);padding:2px 6px;border-radius:4px;
+     font-family:Consolas,Monaco,monospace;font-size:12.5px;color:var(--fg)}
+pre{background:var(--code);padding:12px 14px;border-radius:9px;overflow-x:auto;
+    font-size:12.5px;line-height:1.55;border:1px solid var(--line)}
+pre code{background:none;padding:0}
 .mono{font-family:Consolas,Monaco,monospace}
-.ok{color:#26a69a}.bad{color:#ef5350}.muted{color:#90a4ae}
-.big{font-size:26px;font-weight:700;letter-spacing:1px}
-.msg{padding:11px 14px;border-radius:9px;margin:14px 0;font-size:14px}
-.msg.err{background:#ffebee;color:#c62828}
-.msg.ok{background:#e8f5e9;color:#2e7d32}
-.msg.warn{background:#fff8e1;color:#f57f17}
+.ok{color:var(--ok)}.bad{color:var(--err)}.muted{color:var(--fg2)}
+.big{font-size:26px;font-weight:700;letter-spacing:1.5px;font-family:Consolas,Monaco,monospace}
+.msg{padding:11px 14px;border-radius:9px;margin:14px 0;font-size:14px;border:1px solid transparent}
+.msg.err{background:var(--errbg);color:var(--err);border-color:var(--err)}
+.msg.ok{background:var(--okbg);color:var(--ok);border-color:var(--ok)}
+.msg.warn{background:var(--warnbg);color:var(--warn);border-color:var(--warn)}
+.hint{font-size:12.5px;color:var(--fg2);margin-top:6px;line-height:1.55}
 .row{display:flex;gap:12px;flex-wrap:wrap}
 .row>*{flex:1;min-width:160px}
-.dl{display:block;text-align:center;background:#26a69a;color:#fff;
+.dl{display:block;text-align:center;background:var(--accent);color:var(--accent-fg);
     text-decoration:none;padding:16px;border-radius:12px;
-    font-size:17px;font-weight:600;margin:18px 0}
-.dl:hover{background:#1f8f85}
+    font-size:16px;font-weight:700;margin:18px 0;letter-spacing:.3px}
+.dl:hover{background:var(--accent-d)}
 .step{display:flex;gap:14px;margin:16px 0}
-.step .n{flex:0 0 28px;height:28px;border-radius:50%;background:#e0f2f1;
-         color:#00796b;font-weight:700;text-align:center;line-height:28px;font-size:13px}
+.step .n{flex:0 0 28px;height:28px;border-radius:50%;background:var(--card2);
+         color:var(--accent);font-weight:700;text-align:center;line-height:28px;font-size:13px;
+         border:1px solid var(--line2)}
 .step .t{flex:1;padding-top:3px}
+.kv{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:13.5px}
+.kv:last-child{border-bottom:0}
+.kv .k{flex:0 0 130px;color:var(--fg2)}
+.kv .v{flex:1;word-break:break-all}
+
+/* 页脚：版权 + 免责声明 */
+.foot{margin-top:34px;padding-top:20px;border-top:1px solid var(--line);
+      font-size:12px;color:var(--fg2);line-height:1.75}
+.foot .dis{background:var(--card);border:1px solid var(--line);border-radius:10px;
+           padding:14px 16px;margin-bottom:14px}
+.foot .dis b{color:var(--warn)}
+.foot .links{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0}
+.foot a{color:var(--fg2);text-decoration:none}
+.foot a:hover{color:var(--accent)}
+.foot .cp{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;
+         padding-top:10px;border-top:1px solid var(--line);font-size:11.5px}
 """
 
 
-def page(title, body, refresh=None):
+THEME_COOKIE = 'ferry_theme'
+THEMES = ('dark', 'light', 'sepia', 'ocean')
+THEME_NAMES = {'dark': '深色', 'light': '浅色', 'sepia': '护眼', 'ocean': '深海'}
+
+COPYRIGHT_YEAR = 2026
+
+
+def _theme_from_cookie(cookie_header):
+    """从 Cookie 里读主题偏好。
+
+    为什么要服务端读：如果只在 JS 里设 data-theme，页面会先用默认色渲染
+    再跳变（FOUC），在深色/浅色差异大时很刺眼。服务端直接写进 html 属性
+    就没有这一帧。
+    """
+    for part in (cookie_header or '').split(';'):
+        k, _, v = part.strip().partition('=')
+        if k == THEME_COOKIE and v in THEMES:
+            return v
+    return 'dark'
+
+
+def theme_switcher(current):
+    """四个圆点，纯前端切换 + 写 localStorage + 写 cookie（供服务端下次渲染）。"""
+    btns = []
+    for t in THEMES:
+        cls = 't-' + t
+        on = ' data-on="1"' if t == current else ''
+        btns.append(
+            f'<button type="button" class="{cls}" data-theme-pick="{t}"{on} '
+            f'title="{THEME_NAMES[t]}" aria-label="{THEME_NAMES[t]}"></button>')
+    return '<div class="themes">' + ''.join(btns) + '</div>'
+
+
+THEME_JS = """
+<script>
+(function () {
+  var root = document.documentElement;
+  function apply(t) {
+    root.setAttribute('data-theme', t);
+    document.cookie = 'ferry_theme=' + t + ';path=/;max-age=31536000;SameSite=Lax';
+    document.querySelectorAll('[data-theme-pick]').forEach(function (b) {
+      if (b.getAttribute('data-theme-pick') === t) b.setAttribute('data-on', '1');
+      else b.removeAttribute('data-on');
+    });
+  }
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest && e.target.closest('[data-theme-pick]');
+    if (b) apply(b.getAttribute('data-theme-pick'));
+  });
+  // 若 cookie 没生效（比如被禁用），退回 localStorage
+  if (!root.getAttribute('data-theme')) {
+    try { var t = localStorage.getItem('ferry_theme'); if (t) apply(t); } catch (e) {}
+  }
+})();
+</script>
+"""
+
+
+def footer():
+    """页脚：版权 + 免责声明。
+
+    为什么放免责声明：这是给同学用的内网工具，流量走的是别人的机器出口。
+    必须把「谁负责」讲清楚，否则出事（比如被网管查、跑违规流量）说不明白。
+    """
+    return f"""
+<div class="foot">
+  <div class="dis">
+    <b>免责声明</b><br>
+    本服务仅供 <b>个人学习与内网连通性测试</b> 使用。使用者须自行遵守所在
+    校园网 / 单位网络的《网络使用管理规定》及当地法律法规，不得利用本服务
+    从事任何违法违规活动（包括但不限于传播非法内容、攻击他人系统、绕过
+    计费或超出授权的访问）。<br>
+    服务提供者不对使用者的行为及其后果承担任何责任；不对服务的可用性、
+    连续性、传输速度作任何承诺；有权在不预先通知的情况下中断服务或撤销
+    任何账号。使用本服务即视为已阅读并同意上述条款。
+  </div>
+  <div class="links">
+    <a href="/about">关于 Ferry</a>
+    <a href="/">登录</a>
+    <a href="/setup-hosts">配置局域网域名</a>
+    <a href="/api/status">运行状态</a>
+  </div>
+  <div class="cp">
+    <span>© {COPYRIGHT_YEAR} Ferry（渡口）· 自建内网工具，非商业服务</span>
+    <span>本项目基于 MIT 许可证开源</span>
+  </div>
+</div>"""
+
+
+def page(title, body, refresh=None, theme=None, cookie_header=None):
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ''
-    return f"""<!doctype html><html lang="zh-CN"><head>
+    cur = theme or _theme_from_cookie(cookie_header)
+    top = (f'<div class="top"><div class="brand"><span class="mark">渡</span>'
+           f'<span>渡口<span class="en">FERRY</span></span></div>'
+           f'{theme_switcher(cur)}</div>')
+    return f"""<!doctype html><html lang="zh-CN" data-theme="{cur}"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
 {meta}<title>{html.escape(title)}</title><style>{BASE_CSS}</style></head>
-<body><div class="wrap">{body}</div></body></html>"""
+<body><div class="wrap">{top}{body}{footer()}</div>{THEME_JS}</body></html>"""
 
 
-def login_page(err='', csrf=''):
+def login_page(err='', csrf='', detected_ip='', show_ip_field=False):
+    """登录页：只要求密钥。
+
+    为什么不再要求用户自己填 IP：那是给用户增加负担，还容易填错
+    （比如填了 127.0.0.1、填了 WiFi 而不是有线网卡的地址）。
+    服务端从连接来源就能拿到 IP，直接用它做登记即可。
+
+    那个「可选 IP」输入框只在自动检测不可靠时才显示 ——
+    典型场景是经过反向代理 / 端口转发，服务端看到的来源是 127.0.0.1。
+    """
     errbox = f'<div class="msg err">{html.escape(err)}</div>' if err else ''
     csrf_in = f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">' if csrf else ''
-    return page('渡口登录', f"""
-<h1>渡口登录</h1>
-<div class="sub">用你的局域网 IP 和临时密钥登录，登录后可下载一键部署包</div>
+    ip_field = ''
+    if show_ip_field:
+        ip_field = f"""
+    <label>你的局域网 IP<span style="color:#90a4ae;font-weight:400">（可选）</span></label>
+    <input type="text" name="ip" placeholder="留空则自动识别"
+           pattern="[0-9.]+" value="{html.escape(detected_ip)}">
+    <div class="hint">检测到的来源是 {html.escape(detected_ip or '未知')}，
+      如果这不对（例如你在代理后面），请手动填你机器的 IPv4 地址。</div>"""
+    ip_note = ''
+    if detected_ip and not show_ip_field:
+        ip_note = f'<div class="hint">本机识别为 <b class="mono">{html.escape(detected_ip)}</b></div>'
+
+    return page('渡口登录 · Ferry', f"""
+<h1>渡口 · Ferry</h1>
+<div class="sub">本机网络受限时，借一台能上网的内网主机中转流量</div>
 {errbox}
+
 <div class="card">
   <form method="post" action="/login">
     {csrf_in}
-    <label>你的局域网 IP</label>
-    <input type="text" name="ip" placeholder="例如 10.141.59.235"
-           pattern="[0-9.]+" required autofocus>
     <label>临时密钥</label>
-    <input type="text" name="code" placeholder="8 位密钥，向管理员索取"
-           style="text-transform:uppercase" required maxlength="16">
-    <button type="submit">登录</button>
+    <input type="text" name="code" placeholder="8 位密钥"
+           style="text-transform:uppercase;font-size:19px;letter-spacing:3px;text-align:center;font-family:Consolas,Monaco,monospace"
+           required maxlength="16" autofocus autocomplete="off" spellcheck="false">
+    {ip_field}
+    <button type="submit" style="width:100%">进入</button>
   </form>
+  {ip_note}
 </div>
-<div class="card" style="background:#fafbfc">
-  <div style="font-size:13px;color:#78909c">
-    临时密钥默认 12 小时有效，且**只能用一次**。<br>
-    不知道自己的 IP？在命令行运行 <code>ipconfig</code>，看「IPv4 地址」。
+
+<div class="card">
+  <h2 style="margin-top:0">这是什么</h2>
+  <div style="font-size:13.5px;line-height:1.8">
+    校园网按<strong>账号</strong>限制上网能力的时候，局域网内部通常仍然是通的。
+    渡口利用这一点：通过 SSH 隧道，把你的流量交给一台<b>能上网的局域网主机</b>
+    中转出去。对你来说只是设了个代理，实际出口在别人家。<br><br>
+    隧道是 <code>ssh -D</code> 动态转发（加密），本地还有一个双协议代理
+    （HTTP + SOCKS5 同端口），因为 Windows 系统代理不认 SOCKS5 —— 这是个
+    很容易踩的坑，所以干脆做成同一个端口两种协议。
   </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">三步用起来</h2>
+  <div class="step"><div class="n">1</div><div class="t">
+    <b>拿到密钥</b><div class="hint">找管理员要一个 8 位密钥。一次性，用过即废。</div>
+  </div></div>
+  <div class="step"><div class="n">2</div><div class="t">
+    <b>登录并下载部署包</b><div class="hint">登录后点下载，得到一个 .cmd 文件。</div>
+  </div></div>
+  <div class="step"><div class="n">3</div><div class="t">
+    <b>双击运行</b><div class="hint">自动检测 SSH、生成密钥、建隧道、设代理、开开机自启。
+      第一次需要把打印出来的公钥发给管理员，之后不用再管。</div>
+  </div></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">密钥规则</h2>
+  <div class="kv"><div class="k">一次性</div><div class="v">
+    登录成功即失效。要再登录请申请新密钥。</div></div>
+  <div class="kv"><div class="k">有效期</div><div class="v">
+    默认 12 小时。过期未使用同样作废。</div></div>
+  <div class="kv"><div class="k">限速</div><div class="v">
+    每个账号默认 5 MB/s（管理员可调）。按账号计，不按连接数。</div></div>
+  <div class="kv"><div class="k">试用失败过多</div><div class="v">
+    5 分钟内错 5 次会锁定 15 分钟 —— 请找管理员在面板上解除。</div></div>
+</div>
+
+<div class="msg warn" style="font-size:13px">
+  <b>注意</b>：本服务仅用于个人学习与内网连通性测试。
+  出口流量经过他人的机器，请勿用于任何违规用途（详见页脚免责声明）。
 </div>""", refresh=None)
 
 
@@ -944,7 +1190,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if ip:
                     self.redirect('/portal')
                     return
-                self.send_html(login_page(csrf=csrf_set('login|' + self.client_ip())))
+                ip0 = self.client_ip()
+                self.send_html(login_page(
+                    csrf=csrf_set('login|' + ip0),
+                    detected_ip=ip0,
+                    # 自动识别到非私网地址（在反向代理后面）时才亮出 IP 输入框
+                    show_ip_field=not bool(PRIVATE_IP_RE.match(ip0))))
             elif path == '/portal':
                 self.handle_portal()
             elif path.startswith('/download/'):
@@ -957,6 +1208,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_proxy_mjs()
             elif path == '/api/status':
                 self.handle_api_status()
+            elif path == '/about':
+                self.handle_about()
             elif path == '/setup-hosts':
                 self.handle_setup_hosts()
             elif path == '/admin/unlock':
@@ -1039,16 +1292,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 csrf=csrf_set('login|' + src_ip)), 429)
             return
 
-        ip = (form.get('ip') or '').strip()
+        # IP 只用于登记（门户里显示"谁在用"），不再作为登录凭据。
+        # 默认取连接来源；只有用户显式填了才用表单值 —— 那种情况出现在
+        # 反向代理后面（服务端看到的是 127.0.0.1）。
+        ip = (form.get('ip') or '').strip() or src_ip
         code = (form.get('code') or '').strip().upper().replace('-', '').replace(' ', '')
         csrf_tok = csrf_set('login|' + src_ip)
 
         if not PRIVATE_IP_RE.match(ip):
-            self.send_html(login_page('IP 格式不对，只能是局域网地址（10.x / 172.16-31.x / 192.168.x）',
-                                      csrf=csrf_tok), 400)
+            # 自动检测到非私网地址（被反代了），把可选的 IP 框亮出来让用户填
+            self.send_html(login_page(
+                '识别到的来源地址不是局域网地址。请手动填写你机器的 IPv4（ipconfig 里的那个）',
+                csrf=csrf_tok, detected_ip=src_ip, show_ip_field=True), 400)
             return
         if not re.fullmatch(r'[A-Z0-9]{6,16}', code):
-            self.send_html(login_page('密钥格式不对，应该是 8 位字母数字', csrf=csrf_tok), 400)
+            self.send_html(login_page('密钥格式不对，应该是 8 位字母数字',
+                                      csrf=csrf_tok, detected_ip=ip), 400)
             return
 
         ch = hash_code(code)
@@ -1059,22 +1318,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg = '密钥无效'
             if locked:
                 msg = '尝试太频繁，已锁定 15 分钟'
-            self.send_html(login_page(msg, csrf=csrf_tok), 401 if not locked else 429)
+            self.send_html(login_page(msg, csrf=csrf_tok, detected_ip=ip), 401 if not locked else 429)
             return
         if inv['revoked']:
             rate_fail(src_ip, 'user')
             self.db.log('login_fail', src_ip, 'revoked')
-            self.send_html(login_page('这个密钥已被撤销', csrf=csrf_tok), 401)
+            self.send_html(login_page('这个密钥已被撤销', csrf=csrf_tok, detected_ip=ip), 401)
             return
         if inv['used_by_ip']:
+            # 一次性：激活过就作废。这里不回显被谁用过 —— 那会泄露别人的 IP。
             rate_fail(src_ip, 'user')
             self.db.log('login_fail', src_ip, 'already-used')
-            self.send_html(login_page(f'这个密钥已被 {inv["used_by_ip"]} 用过（一次性）', csrf=csrf_tok), 401)
+            self.send_html(login_page(
+                '这个密钥已经用过了（一次性，激活即失效）。请向管理员索取新密钥。',
+                csrf=csrf_tok, detected_ip=ip), 401)
             return
         if inv['expires_at'] < now():
             rate_fail(src_ip, 'user')
             self.db.log('login_fail', src_ip, 'expired')
-            self.send_html(login_page('密钥已过期，请向管理员索取新的', csrf=csrf_tok), 401)
+            self.send_html(login_page('密钥已过期，请向管理员索取新的', csrf=csrf_tok, detected_ip=ip), 401)
             return
 
         # 通过：绑定 IP
@@ -1262,6 +1524,78 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.db.x('UPDATE clients SET token = ? WHERE ip = ?', (tok, ip))
         self.db.log('client_resettoken', self.client_ip(), ip)
         self.send_html(admin_page(self.db, msg=f'{ip} 的新令牌：{tok}（请重新下发部署包）', csrf=csrf_set('admin|' + self.client_ip())))
+
+    def handle_about(self):
+        """关于页：讲清楚它是什么、怎么工作、边界在哪。
+
+        单独做一页而不是塞进登录页：登录页要短，让人一眼看到输入框；
+        想了解细节的人会点「关于」。
+        """
+        host = CFG['public_host'] or '10.13.24.1'
+        port = CFG['port']
+        self.send_html(page('关于 · Ferry', f"""
+<h1>关于 Ferry（渡口）</h1>
+<div class="sub">内网流量摆渡工具 · 自建 · 非商业</div>
+
+<div class="card">
+  <h2 style="margin-top:0">名字</h2>
+  <div style="font-size:13.5px;line-height:1.8">
+    Ferry = 渡口、摆渡。把一批流量从此岸（受限网络）渡到彼岸（可用出口）。
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">它怎么工作</h2>
+<pre><code>你的浏览器 ──HTTP/SOCKS5──▶ 本地双协议代理 ──SOCKS5──▶ ssh -D 隧道
+                                                          │
+                                                          ▼
+                                              远端主机 ──▶ Internet</code></pre>
+  <div class="hint">
+    隧道是 SSH 动态转发，全程加密；本地代理用同一个端口同时支持 HTTP 与
+    SOCKS5（按首字节自动识别）。
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">为什么不直接开放一个代理端口给大家用</h2>
+  <div style="font-size:13.5px;line-height:1.8">
+    实测过：校园网对学生账号之间是<strong>端口级</strong>隔离 ——
+    从另一台机器探测，22 不通、445 通、某些高端口通。哪些能过完全取决于
+    网管策略，随时会变。<br><br>
+    所以本方案是<strong>每人各自建一条 SSH 隧道直连远端</strong>。
+    远端是唯一的共享点：一台机器、一个出口、N 条独立隧道，互不影响。
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">当前配置</h2>
+  <div class="kv"><div class="k">访问地址</div><div class="v mono">http://{host}:{port}/</div></div>
+  <div class="kv"><div class="k">局域网域名</div><div class="v mono">{CFG['domain']}</div></div>
+  <div class="kv"><div class="k">远端 SSH</div><div class="v mono">{CFG['ssh_user']}@{host}:{CFG['ssh_port']}</div></div>
+  <div class="kv"><div class="k">会话时长</div><div class="v">{SESSION_HOURS} 小时</div></div>
+  <div class="kv"><div class="k">账号限速</div><div class="v">默认 5 MB/s，按账号计</div></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">已知限制</h2>
+  <div style="font-size:13.5px;line-height:1.9">
+    · 出口带宽取决于远端主机，不是无上限<br>
+    · 远端办公网可能封某些站点（实测 google 两端都不通）<br>
+    · 门户本身是 HTTP 不是 HTTPS，临时密钥在局域网内明文传输<br>
+    · 断的是 WLAN 接入层（连网关都不通）时，这套方案救不了
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">技术栈</h2>
+  <div style="font-size:13.5px;line-height:1.8">
+    门户：Python 标准库 + SQLite（远端只有 Python，没有 node/pip）<br>
+    代理：Node.js 单文件（双协议 + IP 择优 + GCRA 限速）<br>
+    隧道：OpenSSH <code>ssh -D</code><br>
+    部署包：.cmd 内嵌 PowerShell，双击即用
+  </div>
+</div>
+"""))
 
     def handle_setup_hosts(self):
         """给出把 ferry.internal 指到本机的 hosts 命令。

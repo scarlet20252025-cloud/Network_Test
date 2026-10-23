@@ -85,7 +85,12 @@ const T = (n, c, e) => {
 // ── 1. 首页 ──
 let r = await req('GET', '/');
 T('首页 200', r.status === 200);
-T('首页含登录表单', r.body.includes('渡口登录') && r.body.includes('name="ip"'));
+// 登录页现在只要求密钥：IP 由服务端自动识别（仅作登记用）。
+// 这几条同时守住"不该出现的东西"——若有人把 IP 改回必填，会立刻挂。
+T('首页含登录表单', r.body.includes('渡口登录') && r.body.includes('name="code"'));
+T('登录页不强制填 IP', !/name="ip"[^>]*required/.test(r.body));
+T('登录页说明密钥一次性', r.body.includes('一次性'));
+T('登录页回显识别到的 IP', r.body.includes('本机识别为'));
 const loginCsrf = csrf(r.body);
 T('登录页含 csrf', loginCsrf.length > 10);
 
