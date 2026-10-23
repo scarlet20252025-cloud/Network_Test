@@ -25,3 +25,4 @@ portal/err.log
 portal/*.db
 portal/*.db-*
 .ferry/
+portal/ck*.txt

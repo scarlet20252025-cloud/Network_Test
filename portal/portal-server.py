@@ -556,7 +556,8 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
 
     return page('渡口门户管理', f"""
 <h1>管理面板</h1>
-<div class="sub">创建临时密钥 · 管理已登录的机器</div>
+<div class="sub">创建临时密钥 · 管理已登录的机器 ·
+  <a href="/admin/unlock">查看 / 解除登录锁定</a></div>
 {msgbox}{codebox}
 
 <div class="card">
@@ -958,6 +959,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_api_status()
             elif path == '/setup-hosts':
                 self.handle_setup_hosts()
+            elif path == '/admin/unlock':
+                self.handle_unlock()
             elif path == '/favicon.ico':
                 self.send_response(204)
                 self.end_headers()
@@ -1007,6 +1010,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_admin_toggle(form)
             elif path == '/admin/resettoken':
                 self.handle_admin_resettoken(form)
+            elif path == '/admin/unlock':
+                self.handle_unlock(form)
             else:
                 self.send_html(page('404', '<h1>404</h1>'), 404)
         except BrokenPipeError:
@@ -1282,7 +1287,6 @@ Write-Host "已添加: $line"</pre>
   <div style="font-size:13px;color:#78909c;margin-top:10px">
     执行后访问 <code>http://{html.escape(domain)}:{CFG['port']}/</code>
   </div>
-</div>
 
 <div class="card">
   <h2 style="margin-top:0">Linux / macOS</h2>
@@ -1299,6 +1303,84 @@ Write-Host "已添加: $line"</pre>
 </div>
 """
         self.send_html(page('配置局域网域名', body))
+
+    def handle_unlock(self, form=None):
+        """解除某个 IP 的登录锁定。
+
+        为什么需要：速率限制按来源 IP 记。如果内网有人故意用错误密钥猛敲，
+        会把该 IP 锁 15 分钟 —— 连带坐在同一台机器后面的无辜用户。
+        没有这个入口，管理员只能干等。
+
+        GET  → 列出当前被锁的 IP
+        POST → 解除指定 IP
+
+        这是管理操作，必须已登录管理面板。
+        """
+        if not self.is_admin():
+            self.redirect('/admin')
+            return
+
+        # target 可能来自 POST 表单（点「解除」按钮）或 GET query（直接带参数）。
+        # 踩过的坑：第一版只读 query，POST 时 target 恒为空，
+        # 于是永远走「显示列表」分支返回 200，按钮看起来点了没反应。
+        target = ''
+        if form:
+            target = (form.get('ip') or '').strip()
+        if not target:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            target = (qs.get('ip') or [''])[0].strip()
+
+        # csrf_set 每次调用都会轮换 token 并返回新的，所以这里拿到的
+        # 就是当前有效的那个。不能复用别处的 token —— 那是上一次的。
+        csrf_tok = csrf_set('admin|' + self.client_ip())
+
+        if not target:
+            with _ratelimit_lock:
+                nowt = now()
+                locked = [
+                    (k.split('|', 1)[-1], k.split('|', 1)[0], max(0, v.get('locked_until', 0) - nowt))
+                    for k, v in _ratelimit.items()
+                    if v.get('locked_until', 0) > nowt
+                ]
+            rows = ''.join(
+                '<tr><td class="mono">' + html.escape(ip) + '</td>'
+                '<td>' + html.escape(scope) + '</td>'
+                '<td>' + str(sec // 60 + 1) + ' 分钟</td>'
+                '<td><form method="post" action="/admin/unlock" style="display:inline">'
+                '<input type="hidden" name="csrf" value="' + html.escape(csrf_tok) + '">'
+                '<input type="hidden" name="ip" value="' + html.escape(ip) + '">'
+                '<button class="sm ghost" type="submit">解除</button></form></td></tr>'
+                for ip, scope, sec in locked)
+            # 注意：即使没有锁定项也要输出 csrf token。
+            # 踩过的坑：第一版只在表格行里放 token，列表为空时页面完全没有
+            # csrf，任何 POST 都会被 403 —— 表现为「解锁按钮永远是坏的」。
+            hidden_csrf = '<input type="hidden" name="csrf" value="' + html.escape(csrf_tok) + '">'
+            self.send_html(page('解除锁定', (
+                '<h1>登录锁定</h1>'
+                '<div class="sub">被速率限制锁住的来源 IP（5 分钟内失败 5 次锁 15 分钟）</div>'
+                '<div class="card"><table><thead><tr><th>IP</th><th>类型</th><th>剩余</th><th></th></tr></thead>'
+                '<tbody>' + (rows or '<tr><td colspan="4" class="muted">当前没有锁定的 IP</td></tr>') + '</tbody></table>'
+                + '<div style="display:none">' + hidden_csrf + '</div>'
+                + '</div>'
+                '<div class="card" style="background:#fafbfc"><div style="font-size:13px;color:#78909c">'
+                '反复被锁说明有人在试 —— 应该先换密钥，而不是反复解锁。'
+                '</div></div>'
+            )))
+            return
+
+        if not PRIVATE_IP_RE.match(target):
+            self.send_html(page('参数错误', '<h1>IP 格式不对</h1>'), 400)
+            return
+
+        with _ratelimit_lock:
+            hit = []
+            for scope in ('user', 'admin'):
+                k = _rl_key(scope, target)
+                if k in _ratelimit:
+                    _ratelimit.pop(k)
+                    hit.append(scope)
+        self.db.log('admin_unlock', self.client_ip(), target + ' (' + (','.join(hit) or '无锁定') + ')')
+        self.redirect('/admin')
 
     def handle_api_status(self):
         """给本机 GUI/脚本查的简单状态。不带敏感信息。"""

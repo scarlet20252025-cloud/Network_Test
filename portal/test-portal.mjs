@@ -1,7 +1,11 @@
 // 门户端到端测试（含 CSRF：每个 POST 都要先 GET 拿 token）
 import http from 'node:http';
 
-const BASE = process.env.PORTAL || 'http://127.0.0.1:18080';
+// 支持两种传参方式（与 test-security.mjs 保持一致，避免一个能跑一个不能）：
+//   PORTAL=http://host:port
+//   或 PORTAL_HOST + PORTAL_PORT
+const BASE = process.env.PORTAL
+  || `http://${process.env.PORTAL_HOST || '127.0.0.1'}:${process.env.PORTAL_PORT || 18080}`;
 const ADMIN_PW = process.env.ADMIN_PW || '';
 
 let userCookie = '';
@@ -55,6 +59,28 @@ const T = (n, c, e) => {
   console.log(`${c ? '✅' : '❌'} ${n}${e ? '  ' + e : ''}`);
   if (c) pass++; else fail++;
 };
+
+// ── 0. 前置：清掉速率限制 ──
+// 为什么需要：本测试会故意制造多次登录失败（验证 401/403），
+// 5 次之后服务端就把本机 IP 锁 15 分钟，后续所有用例全变 429。
+// 真实场景下这就是「有人在爆破把正常用户锁了」，所以：
+//   本地跑 → 用管理接口解锁
+//   远端跑 → 同样先解锁，否则第二次跑必挂
+{
+  const g0 = await req('GET', '/admin', { as: 'admin' });
+  const tok0 = csrf(g0.body);
+  if (tok0) {
+    await req('POST', '/admin/login', { form: { pw: ADMIN_PW, csrf: tok0 }, as: 'admin' });
+    const g1 = await req('GET', '/admin/unlock', { as: 'admin' });
+    const tok1 = csrf(g1.body);
+    if (tok1) {
+      await req('POST', '/admin/unlock', { form: { ip: '127.0.0.1', csrf: tok1 }, as: 'admin' });
+      // 远端测试时来源 IP 是 10.13.x，也一并尝试
+      await req('POST', '/admin/unlock', { form: { ip: '10.13.24.1', csrf: tok1 }, as: 'admin' });
+    }
+  }
+  adminCookie = '';
+}
 
 // ── 1. 首页 ──
 let r = await req('GET', '/');
@@ -205,6 +231,30 @@ if (rawCk.includes('.')) {
   T('篡改 cookie 被拒', r.status === 302);
 } else {
   T('篡改 cookie 被拒', false, '取不到原始 cookie');
+}
+
+// ── 19. 解除锁定（管理操作）──
+// 注意：前面「无效密钥 401」「公网 IP 被拒」等会累积速率限制计数。
+// 远端跑完整套件时必然触发 429，所以最后必须解锁，否则下次跑就全挂。
+r = await req('GET', '/admin/unlock', { as: 'admin' });
+T('解除锁定页可访问', r.status === 200 && r.body.includes('登录锁定'));
+const unlockCsrf = csrf(r.body);
+r = await req('POST', '/admin/unlock', {
+  form: { ip: '127.0.0.1', csrf: unlockCsrf }, as: 'admin',
+});
+T('解除本机锁定成功', r.status === 302);
+
+// 解除后应能再次登录（用一个新密钥验证）
+g = await getCsrf('/admin', 'admin');
+r = await req('POST', '/admin/newcode', { form: { note: '解锁后验证', hours: '1', csrf: csrf(r.body) || g.token }, as: 'admin' });
+const m3 = /class="big mono">([A-Z0-9]{8})</.exec(r.body);
+if (m3) {
+  userCookie = '';
+  const g2 = await getCsrf('/');
+  r = await req('POST', '/login', { form: { ip: '10.141.59.235', code: m3[1], csrf: g2.token } });
+  T('解锁后能正常登录', r.status === 302);
+} else {
+  T('解锁后能正常登录', false, '没拿到新密钥');
 }
 
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
