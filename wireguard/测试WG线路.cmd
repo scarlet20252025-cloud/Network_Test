@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul 2>&1
 setlocal
 title ¶É¿Ú ¡¤ WireGuard ÏßÂ·²âÊÔ
 
