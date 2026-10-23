@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-  Get-BorrowPorts.ps1 — 统一的端口解析（供 borrow-net.ps1 / 借网助手.ps1 / startup.ps1 复用）
+  Get-FerryPorts.ps1 — 统一的端口解析（供 ferry.ps1 / 渡口助手.ps1 / startup.ps1 复用）
 
   为什么单独一个文件：
     端口从「写死 10808/10809」改成「dual-proxy 自动探测」，就必须有一个
@@ -17,7 +17,7 @@
 #>
 
 # 兼容 PS 5.1（没有 ?? 和 ?.）
-function Get-BorrowPorts {
+function Get-FerryPorts {
   param(
     [int]$SocksPort = 0,
     [int]$HttpPort = 0,
@@ -66,9 +66,9 @@ function Get-BorrowPorts {
   兼容旧调用方式：很多地方直接写 $SocksPort / $HttpPort。
   这个函数在 dot-source 时把这些变量设为解析结果。
 #>
-function Set-BorrowPortVars {
+function Set-FerryPortVars {
   param([int]$SocksPort = 0, [int]$HttpPort = 0)
-  $p = Get-BorrowPorts -SocksPort $SocksPort -HttpPort $HttpPort
+  $p = Get-FerryPorts -SocksPort $SocksPort -HttpPort $HttpPort
   Set-Variable -Name SocksPort -Value $p.SocksPort -Scope Script
   Set-Variable -Name HttpPort  -Value $p.HttpPort  -Scope Script
   return $p

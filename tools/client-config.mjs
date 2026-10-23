@@ -3,7 +3,7 @@
  * client-config.mjs — 生成「给使用者的一键配置」
  *
  * 解决的问题：
- *   局域网里其他机器要用借网，得知道三件事：**代理地址、用户名、令牌**。
+ *   局域网里其他机器要用渡口，得知道三件事：**代理地址、用户名、令牌**。
  *   口头传递容易错（尤其是 IP 和那一长串令牌），而且机器一换 IP 就得重发。
  *
  * 这个脚本做一件事：把某个用户的接入信息生成一个**自包含**的文件，
@@ -30,7 +30,7 @@ import { UserStore } from './proxy-users.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
-const USERS_FILE = process.env.BORROW_USERS || path.join(ROOT, 'users.json');
+const USERS_FILE = process.env.FERRY_USERS || path.join(ROOT, 'users.json');
 const PORTS_FILE = path.join(ROOT, '.proxy-state', 'ports.json');
 
 const { values, positionals } = parseArgs({
@@ -139,7 +139,7 @@ let ext = '';
 
 if (values.format === 'md') {
   ext = 'md';
-  content = `# ${user.name} 的借网接入配置
+  content = `# ${user.name} 的渡口接入配置
 
 | 项 | 值 |
 |---|---|
@@ -176,7 +176,7 @@ curl --socks5-hostname ${host}:${ports.http} -U '${user.name}:${user.token}' htt
 } else if (values.format === 'sh') {
   ext = 'sh';
   content = `#!/bin/sh
-# ${user.name} 的借网配置 — 用法: . ./borrow-${user.name}.sh  (或 sh borrow-${user.name}.sh)
+# ${user.name} 的渡口配置 — 用法: . ./borrow-${user.name}.sh  (或 sh borrow-${user.name}.sh)
 export http_proxy="http://${host}:${ports.http}"
 export https_proxy="http://${host}:${ports.http}"
 export HTTP_PROXY="$http_proxy"
@@ -192,7 +192,7 @@ echo "验证: curl -x \\$https_proxy -U '${user.name}:${user.token}' https://www
   ext = 'cmd';
   content = `@echo off
 rem ============================================================
-rem  ${user.name} 的借网配置
+rem  ${user.name} 的渡口配置
 rem  代理 : ${proxyUrl}
 rem  用户 : ${user.name}
 rem  令牌 : ${user.token}

@@ -1,11 +1,11 @@
-﻿# 生成「借网助手」图标 + 快捷方式（一次性脚本）
+﻿# 生成「渡口助手」图标 + 快捷方式（一次性脚本）
 # 用法: pwsh -File tools/make-shortcut.ps1
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
 $ToolsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$IconDir  = Join-Path $ToolsDir '.borrow-net'
-$IcoPath  = Join-Path $IconDir 'borrow-net.ico'
+$IconDir  = Join-Path $ToolsDir '.ferry'
+$IcoPath  = Join-Path $IconDir 'ferry.ico'
 if (-not (Test-Path $IconDir)) { $null = New-Item -ItemType Directory -Path $IconDir }
 
 # ---------- 1. 画图标 ----------
@@ -115,7 +115,7 @@ function New-Lnk([string]$lnkPath, [string]$desc) {
   $lnk = $WshShell.CreateShortcut($lnkPath)
   # 用 powershell.exe 承载，-WindowStyle Hidden 隐藏控制台窗口，只显示 WinForms 界面
   $lnk.TargetPath       = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-  $lnk.Arguments        = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f (Join-Path $ToolsDir '借网助手.ps1')
+  $lnk.Arguments        = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f (Join-Path $ToolsDir '渡口助手.ps1')
   $lnk.WorkingDirectory = $ToolsDir
   $lnk.IconLocation     = "$IcoPath,0"
   $lnk.Description      = $desc
@@ -125,11 +125,11 @@ function New-Lnk([string]$lnkPath, [string]$desc) {
 }
 
 $desktop = [Environment]::GetFolderPath('Desktop')
-New-Lnk (Join-Path $desktop '借网助手.lnk') '在直连与借网之间切换，显示当前出口 IP'
+New-Lnk (Join-Path $desktop '渡口助手.lnk') '在直连与渡口之间切换，显示当前出口 IP'
 
 # 开始菜单（当前用户）
 $startDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
-New-Lnk (Join-Path $startDir '借网助手.lnk') '在直连与借网之间切换，显示当前出口 IP'
+New-Lnk (Join-Path $startDir '渡口助手.lnk') '在直连与渡口之间切换，显示当前出口 IP'
 
 Write-Host ""
-Write-Host "完成。双击桌面「借网助手」即可启动。" -ForegroundColor Green
+Write-Host "完成。双击桌面「渡口助手」即可启动。" -ForegroundColor Green

@@ -1,17 +1,17 @@
 ﻿#requires -Version 5.1
 <#
-  借网助手 · 图形界面版
+  渡口助手 · 图形界面版
   场景：本机被学校断网时，借远端主机（办公网）的出口上网。
-  底层逻辑与 borrow-net.ps1 完全一致，只是把命令换成了按钮。
+  底层逻辑与 ferry.ps1 完全一致，只是把命令换成了按钮。
 
   用法：双击本文件（或在 PowerShell 里执行）即可打开窗口。
 
-  日志：界面日志与未捕获异常都会镜像写入 .borrow-net\gui.log，
+  日志：界面日志与未捕获异常都会镜像写入 .ferry\gui.log，
         窗口莫名消失时先看这个文件。
 #>
 
 # ---------------- 日志出口（最先建，后面任何崩溃都能留下记录） ----------------
-$StateDir = Join-Path $PSScriptRoot '.borrow-net'
+$StateDir = Join-Path $PSScriptRoot '.ferry'
 $LogFile  = Join-Path $StateDir 'gui.log'
 try { if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir -Force } } catch {}
 
@@ -35,14 +35,14 @@ trap {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-Write-AppLog "======== 借网助手启动 pid=$PID PS=$($PSVersionTable.PSVersion) ========"
+Write-AppLog "======== 渡口助手启动 pid=$PID PS=$($PSVersionTable.PSVersion) ========"
 
 # ---------------- 配置 ----------------
 $RemoteHost   = 'pcs'
 # ⚠️ Windows 系统代理（WinINET 的 ProxyServer）只支持 HTTP 代理，不支持 SOCKS5。
 # 必须把系统代理指向 dual-proxy 的 HTTP 端口，绝不能填 SOCKS 端口。
 # 历史事故：这里曾写成 "127.0.0.1:10808"，导致浏览器 / .NET / Electron
-# 把 SOCKS5 端口当 HTTP 代理去连 —— 全部秒失败，用户看到「开了借网浏览器打不开」。
+# 把 SOCKS5 端口当 HTTP 代理去连 —— 全部秒失败，用户看到「开了渡口浏览器打不开」。
 #
 # 端口不再写死：dual-proxy 启动时自动探测可用端口并写进 .proxy-state\ports.json，
 # 这里读它。这样端口被别人的 Clash / 公司代理占了也能正常工作。
@@ -54,8 +54,8 @@ $ToolsDir     = $PSScriptRoot
 $KeeperScript = Join-Path $ToolsDir 'ssh-tunnel-keeper.ps1'
 $BridgeScript = Join-Path $ToolsDir 'dual-proxy.mjs'
 
-. (Join-Path $ToolsDir 'Get-BorrowPorts.ps1')
-$_ports    = Get-BorrowPorts -SocksPort $SocksPort -HttpPort $HttpPort
+. (Join-Path $ToolsDir 'Get-FerryPorts.ps1')
+$_ports    = Get-FerryPorts -SocksPort $SocksPort -HttpPort $HttpPort
 $SocksPort = $_ports.SocksPort
 $HttpPort  = $_ports.HttpPort
 
@@ -82,7 +82,7 @@ function Get-EgressIp {
   param([string]$Proxy = '', [switch]$NoProxy)
   # 依次尝试多个出口 IP 查询源；单源失败不阻塞整行。用 curl 而不是 Invoke-WebRequest：
   # PS 5.1(.NET Framework) 的 -Proxy 不支持 socks5，而本 GUI 就跑在 powershell 5.1 下，
-  # 用 IWR 会导致借网出口永远取不到（实测：同一个函数在 pwsh 7 里全过、在 5.1 里全 FAIL）。
+  # 用 IWR 会导致渡口出口永远取不到（实测：同一个函数在 pwsh 7 里全过、在 5.1 里全 FAIL）。
   $urls = @('http://myip.ipip.net', 'http://ip.3322.net', 'http://members.3322.org/dyndns/getip')
   foreach ($u in $urls) {
     try {
@@ -147,12 +147,12 @@ function Test-BridgeAlive { return (Test-PortOpen -Port $HttpPort -TimeoutMs 300
 # ---------------- 系统代理的备份与还原（唯一实现，两处入口都调它） ----------------
 #
 # 为什么单独抽出来：这个逻辑曾在「开启」「切回直连」「托盘退出」三处各写一遍，
-# 改一处漏两处。实测事故：备份文件被写成借网地址本身（True|http://127.0.0.1:10809），
-# 于是「切回直连」= 还原成借网地址，但隧道已停 → 所有网站打不开。
+# 改一处漏两处。实测事故：备份文件被写成渡口地址本身（True|http://127.0.0.1:10809），
+# 于是「切回直连」= 还原成渡口地址，但隧道已停 → 所有网站打不开。
 #
 # 核心规则：
-#   1. 备份只在「当前代理不是借网地址」时才写 —— 绝不把借网地址存进备份
-#   2. 还原时若发现备份内容本身就是借网地址（历史污染），视为无效备份
+#   1. 备份只在「当前代理不是渡口地址」时才写 —— 绝不把渡口地址存进备份
+#   2. 还原时若发现备份内容本身就是渡口地址（历史污染），视为无效备份
 #   3. 无效备份时：优先回落到 Clash（本机原有代理），其次直接关闭系统代理
 #      —— 绝不留一个指向已停隧道的代理
 
@@ -170,9 +170,9 @@ function Test-BorrowProxyValue {
 
 function Save-ProxyBackup {
   $cur = Get-ProxyState
-  # 当前值就是借网地址 → 不能备份它（会污染）
+  # 当前值就是渡口地址 → 不能备份它（会污染）
   if (Test-BorrowProxyValue $cur.Server) {
-    Write-AppLog "跳过备份：当前代理是借网地址（$($cur.Server)），不能存进备份"
+    Write-AppLog "跳过备份：当前代理是渡口地址（$($cur.Server)），不能存进备份"
     return
   }
   if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir -Force }
@@ -208,7 +208,7 @@ function Restore-ProxyBackup {
         $valid = $true
       }
       else {
-        Write-AppLog "备份内容本身是借网地址（$s），已判定无效，不还原" 'WARN'
+        Write-AppLog "备份内容本身是渡口地址（$s），已判定无效，不还原" 'WARN'
       }
     }
   }
@@ -283,9 +283,9 @@ function Stop-Keeper {
 }
 
 # ---------------- 隧道自愈 ----------------
-# 场景：用户点了「开启借网」，系统代理指向 10809，但 ssh -D 死了 / keeper 被杀。
+# 场景：用户点了「开启渡口」，系统代理指向 10809，但 ssh -D 死了 / keeper 被杀。
 # 此时 dual-proxy 会把请求转发到没人监听的 10808 → 所有站点失败，
-# 而系统代理还在，用户以为「借网开着」。必须自动拉起，不能只靠人去点。
+# 而系统代理还在，用户以为「渡口开着」。必须自动拉起，不能只靠人去点。
 #
 # 两道防线：
 #   1) dual-proxy 自带 watchdog（--keeper 参数），它每 5s 探一次 10808；
@@ -295,7 +295,7 @@ $script:LastRepairAt = [DateTime]::MinValue
 
 function Repair-Tunnel {
   param($State)
-  if (-not $State.ProxyOn) { return }                       # 没开借网就别管
+  if (-not $State.ProxyOn) { return }                       # 没开渡口就别管
   if ($State.ProxySrv -eq "127.0.0.1:$SocksPort") { return }  # 旧 SOCKS 写法交给 StaleProxy 提示
   if ($State.ProxySrv -ne "http://127.0.0.1:$HttpPort") { return }
 
@@ -420,9 +420,9 @@ function Get-State {
   $st     = Get-ProxyState
   $keeper = [bool](Get-KeeperProc)
 
-  # 「借网生效」的判据：系统代理指向 HTTP 端口（浏览器真能用）+ 隧道存活 + bridge 存活。
+  # 「渡口生效」的判据：系统代理指向 HTTP 端口（浏览器真能用）+ 隧道存活 + bridge 存活。
   # 注意：如果系统代理还是历史的 SOCKS 端口写法，这里判为「未生效」并置 StaleProxy，
-  # 让 UI 提示用户重新点一次「开启借网」来修复，而不是把它当成正常状态。
+  # 让 UI 提示用户重新点一次「开启渡口」来修复，而不是把它当成正常状态。
   $httpProxy = "http://127.0.0.1:$HttpPort"
   $socksProxy = "127.0.0.1:$SocksPort"
   $stale = ($st.Enabled -and $st.Server -eq $socksProxy)
@@ -451,7 +451,7 @@ function Get-State {
 # ---------------- 界面 ----------------
 
 $form                 = New-Object System.Windows.Forms.Form
-$form.Text           = '借网助手'
+$form.Text           = '渡口助手'
 $form.Size           = New-Object System.Drawing.Size(470, 600)
 $form.StartPosition  = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
@@ -500,13 +500,13 @@ $form.Add_Resize({
 # ===== 托盘图标 =====
 # 启动即常驻，只有「退出」才 Dispose —— 这是 Windows 桌面软件的通行行为
 $script:NotifyIcon = New-Object System.Windows.Forms.NotifyIcon
-$script:NotifyIcon.Text = '借网助手'
-$script:NotifyIcon.BalloonTipTitle = '借网助手'
+$script:NotifyIcon.Text = '渡口助手'
+$script:NotifyIcon.BalloonTipTitle = '渡口助手'
 $script:NotifyIcon.Visible = $true
 
 # 图标：优先用 make-shortcut.ps1 生成的 .ico，取不到就退化为系统 Application 图标
 $script:TrayIco = $null
-$icoCandidate = Join-Path $StateDir 'borrow-net.ico'
+$icoCandidate = Join-Path $StateDir 'ferry.ico'
 if (Test-Path $icoCandidate) {
   try { $script:TrayIco = New-Object System.Drawing.Icon($icoCandidate) } catch { $script:TrayIco = $null }
 }
@@ -519,7 +519,7 @@ $mnuShow = New-Object System.Windows.Forms.ToolStripMenuItem
 $mnuShow.Text = '显示主窗口'
 $mnuShow.Add_Click({ Show-MainWindow })
 $mnuToggle = New-Object System.Windows.Forms.ToolStripMenuItem
-$mnuToggle.Text = '开启借网 / 切回直连'
+$mnuToggle.Text = '开启渡口 / 切回直连'
 $mnuToggle.Add_Click({
     $s = Get-State
     if ($s.Borrowing) { $btnOff.PerformClick() } else { $btnOn.PerformClick() }
@@ -697,7 +697,7 @@ function Set-Rounded {
 $btnOn                = New-Object System.Windows.Forms.Button
 $btnOn.Location       = New-Object System.Drawing.Point(16, 262)
 $btnOn.Size           = New-Object System.Drawing.Size(204, 54)
-$btnOn.Text           = '开启借网'
+$btnOn.Text           = '开启渡口'
 $btnOn.FlatStyle      = 'Flat'
 $btnOn.FlatAppearance.BorderSize = 0
 $btnOn.FlatAppearance.MouseOverBackColor = $clrOkDark
@@ -785,7 +785,7 @@ $script:AutoTimer.Interval = 10000
 $script:AutoTimer.Add_Tick({ if ($chkAuto.Checked) { $null = Update-Status } })
 
 # 轻量心跳：只做「端口是否就绪 / 后台探测是否完成」这类毫秒级判断，
-# 让开启借网后的状态变化能在一两秒内反映到界面，而不用等 10 秒大刷新。
+# 让开启渡口后的状态变化能在一两秒内反映到界面，而不用等 10 秒大刷新。
 $script:PendingOn = $null
 $script:BeatTimer = New-Object System.Windows.Forms.Timer
 $script:BeatTimer.Interval = 1000
@@ -859,7 +859,7 @@ function Update-Status {
 
   # ---- 顶部大状态：现在用什么网 + 有没有网 ----
   if ($s.Borrowing) {
-    $lblBig.Text      = '借网中'
+    $lblBig.Text      = '渡口中'
     $lblBig.ForeColor = $clrOk
     $lblPath.Text     = "本机 → $RemoteHost（办公网）→ 互联网"
   }
@@ -871,7 +871,7 @@ function Update-Status {
   else {
     $lblBig.Text      = '无网络'
     $lblBig.ForeColor = $clrBad
-    $lblPath.Text     = '两个出口都不通 —— 点「开启借网」试试'
+    $lblPath.Text     = '两个出口都不通 —— 点「开启渡口」试试'
   }
 
   if ($s.CurrentIp) {
@@ -913,7 +913,7 @@ function Update-Status {
   $script:DetailRows[3].ForeColor = if ($s.HasNet) { $clrText } else { $clrMuted }
 
   if ($s.StaleProxy) {
-    $script:DetailRows[3].Text = "⚠ 系统代理是旧版 SOCKS 写法，浏览器会打不开 —— 点「开启借网」自动修复"
+    $script:DetailRows[3].Text = "⚠ 系统代理是旧版 SOCKS 写法，浏览器会打不开 —— 点「开启渡口」自动修复"
     $script:DetailRows[3].ForeColor = $clrBad
   }
 
@@ -929,7 +929,7 @@ $btnOn.Add_Click({
   try {
     $s = Get-State
     if ($s.Borrowing) {
-      Add-Log '借网已在运行'
+      Add-Log '渡口已在运行'
     }
     else {
       # 历史遗留：系统代理被旧版写成 SOCKS 端口，先清掉避免被当成正常状态
@@ -958,7 +958,7 @@ $btnOff.Add_Click({
   try {
     Add-Log '还原系统代理…'
     # 顺序很重要：先停隧道再还原代理会让「端口是否监听」的检查失效。
-    # 这里先还原（此时借网端口还活着，检查才准），再停隧道。
+    # 这里先还原（此时渡口端口还活着，检查才准），再停隧道。
     Restore-ProxyBackup
     Add-Log '停止隧道…'
     Stop-Keeper

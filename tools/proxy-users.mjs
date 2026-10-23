@@ -1,5 +1,5 @@
 /**
- * proxy-users.mjs — 借网代理的多用户与认证
+ * proxy-users.mjs — 渡口代理的多用户与认证
  *
  * 设计目标（对应用户要求「便捷且容易管理，状态显示也要合格」）：
  *   1. **零依赖**：只用 Node 内置模块，不引第三方包。
@@ -33,8 +33,12 @@ const DEFAULT_SETTINGS = {
   maxConnsPerUser: 40,
   // 单用户每天字节上限（上行+下行），0 = 不限
   dailyBytesPerUser: 0,
+  // 单用户带宽上限（字节/秒）。默认 5 MB/s。
+  // 为什么默认限速：出口是共享的，一个人拉大文件会占满，
+  // 其他人的网页就打不开了。5 MB/s 够看 4K 视频，又不至于挤死别人。
+  bytesPerSecPerUser: 5 * 1024 * 1024,
   // 拒绝时的提示语（会出现在 HTTP 407 / SOCKS5 认证失败里）
-  authRealm: 'borrow-net',
+  authRealm: 'ferry',
 };
 
 /* ---------------- 工具 ---------------- */
@@ -368,7 +372,7 @@ export function parseBasicAuth(headerValue) {
 /** 生成 HTTP 407 响应头 */
 export function basicAuthChallenge(realm) {
   return {
-    'Proxy-Authenticate': `Basic realm="${realm || 'borrow-net'}", charset="UTF-8"`,
+    'Proxy-Authenticate': `Basic realm="${realm || 'ferry'}", charset="UTF-8"`,
     'Content-Type': 'text/plain; charset=utf-8',
   };
 }

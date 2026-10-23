@@ -1,6 +1,6 @@
 ﻿#requires -Version 7.0
 <#
-  verify-outage-remote.ps1 — 在被控机上验证「断网后借网仍可用」
+  verify-outage-remote.ps1 — 在被控机上验证「断网后渡口仍可用」
 
   为什么要用「另一台机器」做实验：
     模拟断网会切断本机所有公网出站，包括远程会话本身。
@@ -8,7 +8,7 @@
     局域网（10.141.x → 10.113.x），不受影响，实验可完整跑完。
 
   实验逻辑：
-    1. 起一条 ssh -D 隧道指向 pcs (10.13.24.1) —— 借网的通道
+    1. 起一条 ssh -D 隧道指向 pcs (10.13.24.1) —— 渡口的通道
     2. 加防火墙规则：放行局域网三段 + 回环，阻断其余出站
        （这正是学校「禁用上网但局域网通」的做法）
     3. 验证：直连应失败、经隧道应成功
@@ -23,7 +23,7 @@ $GitSsh     = 'C:\Program Files\Git\usr\bin\ssh.exe'
 $RemoteUser = 'pcserver'
 $RemoteHost = '10.13.24.1'
 $SocksPort  = 10808
-$Tag        = 'BorrowNet-OutageSim'
+$Tag        = 'Ferry-OutageSim'
 
 function Log($m, $c = 'Gray') { Write-Output $m }
 
@@ -61,7 +61,7 @@ Log ("  直连出公网 : $d0")
 
 # ───────────── 1. 起隧道 ─────────────
 Log ''
-Log '===== [1] 建立借网隧道（xt → pcs） ====='
+Log '===== [1] 建立渡口隧道（xt → pcs） ====='
 Remove-SimRules
 $tunnel = [Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{
   FileName               = $GitSsh
@@ -76,9 +76,9 @@ if ($tunnel.HasExited) {
 }
 Log ("  隧道 PID=" + $tunnel.Id)
 $b0 = Probe 'https://github.com' -ViaSocks
-Log ("  借网 github : $b0")
+Log ("  渡口 github : $b0")
 if ($b0 -ne 'OK') {
-  Log '  ❌ 隧道起来了但借网不通，先排查再继续'
+  Log '  ❌ 隧道起来了但渡口不通，先排查再继续'
   $tunnel.Kill()
   exit 1
 }
@@ -114,7 +114,7 @@ try {
 
   # ───────────── 4. 关键验证 ─────────────
   Log ''
-  Log '===== [4] 断网状态下经借网访问 ====='
+  Log '===== [4] 断网状态下经渡口访问 ====='
   $results = [ordered]@{}
   $results['github.com']      = Probe 'https://github.com'          -ViaSocks 20
   $results['api.github.com']  = Probe 'https://api.github.com'      -ViaSocks 15
@@ -123,7 +123,7 @@ try {
   foreach ($k in $results.Keys) { Log ("  {0,-16} : {1}" -f $k, $results[$k]) }
 
   $ipOut = & curl.exe -s --max-time 15 --socks5-hostname "127.0.0.1:$SocksPort" http://myip.ipip.net 2>$null
-  Log ("  借网出口     : " + ($ipOut -replace '[\r\n]+',' '))
+  Log ("  渡口出口     : " + ($ipOut -replace '[\r\n]+',' '))
 
   # ───────────── 5. 稳定性 ─────────────
   Log ''
@@ -153,12 +153,12 @@ Log ''
 Log '===== 结论 ====='
 $pass = @($results.Values | Where-Object { $_ -eq 'OK' }).Count
 Log ("  公网被切断: $publicBlocked")
-Log ("  借网站点通: $pass/4")
+Log ("  渡口站点通: $pass/4")
 Log ("  稳定性    : $okN/$tot")
 if ($publicBlocked -and $pass -ge 3) {
-  Log '  RESULT: PASS — 断网后借网可用'
+  Log '  RESULT: PASS — 断网后渡口可用'
 } elseif (-not $publicBlocked) {
   Log '  RESULT: INVALID — 公网没断干净，结论不可信'
 } else {
-  Log '  RESULT: FAIL — 断网后借网也不可用'
+  Log '  RESULT: FAIL — 断网后渡口也不可用'
 }

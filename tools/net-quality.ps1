@@ -1,12 +1,19 @@
-﻿# 借网链路真实可达性 + 稳定性实测
+﻿# 渡口链路真实可达性 + 稳定性实测
 # 不看出口 IP，而是量：DNS / TCP / TLS / HTTP / 吞吐 / 抖动 / 丢包 / 长连接保持
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File net-quality.ps1
 param(
-  [int]$SocksPort = 10808,
+  [int]$SocksPort = 0,
   [int]$Rounds = 3
 )
+# ---- 端口解析（与 ferry.ps1 / 渡口助手.ps1 共用同一入口）----
+# 不自带默认值：写死端口会让本脚本在「开了端口自适应」的环境里探错端口。
+. (Join-Path $PSScriptRoot 'Get-FerryPorts.ps1')
+$_fp = Get-FerryPorts -SocksPort $SocksPort -HttpPort $(if ($PSBoundParameters.ContainsKey('HttpPort')) { $HttpPort } else { 0 })
+$SocksPort = $_fp.SocksPort
+if ($PSBoundParameters.ContainsKey('HttpPort')) { $HttpPort = $_fp.HttpPort }
+
 $ErrorActionPreference = 'Continue'
-$logDir = Join-Path $PSScriptRoot '.borrow-net'
+$logDir = Join-Path $PSScriptRoot '.ferry'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir 'net-quality.log'
 function L($m) {
@@ -67,10 +74,10 @@ L '========== 1. 各目标可达性（每目标 3 次取中位）=========='
 $rows = @()
 foreach ($name in $targets.Keys) {
   $url = $targets[$name]
-  foreach ($mode in @('直连', '借网')) {
+  foreach ($mode in @('直连', '渡口')) {
     $totals = @(); $ttfbs = @(); $codes = @(); $ok = 0
     for ($i = 0; $i -lt 3; $i++) {
-      if ($mode -eq '借网') { $r = Curl-Time $url -Borrow } else { $r = Curl-Time $url -NoProxy }
+      if ($mode -eq '渡口') { $r = Curl-Time $url -Borrow } else { $r = Curl-Time $url -NoProxy }
       if ($r) { $codes += $r.Code; $totals += $r.Total; $ttfbs += $r.Ttfb; if ($r.Code -match '^[23]') { $ok++ } }
       Start-Sleep -Milliseconds 200
     }
@@ -92,10 +99,10 @@ foreach ($name in $targets.Keys) {
 # ---------- 2. 抖动与丢包（连打 20 次小请求）----------
 L ''
 L '========== 2. 抖动与丢包（20 次连续请求）=========='
-foreach ($mode in @('直连', '借网')) {
+foreach ($mode in @('直连', '渡口')) {
   $totals = @(); $fail = 0
   for ($i = 0; $i -lt 20; $i++) {
-    if ($mode -eq '借网') { $r = Curl-Time 'http://www.baidu.com' -Borrow } else { $r = Curl-Time 'http://www.baidu.com' -NoProxy }
+    if ($mode -eq '渡口') { $r = Curl-Time 'http://www.baidu.com' -Borrow } else { $r = Curl-Time 'http://www.baidu.com' -NoProxy }
     if ($r -and $r.Code -match '^[23]') { $totals += $r.Total } else { $fail++ }
   }
   $st = Stat $totals
@@ -107,21 +114,21 @@ foreach ($mode in @('直连', '借网')) {
 
 # ---------- 3. DNS 解析路径 ----------
 L ''
-L '========== 3. DNS 解析（借网是否走远端解析）=========='
+L '========== 3. DNS 解析（渡口是否走远端解析）=========='
 $dnsTargets = @('www.baidu.com', 'github.com', 'www.google.com', 'nonexistent-abcxyz-12345.com')
 foreach ($d in $dnsTargets) {
   $a = & curl.exe -s -o NUL -w '%{http_code} %{time_namelookup}' --proxy $socks --max-time 12 "http://$d" 2>$null
   $b = & curl.exe -s -o NUL -w '%{http_code} %{time_namelookup}' --noproxy '*' --max-time 12 "http://$d" 2>$null
-  L ("  {0,-32} 借网[{1}]  直连[{2}]" -f $d, $a, $b)
+  L ("  {0,-32} 渡口[{1}]  直连[{2}]" -f $d, $a, $b)
 }
 
 # ---------- 4. 吞吐（下载 3MB）----------
 L ''
 L '========== 4. 吞吐（下载 3MB 测试文件）=========='
 $dlUrl = 'https://speed.cloudflare.com/__down?bytes=3000000'
-foreach ($mode in @('直连', '借网')) {
+foreach ($mode in @('直连', '渡口')) {
   $a = @('-s', '-o', 'NUL', '-w', '%{http_code} %{time_total} %{speed_download}', '--max-time', '40')
-  if ($mode -eq '借网') { $a += '--proxy', $socks } else { $a += '--noproxy', '*' }
+  if ($mode -eq '渡口') { $a += '--proxy', $socks } else { $a += '--noproxy', '*' }
   $a += $dlUrl
   $out = & curl.exe @a 2>$null
   if ($out) {

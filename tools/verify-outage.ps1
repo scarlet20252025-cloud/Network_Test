@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-  verify-outage.ps1 — 一次跑完「模拟断网 → 验证借网 → 自动恢复 → 出报告」
+  verify-outage.ps1 — 一次跑完「模拟断网 → 验证渡口 → 自动恢复 → 出报告」
 
   为什么做成全自动：
     模拟断网会同时切断本机所有公网出站，**包括 DSH 自己的模型调用**。
@@ -18,20 +18,27 @@
     .\verify-outage.ps1
 
   输出：
-    控制台即时打印 + 写文件 .borrow-net\verify-outage.log
+    控制台即时打印 + 写文件 .ferry\verify-outage.log
     ⚠️ 运行期间（约 40 秒）本机无法上公网，属预期；结束会自动恢复。
 #>
 [CmdletBinding()]
 param(
   [string]$RemoteHost = 'pcs',
-  [int]$SocksPort = 10808,
+  [int]$SocksPort = 0,
   [int]$HttpPort = 10809,
   [int]$HoldSeconds = 25
 )
 
+# ---- 端口解析（与 ferry.ps1 / 渡口助手.ps1 共用同一入口）----
+# 不自带默认值：写死端口会让本脚本在「开了端口自适应」的环境里探错端口。
+. (Join-Path $PSScriptRoot 'Get-FerryPorts.ps1')
+$_fp = Get-FerryPorts -SocksPort $SocksPort -HttpPort $(if ($PSBoundParameters.ContainsKey('HttpPort')) { $HttpPort } else { 0 })
+$SocksPort = $_fp.SocksPort
+if ($PSBoundParameters.ContainsKey('HttpPort')) { $HttpPort = $_fp.HttpPort }
+
 $ErrorActionPreference = 'Continue'
-$Tag = 'BorrowNet-OutageSim'
-$StateDir = Join-Path $PSScriptRoot '.borrow-net'
+$Tag = 'Ferry-OutageSim'
+$StateDir = Join-Path $PSScriptRoot '.ferry'
 if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir -Force }
 $LogFile = Join-Path $StateDir 'verify-outage.log'
 
@@ -93,10 +100,10 @@ $d0 = Probe 'http://myip.ipip.net'
 $b0 = Probe 'http://myip.ipip.net' -ViaBorrow
 Log ("  SSH 到远端      : $ssh0")
 Log ("  直连出公网      : $d0")
-Log ("  借网出公网      : $b0")
+Log ("  渡口出公网      : $b0")
 if ($b0 -ne 'OK') {
   Log ''
-  Log '❌ 借网现在就不通，先修好再验证（GUI 点「开启借网」或跑 borrow-net.ps1 On）' 'Red'
+  Log '❌ 渡口现在就不通，先修好再验证（GUI 点「开启渡口」或跑 ferry.ps1 On）' 'Red'
   exit 1
 }
 Log ''
@@ -127,14 +134,14 @@ try {
   else { Log '  ⚠️ 公网没断干净，结论会失真（可能有多网卡或规则被覆盖）' 'Yellow' }
 
   Log ''
-  Log "[3/5] 关键验证：断网状态下借网是否可用"
+  Log "[3/5] 关键验证：断网状态下渡口是否可用"
   $results = [ordered]@{}
   $results['SSH 到远端'] = ProbeSsh
   $results['github.com'] = Probe 'https://github.com' -ViaBorrow -TimeoutSec 20
   $results['api.github.com'] = Probe 'https://api.github.com' -ViaBorrow -TimeoutSec 15
   $results['baidu.com'] = Probe 'https://www.baidu.com' -ViaBorrow -TimeoutSec 15
   $results['bilibili.com'] = Probe 'https://www.bilibili.com' -ViaBorrow -TimeoutSec 15
-  $results['出口IP(借网)'] = Probe 'http://myip.ipip.net' -ViaBorrow
+  $results['出口IP(渡口)'] = Probe 'http://myip.ipip.net' -ViaBorrow
 
   foreach ($k in $results.Keys) {
     $v = $results[$k]
@@ -170,11 +177,11 @@ $borrowAll = @($results['github.com'], $results['api.github.com'], $results['bai
 $borrowOk = @($borrowAll | Where-Object { $_ -eq 'OK' }).Count
 
 Log ("  断网时 SSH 到远端 : {0}" -f $results['SSH 到远端'])
-Log ("  断网时借网出公网  : {0}/4 个站点通（持续采样 {1}/{2}）" -f $borrowOk, $okCount, $total)
+Log ("  断网时渡口出公网  : {0}/4 个站点通（持续采样 {1}/{2}）" -f $borrowOk, $okCount, $total)
 Log ''
 
 if ($publicBlocked -and $borrowOk -ge 3) {
-  Log '  ✅ 验证通过：公网被切断的情况下，借网仍然可用。' 'Green'
+  Log '  ✅ 验证通过：公网被切断的情况下，渡口仍然可用。' 'Green'
   Log '     说明学校那种「禁用上网但局域网通」的断网，本方案能顶住。' 'Green'
 }
 elseif (-not $publicBlocked) {
@@ -182,11 +189,11 @@ elseif (-not $publicBlocked) {
 }
 elseif ($results['SSH 到远端'] -ne 'OK') {
   Log '  ❌ SSH 到远端也断了 —— 说明模拟规则误伤了局域网，' 'Red'
-  Log '     或远端确实不可达。这种情况借网无法救场。' 'Red'
+  Log '     或远端确实不可达。这种情况渡口无法救场。' 'Red'
 }
 else {
-  Log '  ❌ SSH 通但借网站点不通 —— 问题在 dual-proxy / 系统代理层。' 'Red'
-  Log '     看 .borrow-net\bridge.log 里 CONNECT 的记录。' 'Red'
+  Log '  ❌ SSH 通但渡口站点不通 —— 问题在 dual-proxy / 系统代理层。' 'Red'
+  Log '     看 .ferry\bridge.log 里 CONNECT 的记录。' 'Red'
 }
 
 Log ''

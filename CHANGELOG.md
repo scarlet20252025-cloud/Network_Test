@@ -1,3 +1,60 @@
+## v0.6.0 — 2026-10-23
+
+### 更名：borrow-net → Ferry（渡口）
+
+- 工程名统一为 `ferry`，中文显示名「渡口」
+- `borrow-net.ps1` → `ferry.ps1`、`借网助手.ps1` → `渡口助手.ps1`
+- `Get-BorrowPorts.ps1` → `Get-FerryPorts.ps1`
+- 运行期状态目录 `.borrow-net` → `.ferry`
+- 局域网域名 **`ferry.internal`**（`.internal` 是 ICANN 保留 TLD）
+
+### 登录门户（新增）
+
+`portal/portal-server.py` —— 远端运行，Python 标准库零依赖。
+
+- 以**局域网 IP 作账号**，需输入**临时密钥**（默认 12 小时、一次性）
+- 登录后下载一键部署包（`.cmd` 内嵌 base64 PowerShell，双击即完成
+  建密钥 → 建隧道 → 起代理 → 设系统代理 → 注册自启）
+- 管理面板：创建/撤销密钥、停用账号、重置令牌、事件日志
+- `/setup-hosts` 页给出配置 `ferry.internal` 的命令
+
+安全加固（17 项测试）：
+
+| 项 | 做法 |
+|---|---|
+| 密钥存储 | 只存 SHA-256 |
+| 会话 | HMAC-SHA256 签名 cookie，库存 sid 哈希 |
+| CSRF | 所有 POST 带一次性 token |
+| 爆破防护 | 5 分钟 5 次锁 15 分钟，**用户/管理分开计数** |
+| 响应头 | CSP / X-Frame-Options / nosniff / Referrer-Policy |
+| 开放重定向 | Location 只允许站内 |
+| IP 校验 | 只接受私网段 |
+
+### 每账号限速（新增，默认 5 MB/s）
+
+- 实现用 **GCRA**，实测精度：20MB@5MB/s → 正好 4.00s / 5.00 MB/s
+- 为什么不用令牌桶：初始给满一桶 → 前 1 秒免费 → 实测超速 2.4 倍
+- 转发改为队列式 `pipeLimited`（`'data'` 只入队，单泵出队），
+  实测 20MB 零丢字节
+
+### 修复
+
+- **HTTP 明文代理返回 0 字节**：把上游原始响应（含状态行）直接写进
+  Node 的 `ServerResponse`，Node 自己补 `Content-Length: 0`，body 全丢。
+  改为解析响应头后分别 `writeHead` + 转发 body。
+- **`close` 时误判**：`relayHttpResponse` 的 `sock.on('close')` 无条件报
+  「未返回完整响应头」，导致每个正常响应都变 502。改为只在
+  `headersParsed === false` 时报错。
+- **诊断脚本端口写死**：`net-quality` / `outage-watch` / `simulate-outage` /
+  `verify-outage` 仍用 10808，与端口自适应冲突。统一改走 `Get-FerryPorts`。
+- **4 个 PS 脚本缺 BOM**：改名时写入丢了 BOM，PS 5.1 按 ANSI 读会破坏语法。
+
+### 全工程静态审查
+
+`portal/audit.py` 检查空 catch / `.Result` / 硬编码端口 / SQL 拼接 /
+令牌进日志 / 缺 encoding / 缺 BOM / TODO。当前 **0 错误**。
+
+测试总计：门户 43 + 安全 17 + 限速 9 = **69 项全通过**。
 ## v0.5.0 — 2026-10-23
 
 ### 多用户与便捷接入
@@ -22,8 +79,8 @@
 
 - `dual-proxy.mjs` 加 `--port auto`（默认）：从 10800 起探测可用端口，
   结果写进 `.proxy-state/ports.json`。
-- `tools/Get-BorrowPorts.ps1`：端口解析唯一入口，`borrow-net.ps1` /
-  `借网助手.ps1` / `startup.ps1` 共用。优先级：显式参数 > 状态文件 > 默认值。
+- `tools/Get-FerryPorts.ps1`：端口解析唯一入口，`ferry.ps1` /
+  `渡口助手.ps1` / `startup.ps1` 共用。优先级：显式参数 > 状态文件 > 默认值。
 - 自启 `.cmd` 不再写死端口，改传 `--keeper` 让 dual-proxy 自己探测。
 
 **热加载**
@@ -59,8 +116,8 @@
 ### 新增
 - **断网可用性已验证**：在实验机 `xt` 上删除默认路由（保留 `10.0.0.0/8`）
   模拟学校「禁用上网但局域网通」的断网方式，实测结果 PASS：
-  公网三个目标全 `FAIL(000)`，经借网 4/4 站点 200，20 秒采样 4/4，
-  借网出口 `203.0.113.47` 与实验机自身出口不同，证明走的是另一条路。
+  公网三个目标全 `FAIL(000)`，经渡口 4/4 站点 200，20 秒采样 4/4，
+  渡口出口 `203.0.113.47` 与实验机自身出口不同，证明走的是另一条路。
 - `tools/verify-outage-remote.ps1`：在实验机上断网验证（路由表方案，
   不影响本机会话）。为什么不用防火墙见 `docs/实测数据.md` §6.2。
 
@@ -76,7 +133,7 @@
 - `tools/egress-diag.ps1` —— 一次性诊断，结论已固化进文档
 - `tools/concurrency-probe.mjs`、`tools/gh-probe.mjs`、`tools/test-smart-resolve.mjs`
   —— 与 `bw-probe` / `socks-layer-probe` / `longrun` 功能重复
-- `tools/borrow-net.keeper.lock` —— 运行期文件误入库
+- `tools/ferry.keeper.lock` —— 运行期文件误入库
 ## v0.4.1 — 2026-10-23
 
 ### 修复
@@ -100,12 +157,12 @@
 
 ## v0.4.0 — 2026-10-23
 
-### 隧道自愈（修复「开启借网后只有部分站点可用」）
+### 隧道自愈（修复「开启渡口后只有部分站点可用」）
 
 根因是两个独立缺陷叠加：
 
 1. `ssh-tunnel-keeper.ps1` 的单例锁只比对 PID。keeper 被强制结束时会残留
-   `borrow-net.keeper.lock`，而 Windows 会把该 PID 复用给任意新进程，新 keeper
+   `ferry.keeper.lock`，而 Windows 会把该 PID 复用给任意新进程，新 keeper
    据此判定「已有实例在跑」并 `exit 0` 自杀，隧道再也起不来。
    修复：除 PID 存活外，还校验该 PID 的命令行确实包含本脚本名。
 2. `dual-proxy.mjs` 没有任何隧道存活检测。ssh 死后它仍把请求转发到无人监听的
@@ -117,7 +174,7 @@
 - `spawn(..., {detached:true})` 在 Windows 上拉起的 powershell 会在约 300 ms 内
   以 code=0 退出，脚本一行都不执行（连它自己的日志文件都不会生成）。改为非 detached。
 - `stdio:'ignore'` 会把子进程输出全部丢弃，启动失败无从排查。改为 pipe 转发，
-  同时 keeper 自身写 `.borrow-net/keeper.log`。
+  同时 keeper 自身写 `.ferry/keeper.log`。
 - keeper 现在用管道接收 ssh 的 stderr 并落盘，`Host key` / `Permission denied` /
   绑定失败等原因不再消失。
 
@@ -146,22 +203,22 @@
 - 新增 `docs/实测报告.md`：完整实测数据。
 - 新增 `docs/踩坑记录.md`：19 条实测坑。
 - 新增 `docs/远端部署.md`：远端目标状态与远程操作约定。
-- 工程落库到 GitHub（仓库名 `Network_Test`，工程名 `borrow-net`）。
+- 工程落库到 GitHub（仓库名 `Network_Test`，工程名 `ferry`）。
 
 ### 实测发现（重要）
 
 - **WireGuard 从未投入使用**：本机无客户端、无 wg0 适配器、`tracert` 显示 SSH 走校内 3 跳直连。
   真正承载流量的是 `ssh -D` 动态转发。远端 WG 服务端 Running/Auto 但零握手。
-- **吞吐瓶颈在远端**：借网 1.05 MB/s ≈ 远端自身 0.95 MB/s，SSH 隧道几乎零带宽损耗。
-- **借网不是翻墙工具**：google 直连与借网都超时；国内站点延迟几乎无损。
-- **抖动放大 4.55 倍**：直连 0.029s → 借网 0.132s（20 次连续请求）。
+- **吞吐瓶颈在远端**：渡口 1.05 MB/s ≈ 远端自身 0.95 MB/s，SSH 隧道几乎零带宽损耗。
+- **渡口不是翻墙工具**：google 直连与渡口都超时；国内站点延迟几乎无损。
+- **抖动放大 4.55 倍**：直连 0.029s → 渡口 0.132s（20 次连续请求）。
 - **零丢包**：40 次请求全成功。
 - **最大单点**：断网若发生在 WLAN 接入层，SSH 无法建立，整套失效。
 
 ### 托盘图标（结论：程序侧无法固定）
 
 - 查清 `NotifyIcon.Visible=true` **是生效的**，图标确实在 Win11 溢出区里
-  （UIA 枚举 `TopLevelWindowForOverflowXamlIsland` 可见「借网助手」）。
+  （UIA 枚举 `TopLevelWindowForOverflowXamlIsland` 可见「渡口助手」）。
 - `HKCU:\Control Panel\NotifyIconSettings` 按 **exe 身份**记录，
   所有寄生在 `powershell.exe` 的图标共享一条记录（本机只有 `Codex Dream Skin`）。
 - 尝试并全部失败：`mouse_event` 拖拽、`SendInput` 相对位移拖拽、
@@ -171,7 +228,7 @@
 
 ## v0.2.0 — 2026-10-22
 
-- GUI `借网助手.ps1`：三态状态卡、出口 IP 对照、后台异步探测、1s 心跳、日志出口、托盘。
+- GUI `渡口助手.ps1`：三态状态卡、出口 IP 对照、后台异步探测、1s 心跳、日志出口、托盘。
 - 修 PS 5.1 下 socks5 不支持（改用 curl.exe）。
 - 修出口探测被 Clash 污染（`--noproxy '*'`）。
 - 修 `ShowDialog` 模态循环导致最小化即退出（改 `Application.Run`）。
@@ -181,7 +238,7 @@
 
 ## v0.1.0 — 2026-10-22
 
-- CLI `borrow-net.ps1`：`On` / `Off` / `Status` / `InstallStartup` / `UninstallStartup`。
+- CLI `ferry.ps1`：`On` / `Off` / `Status` / `InstallStartup` / `UninstallStartup`。
 - 常驻保活 `ssh-tunnel-keeper.ps1`：断线 5s 重连，单例锁。
 - 设计定调：**只切系统代理，不动路由表**（无自环风险，`Off` 可干净还原）。
 - 远端就绪：WireGuard 服务端 + sshd + IP 转发 + 防火墙规则。

@@ -7,7 +7,7 @@
     也就是说：
       - WLAN 接入正常、能拿到 IP、能到网关、能到校内其他机器（含远端）
       - 但去公网的流量被挡
-    借网之所以能生效，正是因为 SSH 走的是**局域网**（到远端 10.x），
+    渡口之所以能生效，正是因为 SSH 走的是**局域网**（到远端 10.x），
     根本不需要公网出口；出公网那一段由远端办公网承担。
 
   本脚本用 Windows 防火墙出站规则复刻这个状态：
@@ -17,14 +17,14 @@
 
   ⚠️ 需要管理员权限。执行期间本机无法访问公网（但 SSH 到远端仍通），属预期。
   ⚠️ 万一脚本异常退出没回滚，手动执行：
-       Remove-NetFirewallRule -DisplayName 'BorrowNet-OutageSim-*'
+       Remove-NetFirewallRule -DisplayName 'Ferry-OutageSim-*'
 
   用法：
     # 管理员 PowerShell
     .\simulate-outage.ps1 -Action Start
     # 验证
     curl.exe -s -o NUL -w "%{http_code}" --noproxy "*" http://myip.ipip.net   # 应失败 = 公网被禁
-    curl.exe -s -x http://127.0.0.1:10809 http://myip.ipip.net                # 应成功 = 借网有效
+    curl.exe -s -x http://127.0.0.1:10809 http://myip.ipip.net                # 应成功 = 渡口有效
     # 恢复
     .\simulate-outage.ps1 -Action Stop
 #>
@@ -34,12 +34,19 @@ param(
   [ValidateSet('Start', 'Stop', 'Status')]
   [string]$Action,
   [string]$RemoteHost = 'pcs',
-  [int]$SocksPort = 10808,
+  [int]$SocksPort = 0,
   [int]$HttpPort = 10809
 )
 
+# ---- 端口解析（与 ferry.ps1 / 渡口助手.ps1 共用同一入口）----
+# 不自带默认值：写死端口会让本脚本在「开了端口自适应」的环境里探错端口。
+. (Join-Path $PSScriptRoot 'Get-FerryPorts.ps1')
+$_fp = Get-FerryPorts -SocksPort $SocksPort -HttpPort $(if ($PSBoundParameters.ContainsKey('HttpPort')) { $HttpPort } else { 0 })
+$SocksPort = $_fp.SocksPort
+if ($PSBoundParameters.ContainsKey('HttpPort')) { $HttpPort = $_fp.HttpPort }
+
 $ErrorActionPreference = 'Stop'
-$Tag = 'BorrowNet-OutageSim'
+$Tag = 'Ferry-OutageSim'
 
 function Test-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -63,17 +70,17 @@ function Show-State {
   $b = Test-Borrow
   Write-Host ("  SSH 到 {0,-5} : {1}" -f $RemoteHost, $(if ($sshOk) { '通' } else { '断' }))
   Write-Host ("  直连出公网     : {0}" -f $(if ($d) { '通' } else { '断（符合预期）' }))
-  Write-Host ("  借网出公网     : {0}" -f $(if ($b) { '通' } else { '断' }))
+  Write-Host ("  渡口出公网     : {0}" -f $(if ($b) { '通' } else { '断' }))
   Write-Host ''
   if (-not $d -and $b) {
-    Write-Host '✅ 这就是「断网但借网有效」的状态' -ForegroundColor Green
+    Write-Host '✅ 这就是「断网但渡口有效」的状态' -ForegroundColor Green
   }
   elseif (-not $d -and -not $b) {
     if (-not $sshOk) {
-      Write-Host '❌ 借网也断了，因为连不上远端 —— 检查隧道 / keeper' -ForegroundColor Red
+      Write-Host '❌ 渡口也断了，因为连不上远端 —— 检查隧道 / keeper' -ForegroundColor Red
     }
     else {
-      Write-Host '⚠️ SSH 通但借网不通 —— 检查 dual-proxy 与系统代理' -ForegroundColor Yellow
+      Write-Host '⚠️ SSH 通但渡口不通 —— 检查 dual-proxy 与系统代理' -ForegroundColor Yellow
     }
   }
   elseif ($d -and $b) {

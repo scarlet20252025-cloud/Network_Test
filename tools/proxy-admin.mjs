@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * proxy-admin.mjs — 借网代理的用户管理命令行
+ * proxy-admin.mjs — 渡口代理的用户管理命令行
  *
  * 设计原则：**一条命令一件事，输出直接可复制发给对方**。
  *
@@ -12,7 +12,7 @@
  *   node proxy-admin.mjs disable 张三                    停用（不删，可恢复）
  *   node proxy-admin.mjs enable 张三                     恢复
  *   node proxy-admin.mjs remove 张三                     删除
- *   node proxy-admin.mjs settings [--auth on|off] [--max-conns N] [--daily-mb N]
+ *   node proxy-admin.mjs settings [--auth on|off] [--max-conns N] [--daily-mb N] [--rate-mb N] [--rate-mb N]
  *
  * 也可以给「客户端怎么配置」直接出说明：
  *   node proxy-admin.mjs show 张三
@@ -24,7 +24,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const USERS_FILE = process.env.BORROW_USERS || path.join(HERE, '..', 'users.json');
+const USERS_FILE = process.env.FERRY_USERS || path.join(HERE, '..', 'users.json');
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
@@ -33,6 +33,7 @@ const { values, positionals } = parseArgs({
     auth: { type: 'string', default: '' },
     'max-conns': { type: 'string', default: '' },
     'daily-mb': { type: 'string', default: '' },
+    'rate-mb': { type: 'string', default: '' },
     port: { type: 'string', default: '10809' },
     help: { type: 'boolean', default: false },
   },
@@ -62,7 +63,7 @@ function fmtAgo(iso) {
 }
 
 function printHelp() {
-  console.log(`借网代理 — 用户管理
+  console.log(`渡口代理 — 用户管理
 
   node proxy-admin.mjs add <名字> [--note "备注"]   新增并打印令牌
   node proxy-admin.mjs list                        列表
@@ -180,11 +181,18 @@ switch (cmd) {
       s.dailyBytesPerUser = Math.round(mb * 1024 * 1024);
       changed = true;
     }
+    if (values['rate-mb']) {
+      const mb = Number(values['rate-mb']);
+      if (!Number.isFinite(mb) || mb < 0) { console.error('❌ --rate-mb 必须是非负数'); process.exit(1); }
+      s.bytesPerSecPerUser = Math.round(mb * 1024 * 1024);
+      changed = true;
+    }
     if (changed) store.save();
     console.log('当前设置：');
     console.log(`  要求认证        : ${s.requireAuth ? '是' : '否（任何人都能用）'}`);
     console.log(`  单用户连接上限  : ${s.maxConnsPerUser || '不限'}`);
     console.log(`  单用户每日流量  : ${s.dailyBytesPerUser ? fmtBytes(s.dailyBytesPerUser) : '不限'}`);
+    console.log(`  单用户带宽上限  : ${s.bytesPerSecPerUser ? fmtBytes(s.bytesPerSecPerUser) + '/s' : '不限'}`);
     break;
   }
 

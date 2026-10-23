@@ -37,13 +37,13 @@ $ErrorActionPreference = 'Stop'
 $KeeperScript = Join-Path $PSScriptRoot 'ssh-tunnel-keeper.ps1'
 $BridgeScript = Join-Path $PSScriptRoot 'dual-proxy.mjs'
 $StartupDir   = [Environment]::GetFolderPath('Startup')
-$CmdPath      = Join-Path $StartupDir 'BorrowNetKeeper.cmd'
-$LnkPath      = Join-Path $StartupDir 'BorrowNetKeeper.lnk'
-$LockPath     = Join-Path $PSScriptRoot 'borrow-net.keeper.lock'
+$CmdPath      = Join-Path $StartupDir 'FerryKeeper.cmd'
+$LnkPath      = Join-Path $StartupDir 'FerryKeeper.lnk'
+$LockPath     = Join-Path $PSScriptRoot 'ferry.keeper.lock'
 
-# ---- 端口解析（与 borrow-net.ps1 / 借网助手.ps1 共用同一入口）----
-. (Join-Path $PSScriptRoot 'Get-BorrowPorts.ps1')
-$_ports    = Get-BorrowPorts -SocksPort $SocksPort -HttpPort $HttpPort
+# ---- 端口解析（与 ferry.ps1 / 渡口助手.ps1 共用同一入口）----
+. (Join-Path $PSScriptRoot 'Get-FerryPorts.ps1')
+$_ports    = Get-FerryPorts -SocksPort $SocksPort -HttpPort $HttpPort
 $SocksPort = $_ports.SocksPort
 $HttpPort  = $_ports.HttpPort
 
@@ -139,7 +139,7 @@ switch ($Action) {
     $lines = @(
       '@echo off',
       'chcp 936 >nul',
-      'rem 借网自启：1) ssh -D SOCKS5 隧道  2) 双协议代理(HTTP+SOCKS5)',
+      'rem 渡口自启：1) ssh -D SOCKS5 隧道  2) 双协议代理(HTTP+SOCKS5)',
       "start `"`" /min powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$KeeperScript`" -RemoteHost $RemoteHost -SocksPort $SocksPort",
       'rem 等隧道起来（timeout 在非交互环境会失败，用 ping 代替）',
       'ping -n 6 127.0.0.1 >nul'
@@ -161,11 +161,11 @@ switch ($Action) {
     [IO.File]::WriteAllLines($CmdPath, $lines, $gbk)
     Write-Ok "已写入: $CmdPath"
 
-    if (Test-Path $LnkPath) { Remove-Item $LnkPath -Force; Write-Host '    已移除旧的 BorrowNetKeeper.lnk' }
+    if (Test-Path $LnkPath) { Remove-Item $LnkPath -Force; Write-Host '    已移除旧的 FerryKeeper.lnk' }
 
     Write-Host ''
     Write-Host '下次登录 Windows 时自动启动隧道 + 双协议代理（不自动切系统代理）。' -ForegroundColor Cyan
-    Write-Host '断网时跑 borrow-net.ps1 On 或双击「借网助手」切代理。' -ForegroundColor Cyan
+    Write-Host '断网时跑 ferry.ps1 On 或双击「渡口助手」切代理。' -ForegroundColor Cyan
   }
 
   'Uninstall' {
@@ -215,7 +215,7 @@ switch ($Action) {
     if ($code -ne '200') { throw "github.com 经代理返回 $code" }
     Write-Ok "github.com 经 HTTP 代理 code=$code"
     $ip = & curl.exe -s --proxy "http://127.0.0.1:$HttpPort" --max-time 15 'http://myip.ipip.net' 2>$null
-    Write-Ok "借网出口: $ip"
+    Write-Ok "渡口出口: $ip"
 
     Write-Host '[6/6] 读系统代理的程序验证（.NET）'
     try {

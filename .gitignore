@@ -17,3 +17,11 @@ client-configs/
 
 # 临时测试/调试文件
 scratch/
+portal/portal.db
+portal/portal-admin.txt
+portal/test-portal.db
+portal/out.log
+portal/err.log
+portal/*.db
+portal/*.db-*
+.ferry/

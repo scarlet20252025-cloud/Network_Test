@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# push-with-retry.sh — 借网环境下推送 git 仓库，带自动重试
+# push-with-retry.sh — 渡口环境下推送 git 仓库，带自动重试
 #
-# 为什么需要：借网链路到 github 偶发 TLS 抖动（schannel 报 handshake failed、
+# 为什么需要：渡口链路到 github 偶发 TLS 抖动（schannel 报 handshake failed、
 # openssl 报 unexpected eof），单次推送成功率约 50%。重试 5 次基本都能成。
 #
 # 必需参数（缺一不可）：

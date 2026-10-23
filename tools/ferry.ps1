@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-  borrow-net.ps1 — 借网主控脚本（常驻版）
+  ferry.ps1 — 渡口主控脚本（常驻版）
 
   场景：本机被学校断网时，借远端主机（办公网）的出口上网。
   远端已就绪：WireGuard 隧道 Running + IP 转发 Enabled + 防火墙放行；
@@ -38,12 +38,12 @@ $ErrorActionPreference = 'Stop'
 
 $ToolsDir     = $PSScriptRoot
 $KeeperScript = Join-Path $ToolsDir 'ssh-tunnel-keeper.ps1'
-$StateDir     = Join-Path $ToolsDir '.borrow-net'
-$TaskName     = 'borrow-net-keeper'
+$StateDir     = Join-Path $ToolsDir '.ferry'
+$TaskName     = 'ferry-keeper'
 
 # ---- 端口解析（唯一入口，GUI/CLI/自启共用）----
-. (Join-Path $ToolsDir 'Get-BorrowPorts.ps1')
-$_ports    = Get-BorrowPorts -SocksPort $SocksPort -HttpPort $HttpPort
+. (Join-Path $ToolsDir 'Get-FerryPorts.ps1')
+$_ports    = Get-FerryPorts -SocksPort $SocksPort -HttpPort $HttpPort
 $SocksPort = $_ports.SocksPort
 $HttpPort  = $_ports.HttpPort
 
@@ -111,8 +111,8 @@ function Get-ProxyState {
 # ---- 系统代理的备份与还原（与 GUI 版逻辑一致，改动要两边同步） ----
 #
 # 核心规则：
-#   1. 备份只在「当前代理不是借网地址」时才写 —— 绝不把借网地址存进备份
-#   2. 还原时若发现备份内容本身是借网地址（历史污染），视为无效备份
+#   1. 备份只在「当前代理不是渡口地址」时才写 —— 绝不把渡口地址存进备份
+#   2. 还原时若发现备份内容本身是渡口地址（历史污染），视为无效备份
 #   3. 无效备份时优先回落到 Clash（本机原有代理），其次直接关闭系统代理
 #      —— 绝不留一个指向已停隧道的代理
 
@@ -131,7 +131,7 @@ function Test-BorrowProxyValue {
 function Save-ProxyBackup {
   $cur = Get-ProxyState
   if (Test-BorrowProxyValue $cur.Server) {
-    Write-Host "  跳过备份：当前代理是借网地址（$($cur.Server)）" -ForegroundColor DarkGray
+    Write-Host "  跳过备份：当前代理是渡口地址（$($cur.Server)）" -ForegroundColor DarkGray
     return
   }
   if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir -Force }
@@ -168,7 +168,7 @@ function Restore-ProxyBackup {
         $valid = $true
       }
       else {
-        Write-Host "  备份内容本身是借网地址（$s），判定无效，不还原" -ForegroundColor Yellow
+        Write-Host "  备份内容本身是渡口地址（$s），判定无效，不还原" -ForegroundColor Yellow
       }
     }
   }
@@ -217,7 +217,7 @@ switch ($Action) {
     # 只有「系统代理指向 HTTP 端口」且「隧道存活」才算真的开着
     $alreadyOn = $ps.Enabled -and $ps.Server -eq "http://127.0.0.1:$HttpPort" -and (Test-SocksAlive)
     if ($alreadyOn) {
-      Write-Host "借网已在运行中（SOCKS $SocksPort + HTTP $HttpPort 均存活）" -ForegroundColor Green
+      Write-Host "渡口已在运行中（SOCKS $SocksPort + HTTP $HttpPort 均存活）" -ForegroundColor Green
       return
     }
 
@@ -285,7 +285,7 @@ switch ($Action) {
       # ⚠️ 硬性保护：HTTP 代理没起来时，绝对不写系统代理。
       # 历史事故：回退写 "127.0.0.1:10808"(SOCKS5) 会让所有读系统代理的程序
       # （浏览器 / .NET / Electron）把 SOCKS5 端口当 HTTP 代理连 —— 全部秒失败，
-      # 表现就是「开了借网浏览器完全不能上网」。宁可不动系统代理。
+      # 表现就是「开了渡口浏览器完全不能上网」。宁可不动系统代理。
       if (-not $bridgeOk) {
         Write-Host "  ❌ HTTP 代理 $HttpPort 未就绪，已跳过系统代理切换" -ForegroundColor Red
         Write-Host "     （不写 SOCKS 端口：系统代理只认 HTTP，写 SOCKS 会让浏览器全部打不开）" -ForegroundColor DarkGray
@@ -295,7 +295,7 @@ switch ($Action) {
 
       Write-Step "切换系统代理到 HTTP 127.0.0.1:$HttpPort"
       # 备份当前值，供 Off 还原。
-      # ⚠️ 绝不备份借网地址本身 —— 否则 Off 会「还原成借网地址」，
+      # ⚠️ 绝不备份渡口地址本身 —— 否则 Off 会「还原成渡口地址」，
       # 而那时隧道已停，所有网站打不开（实测踩过这个坑）。
       if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir }
       Save-ProxyBackup
@@ -332,13 +332,13 @@ public class InetOptRefresh {
     $direct = Get-EgressIp
     $borrow = Get-EgressIp -Proxy "socks5://127.0.0.1:$SocksPort"
     Write-Host ("  直连出口 : {0}" -f $(if ($direct) { $direct } else { '不可用（已断网？）' }))
-    Write-Host ("  借网出口 : {0}" -f $(if ($borrow) { $borrow } else { '失败' }))
-    if ($borrow) { Write-Host "借网已生效。" -ForegroundColor Green }
+    Write-Host ("  渡口出口 : {0}" -f $(if ($borrow) { $borrow } else { '失败' }))
+    if ($borrow) { Write-Host "渡口已生效。" -ForegroundColor Green }
   }
 
   'Off' {
     Write-Step "还原系统代理"
-    # 先还原代理（此时借网端口还活着，端口存活检查才准），再停隧道。
+    # 先还原代理（此时渡口端口还活着，端口存活检查才准），再停隧道。
     Restore-ProxyBackup
 
     Write-Step "停止保活进程与隧道"
@@ -354,7 +354,7 @@ public class InetOptRefresh {
   'Status' {
     $alive = Test-SocksAlive
     $st = Get-ProxyState
-    Write-Host "--- 借网状态 ---"
+    Write-Host "--- 渡口状态 ---"
     Write-Host ("  SOCKS 127.0.0.1:{0} : {1}" -f $SocksPort, $(if ($alive) { '存活' } else { '未监听' }))
     Write-Host ("  系统代理         : {0} {1}" -f $(if ($st.Enabled) { '开' } else { '关' }), $st.Server)
     $keeper = Get-KeeperProc
@@ -363,10 +363,10 @@ public class InetOptRefresh {
     $direct = Get-EgressIp -NoProxy
     $borrow = if ($alive) { Get-EgressIp -Proxy "socks5://127.0.0.1:$SocksPort" } else { '' }
     Write-Host ("  直连出口 : {0}" -f $(if ($direct) { $direct } else { '不可用（已断网）' }))
-    Write-Host ("  借网出口 : {0}" -f $(if ($borrow) { $borrow } else { '未启用/失败' }))
+    Write-Host ("  渡口出口 : {0}" -f $(if ($borrow) { $borrow } else { '未启用/失败' }))
     if ($direct -and $borrow) {
-      if ($direct -eq $borrow) { Write-Host "  注意：两者相同，借网可能没生效（代理没走通）" -ForegroundColor Yellow }
-      else { Write-Host "  两者不同，借网链路可用" -ForegroundColor Green }
+      if ($direct -eq $borrow) { Write-Host "  注意：两者相同，渡口可能没生效（代理没走通）" -ForegroundColor Yellow }
+      else { Write-Host "  两者不同，渡口链路可用" -ForegroundColor Green }
     }
   }
 
@@ -378,7 +378,7 @@ public class InetOptRefresh {
     $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
     $prn = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
     $null = Register-ScheduledTask -TaskName $TaskName -Action $act -Trigger $trg -Settings $set -Principal $prn -Force
-    Write-Host "已注册登录自启任务 '$TaskName'（只建隧道，不自动切代理；断网时跑 borrow-net.ps1 -Action On 即可）" -ForegroundColor Green
+    Write-Host "已注册登录自启任务 '$TaskName'（只建隧道，不自动切代理；断网时跑 ferry.ps1 -Action On 即可）" -ForegroundColor Green
   }
 
   'UninstallStartup' {

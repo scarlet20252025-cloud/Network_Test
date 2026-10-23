@@ -1,166 +1,244 @@
-# borrow-net
+# Ferry（渡口）
 
-在受限网络环境下，借用远端主机的出口访问互联网的常驻工具。
+> **Ferry** = 渡口 / 摆渡。把本机流量摆渡到另一条可用网络上。
+> 校园网断网时，通过一台能上网的远端主机中转，让本机继续访问互联网。
 
-数据通路为 `ssh -D` 动态转发（SOCKS5），由本地双协议代理桥接给操作系统。
-WireGuard 通道已具备服务端能力，但当前链路未启用。
+**局域网域名**：`ferry.internal`（`.internal` 是 ICANN 保留给私有网络的 TLD，
+永远不会被公网解析占用）
 
-> 仓库名与工程名无关：GitHub 仓库为 `Network_Test`，本工程按功能命名 `borrow-net`。
+---
 
-## 架构
+## 一、它解决什么问题
+
+学校的断网方式是「**禁用上网权限，但局域网仍然互通**」。
+这种情况下本机拿不到公网出口，但还能连到校内的其他机器。
+
+渡口利用这一点：
 
 ```
-浏览器 / 系统代理 ──HTTP──▶ dual-proxy(10809) ──SOCKS5──▶ ssh -D(10808) ──▶ 远端 ──▶ Internet
-                                   │
-                                   └── smart-resolve：GitHub 系域名走候选 IP 池择优建连
+使用者机器 ──ssh -D──> 远端主机（能上网）──> Internet
+             ↑
+        走局域网，不需要公网出口
 ```
 
-### 双协议代理层
+**实测结论**（在实验机上删默认路由、保留 `10.0.0.0/8` 模拟断网）：
 
-Windows 系统代理（`HKCU\...\Internet Settings` 的 `ProxyServer`）**只支持 HTTP 代理**。
-若将 `ProxyServer` 直接写为 SOCKS5 端口，浏览器、Electron、.NET、git 等均会把
-SOCKS5 端口当作 HTTP 代理连接，立即失败。
+```
+公网直连      : FAIL(000) FAIL(000) FAIL(000)   ← 确实断了
+经渡口访问    : github / api / baidu / bilibili 全 200
+出口 IP       : 218.107.0.47（联通，远端出口）
+               与实验机自己的 116.23.159.136（电信）不同 → 走的是另一条路
+20 秒采样     : 4/4
+```
 
-`dual-proxy.mjs` 在**单端口**上按连接首字节分流：
+详细数据见 [docs/实测数据.md](docs/实测数据.md)。
 
-| 首字节 | 协议 |
+---
+
+## 二、快速开始
+
+### 方式 A：登录门户（推荐，适合多人）
+
+1. 浏览器打开 `http://ferry.internal:8080/`（或 `http://10.13.24.1:8080/`）
+2. 输入**你的局域网 IP** 和**管理员给的临时密钥**（12 小时有效，一次性）
+3. 下载 `ferry-<你的IP>.cmd`，双击运行
+
+部署包会自动：检查 SSH 密钥 → 建隧道 → 起双协议代理 → 设系统代理 → 注册自启。
+
+> 第一次需要把你的公钥发给管理员加到远端，之后不用再管。
+
+### 方式 B：命令行（适合自己用）
+
+```powershell
+# 只建隧道 + 切系统代理
+powershell -ExecutionPolicy Bypass -File tools\ferry.ps1 -Action On
+
+# 看状态（含直连与渡口出口 IP 对照）
+powershell -ExecutionPolicy Bypass -File tools\ferry.ps1 -Action Status
+
+# 切回直连（还原原始系统代理，不是简单关掉）
+powershell -ExecutionPolicy Bypass -File tools\ferry.ps1 -Action Off
+```
+
+### 方式 C：图形界面
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\渡口助手.ps1
+```
+
+托盘常驻，状态卡 + 链路明细 + 日志窗。
+
+---
+
+## 三、端口不用记
+
+所有脚本都读 `.proxy-state/ports.json`（dual-proxy 启动时自动探测并写入）。
+端口被 Clash / 公司代理占了也能正常跑。
+
+```powershell
+# 想手动指定时才需要（一般不用）
+tools\ferry.ps1 -Action On -SocksPort 20808 -HttpPort 20809
+```
+
+解析优先级：**显式参数 > `.proxy-state/ports.json` > 默认 10808/10809**
+
+---
+
+## 四、多人管理
+
+```powershell
+# 加人（直接打印可转发的令牌）
+node tools\proxy-admin.mjs add 张三 --note "3 楼实验室"
+
+# 看全部
+node tools\proxy-admin.mjs list
+
+# 停用 / 恢复 / 重置令牌 / 删除
+node tools\proxy-admin.mjs disable 李四
+node tools\proxy-admin.mjs enable 李四
+node tools\proxy-admin.mjs reset 王五
+node tools\proxy-admin.mjs remove 王五
+
+# 全局设置
+node tools\proxy-admin.mjs settings --max-conns 40 --rate-mb 5
+```
+
+**改完立即生效**（热加载 120ms），不用重启代理。
+
+### 每账号限速
+
+默认 **5 MB/s**，实测精度：
+
+| 设定 | 实测 | 误差 |
+|---|---|---|
+| 2 MB/s（源速 0.91） | 0.49 MB/s（设 0.5 时） | 2% |
+| 20 MB @ 5 MB/s | 4.00s / 5.00 MB/s | 0% |
+
+实现用 **GCRA**（不是令牌桶 —— 令牌桶初始给满一桶，实测超速 2.4 倍）。
+
+---
+
+## 五、管理门户
+
+```powershell
+# 远端启动
+python portal\portal-server.py --port 8080 --public-host 10.13.24.1
+```
+
+访问 `/admin`，用 `portal-admin.txt` 里的密码登录。
+
+| 功能 | 说明 |
 |---|---|
-| `0x05` | SOCKS5 |
-| `C` / `G` / `P` … | HTTP（含 `CONNECT` 隧道） |
+| 创建密钥 | 指定备注 + 有效小时数，明文只在生成时显示一次 |
+| 撤销密钥 | 立即失效 |
+| 停用账号 | 门户和部署包都拒绝 |
+| 重置令牌 | 旧令牌立即失效 |
+| 事件日志 | 谁在什么时候登录/失败/下载 |
 
-因此系统代理填 `http://127.0.0.1:10809` 或 `socks5://127.0.0.1:10809` 均可工作。
+### 安全措施
 
-### IP 择优层
+| 项 | 做法 |
+|---|---|
+| 密钥存储 | 只存 SHA-256，明文不落库 |
+| 会话 | HMAC-SHA256 签名 cookie，库里只存 sid 哈希 |
+| CSRF | 所有 POST 带一次性 token |
+| 爆破防护 | 5 分钟内失败 5 次锁 15 分钟（用户/管理**分开计数**，防低权限锁高权限） |
+| 响应头 | CSP / X-Frame-Options / nosniff / Referrer-Policy |
+| 开放重定向 | Location 只允许站内路径 |
+| IP 校验 | 只接受私网段，公网 IP 直接拒 |
+| 部署包越权 | 只能下载自己 IP 的包 |
 
-远端网络的 DNS 对 GitHub 系域名的解析结果可达性不稳定，部分权威记录指向的 IP
-在链路上不可达。`smart-resolve.mjs` 维护候选 IP 池，按健康分排序并以
-Happy Eyeballs 方式并发探测，取首个成功连接。健康分仅统计最近 60 秒事件，
-避免长期运行后排序失真。
+---
 
-### 隧道守护层
+## 六、文件清单
 
-`ssh -D` 会因远端重启、网络抖动、休眠恢复而断开。守护分两处：
-
-- `ssh-tunnel-keeper.ps1` 在 `ssh` 退出后 5 秒重启（带单例锁与 PID 复用防护）；
-- `dual-proxy.mjs` 每 5 秒探测上游 SOCKS 端口，连续 2 次失败后自行拉起 keeper。
-
-两层均写日志（`.borrow-net/bridge.log`、`.borrow-net/keeper.log`），便于定位断链原因。
-
-## 快速开始
-
-```powershell
-# 开启借网：建隧道 + 切系统代理 + 验证出口
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\borrow-net.ps1 On
-
-# 查看状态：含直连与借网出口 IP 对照
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\borrow-net.ps1 Status
-
-# 切回直连：还原原始系统代理
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\borrow-net.ps1 Off
-```
-
-图形界面：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\借网助手.ps1
-```
-
-## 链路
-
-```
-本机 ──[校园网 WLAN 192.0.2.0/22]──┐
-                                   ├─→ 192.0.2.1 ─→ 198.51.100.254 ─→ 203.0.113.1 (pcs)
-远端 pcs ──[办公网 203.0.113.0/24, gw 203.0.113.254]──→ Internet
-```
-
-SSH 走校园网直连（3 跳，RTT 3–14 ms），不经 WireGuard 网段。
-
-## 关键文件
+### 核心
 
 | 文件 | 作用 |
 |---|---|
-| `tools/borrow-net.ps1` | 主控 CLI：`On` / `Off` / `Status` / `InstallStartup` / `UninstallStartup` |
-| `tools/借网助手.ps1` | WinForms 图形界面（状态卡、链路明细、日志窗、托盘常驻） |
-| `tools/ssh-tunnel-keeper.ps1` | 隧道保活：ssh 断开后自动重连，单例锁 + PID 复用防护，自写日志 |
-| `tools/dual-proxy.mjs` | 双协议代理：HTTP + SOCKS5 单端口自动识别，内含隧道守护 |
-| `tools/smart-resolve.mjs` | IP 择优：候选池 + 健康分衰减 + Happy Eyeballs 并发建连 |
-| `tools/startup.ps1` | 登录自启管理：`Status` / `Install` / `Uninstall` / `Test` |
-| `tools/net-quality.ps1` | 链路质量实测：可达性 / 抖动 / 丢包 / 吞吐 / 长连接 / DNS |
-| `tools/bw-probe.mjs` | 并发带宽测试，区分物理带宽瓶颈与 TCP 窗口瓶颈 |
-| `tools/gh-stability.mjs` | GitHub 稳定性对比（直连 vs 隧道） |
-| `tools/longrun.mjs` | 长跑稳定性测试（多目标 × 多轮，输出 p50 / p95） |
-| `tools/correlate.mjs` | 同时刻对比远端直连与隧道，定位波动源 |
-| `tools/socks-layer-probe.mjs` | 分层定位 SOCKS 隧道失败阶段 |
-| `tools/verify-outage.ps1` | **一键验证断网可用性**：模拟断网 → 测借网 → 自动恢复（需管理员） |
-| `tools/simulate-outage.ps1` | 模拟「局域网通 / 公网断」的防火墙开关（Start / Stop / Status） |
-| `tools/outage-watch.ps1` | 断网存活监控，持续记录直连 / 借网 / SSH 三态，`-Report` 出统计 |
-| `tools/verify-outage-remote.ps1` | 在**实验机**上断网验证（路由表方案，不影响本机会话） |
-| `tools/push-with-retry.sh` | 借网环境下的 git 推送封装（必需参数 + 重试） |
-| `tools/make-shortcut.ps1` | 生成桌面与开始菜单快捷方式（含自绘 ICO） |
-| `tools/Get-BorrowPorts.ps1` | **端口解析唯一入口**：读 `.proxy-state/ports.json`，三个脚本共用 |
-| `tools/proxy-users.mjs` | 多用户库：令牌认证（HTTP Basic + SOCKS5 RFC1929）、配额、热加载 |
-| `tools/proxy-admin.mjs` | 用户管理 CLI：`add` / `list` / `disable` / `reset` / `settings` / `show` |
-| `tools/client-config.mjs` | 生成使用者接入配置：`--format cmd|sh|md`，自动识别本机 IP |
-| `tools/setup-client.ps1` | 使用者机器上一键接入（建密钥、测直连、起隧道、打印配置） |
-| `config/wg0-remote.conf.example` | 远端 WireGuard 服务端配置样例（当前未启用） |
+| `tools/dual-proxy.mjs` | 双协议代理（HTTP + SOCKS5 单端口自动识别）、限速、隧道守护、孤儿清理 |
+| `tools/smart-resolve.mjs` | GitHub 系 IP 择优（健康分 + GCRA 式并发竞速） |
+| `tools/ssh-tunnel-keeper.ps1` | 隧道保活，断线 5 秒重连，单例锁 |
+| `tools/Get-FerryPorts.ps1` | **端口解析唯一入口**，所有脚本共用 |
 
-## 设计原则
+### 多用户
 
-1. **只切系统代理，不动路由表** —— 无自环风险，`Off` 可干净还原。
-2. **隧道与代理分离** —— keeper 只负责建立 `ssh -D`，是否走代理由主控决定。
-3. **出口 IP 必须对照验证** —— 直连与借网出口 IP 不同，才说明链路真正生效；
-   直连探测需 `--noproxy '*'`，否则会被本机已有代理截走。
-4. **PowerShell 5.1 兼容** —— 图形界面运行在 `powershell.exe` 5.1：
-   不支持 `if` 作表达式、`Invoke-WebRequest -Proxy socks5://`、枚举字符串隐式转换。
+| 文件 | 作用 |
+|---|---|
+| `tools/proxy-users.mjs` | 用户库 + 双协议认证 + 配额 + 热加载 |
+| `tools/proxy-admin.mjs` | 用户管理 CLI |
+| `tools/client-config.mjs` | 生成接入配置（`cmd` / `sh` / `md`） |
+| `tools/setup-client.ps1` | 使用者机器一键接入 |
 
-## git 操作
+### 门户
 
-本机直连 GitHub 不可达，仓库推送需经借网链路。完整参数：
+| 文件 | 作用 |
+|---|---|
+| `portal/portal-server.py` | 登录门户 + 管理面板（Python 标准库，零依赖） |
 
-```powershell
-git -c http.version=HTTP/1.1 -c http.proxy=http://127.0.0.1:10809 -c http.sslBackend=openssl push origin main
-```
+### 验证与诊断
 
-- `http.version=HTTP/1.1`：本机 HTTP/2 会在 TLS renegotiate 阶段挂起；
-- `http.sslBackend=openssl`：Windows 默认 schannel 在 `CONNECT` 隧道上报
-  `failed to receive handshake` / `server closed abruptly (missing close_notify)`；
-- `http.proxy=...10809`：经 dual-proxy 走 IP 择优，成功率高于裸 SOCKS5。
+| 文件 | 作用 |
+|---|---|
+| `tools/verify-outage.ps1` | 本机一键断网验证（管理员） |
+| `tools/verify-outage-remote.ps1` | 在实验机上断网验证（不改本机） |
+| `tools/simulate-outage.ps1` | 模拟断网开关 |
+| `tools/outage-watch.ps1` | 真实断网时的后台存活监控 |
+| `tools/net-quality.ps1` | 可达性 / 抖动 / 丢包 / 吞吐 / 长连接 / DNS |
+| `tools/bw-probe.mjs` | 并发带宽测试 |
+| `tools/longrun.mjs` | 长跑稳定性 |
+| `tools/socks-layer-probe.mjs` | 分层定位 SOCKS 失败阶段 |
+| `tools/correlate.mjs` | 同时刻对比远端直连与隧道 |
+| `tools/gh-stability.mjs` | GitHub 稳定性对比 |
+| `portal/audit.py` | 静态审查（空 catch / 硬编码端口 / SQL 拼接 / 缺 BOM） |
 
-推送前需确保 keeper 在运行（`tools\startup.ps1 Status`）。
+### 测试
 
-## 文档
+| 文件 | 覆盖 |
+|---|---|
+| `portal/test-portal.mjs` | 门户端到端 **43 项** |
+| `portal/test-security.mjs` | 安全加固 **17 项** |
+| `portal/test-pipe.mjs` | 限速 + 背压 **9 项** |
+
+---
+
+## 七、文档
 
 | 文档 | 内容 |
 |---|---|
-| [docs/踩坑记录.md](docs/踩坑记录.md) | 实测踩坑清单（PowerShell 5.1 / 远端 / WinForms / git） |
 | [docs/实测数据.md](docs/实测数据.md) | **全部实测数据**：可达性 / 抖动 / 带宽多源对比 / DNS / 稳定性 / 断网验证 |
-| [docs/远端部署.md](docs/远端部署.md) | 远端 sshd、WireGuard、端口转发部署步骤 |
-| [docs/断网验证方法.md](docs/断网验证方法.md) | 怎么验证「断网后借网还能用」：模拟断网脚本、判定表、手动验证步骤 |
-| [docs/多人使用管理.md](docs/多人使用管理.md) | 多人接入架构、用户管理 CLI、面板字段说明、认证与配额 |
+| [docs/踩坑记录.md](docs/踩坑记录.md) | 27 条实测踩坑，每条都有「为什么」和「怎么做」 |
+| [docs/多人使用管理.md](docs/多人使用管理.md) | 接入架构、管理命令、面板字段、认证与配额 |
+| [docs/断网验证方法.md](docs/断网验证方法.md) | 三种验证方式、四类断网类型判定表 |
+| [docs/远端部署.md](docs/远端部署.md) | 远端 sshd / WireGuard / 端口转发 |
 
-## 已知边界
+---
 
-1. **系统代理覆盖面有限**：只影响读取代理设置的程序（浏览器、.NET、多数下载工具）。
-   需要全局接管需引入 tun2socks（涉及路由改动与自环风险，未实施）。
-2. **链路依赖校园网接入层**：隧道是 SSH over 校园 WLAN。若断网发生在 WLAN
-   接入层（无法取得 IP / 路由），隧道同样无法建立 —— 这是当前方案的主要单点。
-3. **吞吐取决于下载源而非带宽上限**：远端实测华为云 90+ MB/s（≈720 Mbps），
-   经借网 HTTP 代理 36 MB/s，本机直连 7.8 MB/s。CERNET 源仅 1.12 MB/s，
-   属路由质量问题，不可作为带宽上限参考。
-4. **`gist.github.com` 在远端被封锁**：远端对该域名解析结果 TCP 不可达，
-   与借网无关；gist 的 raw 内容（`gist.githubusercontent.com`）可正常访问。
+## 八、必须知道的限制
 
-## 踩坑速查
+1. **断网类型决定成败**
+   - ✅ 禁用上网权限、局域网通（本校情况）→ 有效，已实测
+   - ❌ WLAN 接入层断开（连网关都不通）→ 无效，SSH 起不来
+     → 需要另一条物理通路（手机热点）
 
-完整清单见 [docs/踩坑记录.md](docs/踩坑记录.md)。三条高频问题：
+2. **校园网账号间有端口级隔离**
+   实测从另一个账号的机器探本机：`22` 不通、`445` 通、`10803` 通。
+   所以「把某台机器的代理共享出去」不可靠。
+   **本方案是每台机器各自建隧道直连远端**，远端才是共享点。
 
-- `.ps1` 必须为 UTF-8 **with BOM**，PS 5.1 会把无 BOM 的 UTF-8 当 ANSI 读取，
-  中文注释直接破坏语法，且报错位置指向无关行。
-- `Test-NetConnection` 探测关闭端口需等待 14.3 s，应改用
-  `TcpClient.BeginConnect` + 300 ms 超时。
-- 远端执行 `$priv | wg pubkey` 报 `Cannot process the XML from the 'Error' stream`，
-  需改为 `& cmd /c "echo <priv> | wg.exe pubkey"`。
+3. **google.com 两端都不通**
+   远端办公网的出口策略，不是渡口缺陷。
 
-## 版本
+4. **`raw.githubusercontent.com` 约 1/6 成功率**
+   办公网到 GitHub Fastly 边缘的链路问题。取证：远端直连与经隧道
+   同时刻各 6 次，成功率一致。固定 IP 无效，已从候选池移除。
 
-见 [CHANGELOG.md](CHANGELOG.md)。
+5. **令牌是明文存在 `users.json` 里**
+   这台机器本身要管好，不要把该文件同步到公开仓库。
+
+---
+
+## 九、命名说明
+
+工程名 `ferry` 与 GitHub 仓库名 `Network_Test` **无关** —— 仓库是早期建的，
+工程按功能重新命名。历史版本里叫过 `borrow-net`，v0.6.0 起统一为 Ferry。

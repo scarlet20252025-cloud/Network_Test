@@ -27,7 +27,7 @@
 
 import net from 'node:net';
 import http from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import path from 'node:path';
@@ -184,6 +184,34 @@ function log(...a) {
 // 每用户累计（面板「谁在用、用了多少」的原始数据）
 const perUser = new Map(); // name -> { conns, ok, fail, bytesIn, bytesOut }
 
+/* ---------------- 每用户限速（GCRA） ----------------
+ *
+ * 为什么不用令牌桶（实测踩过）：
+ *   标准令牌桶初始给满一桶（= 1 秒配额），前 1 秒的流量完全免费。
+ *   实测 5MB @ 2MB/s 只花 1.03s（应 2.5s）、4.86 MB/s（超 2.4 倍）；
+ *   20MB @ 5MB/s 实测 8.08 MB/s。桶越大偏差越大。
+ *
+ * GCRA 只维护「下一个包最早可发时间」，每个包消耗 n/rate 秒。
+ * 没有桶、没有初始免费额度，实测 20MB@5MB/s 正好 4.00s / 5.00 MB/s。
+ *
+ * 为什么按「用户」而不是按「连接」限速：
+ *   一个人能开 40 条连接，按连接限速等于把总配额乘 40。
+ */
+const gcraNext = new Map();   // name -> 下一个包最早可发时间（ms）
+const GCRA_TOLERANCE_MS = 50; // 允许 50ms 突发，避免 TCP 窗口塌陷
+
+function takeTokens(name, n, rate) {
+  if (!rate || rate <= 0) return 0;   // 不限速
+  const nowMs = Date.now();
+  const costMs = (n / rate) * 1000;
+  let t = gcraNext.get(name);
+  if (t === undefined) t = nowMs;
+  const earliest = Math.max(nowMs - GCRA_TOLERANCE_MS, t);
+  gcraNext.set(name, earliest + costMs);
+  const waitMs = earliest - nowMs;
+  return waitMs > 0 ? Math.ceil(waitMs) : 0;
+}
+
 function record(kind, target, ms, ok, err, user) {
   stats.total++;
   if (ok) stats.ok++;
@@ -238,6 +266,90 @@ async function smartConnect(host, port, timeoutMs = 8000) {
 }
 
 /**
+ * 限速转发：替代所有 `sock.pipe(dst)`。
+ *
+ * 为什么不能只用 sock.pipe()：pipe 无法插队限速。
+ * 为什么不能只 setTimeout 不 pause：数据会继续涌进内存，
+ *   最后一次性冲出去，限速形同虚设。
+ *
+ * limiter(chunkLen) 返回「需要等多少毫秒」，0 表示不用等。
+ */
+/**
+ * 给某个用户造一个 limiter。返回 null 表示不限速。
+ *
+ * 为什么按用户而不是按连接：一个人能开 40 条连接，
+ * 按连接限速等于把总带宽乘 40，限了跟没限一样。
+ */
+function makeLimiter(userName) {
+  if (!auth || !userName) return null;
+  const rate = auth.store.settings.bytesPerSecPerUser || 0;
+  if (rate <= 0) return null;
+  return (n) => takeTokens(userName, n, rate);
+}
+
+function pipeLimited(src, dst, limiter) {
+  // 队列式：'data' 只入队，单泵按节奏出队。
+  //
+  // 为什么不用「pause + setTimeout」那版（实测踩过）：
+  //   在 'data' 里 pause 后 setTimeout，Node 在 pause 生效前可能已 emit
+  //   多个缓冲 chunk，于是**多个 setTimeout 并发排队**、顺序错乱；
+  //   src 'close' 又可能先于尾部 setTimeout 触发 → 实测 5MB 丢 64KB。
+  //
+  // 队列式的关键：单泵串行、队列有界、只有队列空且 src 结束才 dst.end()。
+  const queue = [];
+  let pumping = false;
+  let srcEnded = false;
+  let dstClosed = false;
+  let queued = 0;
+  const HIGH_WATER = 1024 * 1024;   // 1MB 高水位，够吸收抖动又不吃内存
+
+  const finish = () => {
+    if (dstClosed) return;
+    dstClosed = true;
+    if (dst.writable) dst.end();
+  };
+
+  const pump = () => {
+    if (pumping) return;
+    pumping = true;
+    const step = () => {
+      if (dstClosed) { pumping = false; return; }
+      if (queue.length === 0) {
+        pumping = false;
+        if (srcEnded) finish();
+        return;
+      }
+      const chunk = queue.shift();
+      queued -= chunk.length;
+      if (queued < HIGH_WATER / 2) src.resume();
+
+      const waitMs = limiter ? limiter(chunk.length) : 0;
+      const write = () => {
+        if (dstClosed) { pumping = false; return; }
+        if (!dst.writable) { finish(); pumping = false; return; }
+        if (dst.write(chunk)) step();
+        else dst.once('drain', step);   // 等下游消化，不丢数据
+      };
+      if (waitMs > 0) setTimeout(write, waitMs);
+      else write();
+    };
+    step();
+  };
+
+  src.on('data', (chunk) => {
+    queue.push(chunk);
+    queued += chunk.length;
+    if (queued >= HIGH_WATER) src.pause();
+    pump();
+  });
+  src.on('end', () => { srcEnded = true; pump(); });
+  src.on('close', () => { srcEnded = true; pump(); });
+  src.on('error', () => { if (dst.writable) dst.destroy(); });
+  dst.on('error', () => src.destroy());
+  dst.on('close', () => { dstClosed = true; });
+}
+
+/**
  * 带确认的双向管道。
  *
  * 为什么不用 attachConfirm + pipe：给 sock 加 'data' 监听会让流进入 flowing
@@ -247,7 +359,7 @@ async function smartConnect(host, port, timeoutMs = 8000) {
  * 确认规则：上游只要回吐 ≥1 字节即认为该 IP 可用；若在上游首字节前就 close，
  * 或 6 秒内零字节，则记一次失败（下次排序自动降权）。
  */
-function pipeWithConfirm(src, dst, confirm, label) {
+function pipeWithConfirm(src, dst, confirm, label, limiter) {
   let bytes = 0;
   let settled = false;
   const settle = (ok, detail) => {
@@ -258,32 +370,155 @@ function pipeWithConfirm(src, dst, confirm, label) {
   };
   const timer = setTimeout(() => settle(false, `${label} 6s 无上游字节`), 6000);
 
-  src.on('data', (chunk) => {
+  // 复用 pipeLimited，只是额外观察「有没有拿到首字节」。
+  // 不要在这里再挂 src.on('data') —— 会和 pipeLimited 抢数据（踩过的坑）。
+  const origLimiter = limiter;
+  const wrapped = (n) => {
     if (bytes === 0) settle(true);
-    bytes += chunk.length;
-    if (!dst.write(chunk)) src.pause();
-  });
-  dst.on('drain', () => src.resume());
+    bytes += n;
+    return origLimiter ? origLimiter(n) : 0;
+  };
 
-  src.on('end', () => {
-    if (bytes === 0) settle(false, `${label} 上游零字节即结束`);
-    if (dst.writable) dst.end();
-  });
-  src.on('close', () => {
+  src.once('close', () => {
     if (bytes === 0) settle(false, `${label} 上游零字节即关闭`);
     else settle(true);
-    if (dst.writable) dst.end();
   });
-  src.on('error', () => {
-    if (bytes === 0) settle(false, `${label} 上游 error`);
-    dst.destroy();
-  });
-  dst.on('error', () => src.destroy());
-  dst.on('close', () => src.destroy());
+
+  pipeLimited(src, dst, wrapped);
 }
 
-function socksConnect(host, port, timeoutMs = 20000) {
-  return new Promise((resolve, reject) => {
+/**
+ * 把上游的 HTTP 响应转成 res。必须自己解析响应头。
+ *
+ * 为什么不能直接 pipe：
+ *   res 是 Node 的 ServerResponse，它会在第一次 write 时自己补状态行和头。
+ *   把上游的 "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n<body>"
+ *   整个写进去，Node 会把状态行当成 body 的第一个 chunk，
+ *   同时按自己的规则补 Content-Length: 0 —— 客户端拿到 0 字节。
+ *   实测：baidu 200 但 size_download=0，github 走 CONNECT 却正常。
+ *
+ * 处理要点：
+ *   · 头部可能分多个 TCP 段到达，要缓存到 \r\n\r\n 为止
+ *   · Content-Length / Transfer-Encoding 必须原样搬（不能重算）
+ *   · 1xx / 204 / 304 没有 body，直接结束
+ *   · 剩余字节（已读到的 body 部分）要先写出去
+ */
+function relayHttpResponse(sock, res, limiter, onDone, onError) {
+  let buf = Buffer.alloc(0);
+  let headersParsed = false;
+  let finished = false;
+
+  const finish = (err) => {
+    if (finished) return;
+    finished = true;
+    if (err) onError(err);
+    else onDone();
+  };
+
+  // 换掉 pipeLimited，改用自己控制的队列式转发（因为要先剥头）
+  const writeBody = (chunk) => {
+    const waitMs = limiter ? limiter(chunk.length) : 0;
+    if (waitMs > 0) {
+      sock.pause();
+      setTimeout(() => {
+        if (!res.writable) return;
+        if (res.write(chunk)) sock.resume();
+        else res.once('drain', () => sock.resume());
+      }, waitMs);
+    } else {
+      if (!res.write(chunk)) {
+        sock.pause();
+        res.once('drain', () => sock.resume());
+      }
+    }
+  };
+
+  const onData = (chunk) => {
+    if (finished) return;
+
+    if (!headersParsed) {
+      buf = Buffer.concat([buf, chunk]);
+      const idx = buf.indexOf('\r\n\r\n');
+      if (idx < 0) {
+        // 头部太大？给个上限，避免恶意服务器把内存吃满
+        if (buf.length > 64 * 1024) finish('响应头超过 64KB');
+        return;
+      }
+      const headText = buf.subarray(0, idx).toString('latin1');
+      const body = buf.subarray(idx + 4);
+      buf = Buffer.alloc(0);
+
+      const lines = headText.split('\r\n');
+      const statusLine = lines.shift() || '';
+      const m = /^HTTP\/\d\.\d\s+(\d{3})\s*(.*)$/.exec(statusLine);
+      if (!m) return finish(`无法解析状态行: ${statusLine.slice(0, 60)}`);
+      const statusCode = Number(m[1]);
+
+      const headers = {};
+      for (const line of lines) {
+        const c = line.indexOf(':');
+        if (c <= 0) continue;
+        const k = line.slice(0, c).trim();
+        const v = line.slice(c + 1).trim();
+        // 逐跳头不能转发
+        const lower = k.toLowerCase();
+        if (lower === 'connection' || lower === 'keep-alive' ||
+            lower === 'proxy-authenticate' || lower === 'proxy-authorization' ||
+            lower === 'transfer-encoding' && false) {
+          // 注意：transfer-encoding 要保留（chunked 必须原样传）
+          if (lower !== 'transfer-encoding') continue;
+        }
+        headers[k] = v;
+      }
+
+      headersParsed = true;
+      sock.removeListener('data', onData);
+
+      try {
+        res.writeHead(statusCode, headers);
+      } catch (e) {
+        return finish(`writeHead 失败: ${e.message}`);
+      }
+
+      // 无 body 的状态码
+      if (statusCode === 204 || statusCode === 304 ||
+          (statusCode >= 100 && statusCode < 200)) {
+        res.end();
+        sock.destroy();
+        return finish(null);
+      }
+
+      if (body.length) writeBody(body);
+      // 剩下的字节继续走流式
+      sock.on('data', (c) => writeBody(c));
+      sock.on('end', () => { if (res.writable) res.end(); finish(null); });
+      sock.on('close', () => { if (res.writable) res.end(); finish(null); });
+      return;
+    }
+  };
+
+  sock.on('data', onData);
+  sock.on('error', (e) => finish(e.code || e.message));
+  // 只在「还没解析出头」时才把 close 当错误。
+  // 踩过的坑：这里原本无条件 finish('上游未返回完整响应头就关闭')，
+  // 但 headersParsed 已经为 true 时（正常结束）也会走到，
+  // 于是每个正常响应都变成 502。必须判断 headersParsed。
+  sock.on('close', () => {
+    if (headersParsed) {
+      if (res.writable) res.end();
+      finish(null);
+    } else {
+      finish('上游未返回完整响应头就关闭');
+    }
+  });
+
+  // 超时保护：30 秒没拿到完整响应头就报错
+  setTimeout(() => {
+    if (!headersParsed) finish('等待响应头超时（30s）');
+  }, 30000).unref();
+}
+
+function socksConnect(host, port, timeoutMs = 20000) {  return new Promise((resolve, reject) => {
     const t0 = Date.now();
     const sock = net.connect({ host: '127.0.0.1', port: SOCKS_PORT });
     let stage = 'greeting';
@@ -456,25 +691,33 @@ const httpServer = http.createServer((req, res) => {
         '\r\n\r\n'
       );
       req.pipe(sock);
-      if (ip !== host) pipeWithConfirm(sock, res, confirm, `${host}@${ip}`);
-      else sock.pipe(res);
 
-      const done = (err) => {
+      // ⚠️ HTTP 明文代理不能把上游的**原始响应**直接写进 res。
+      // 踩过的坑：`pipeLimited(sock, res)` 会让 Node 的 ServerResponse
+      // 把 "HTTP/1.1 200 OK\r\n..." 当成 body，同时自己补一套头
+      // （实测 Content-Length: 0），结果响应体全部丢失、下载 0 字节。
+      // CONNECT 路径没这问题，因为那条走的是裸 socket。
+      //
+      // 正解：先解析上游响应头，把状态码和头搬到 res，再转发 body。
+      const lim = makeLimiter(a.user?.name);
+      relayHttpResponse(sock, res, lim, () => {
         stats.active--;
         session?.close();
-        record('http', `${host}:${port}`, Date.now() - t0, !err, err, a.user?.name);
-      };
+        record('http', `${host}:${port}`, Date.now() - t0, true, null, a.user?.name);
+      }, (err) => {
+        log(`  ! ${host}:${port} ${err}`);
+        session?.close();
+        record('http', `${host}:${port}`, Date.now() - t0, false, err, a.user?.name);
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end(`代理错误: ${err}`);
+      });
+
       sock.on('data', (c) => session?.addIn(c.length));
       req.on('data', (c) => session?.addOut(c.length));
       sock.on('error', (e) => {
         log(`  ! ${host}:${port} ${e.message}`);
         if (!res.headersSent) res.writeHead(502);
         res.end();
-        done(e.code || e.message);
-      });
-      sock.on('close', () => {
-        if (!res.writableEnded) res.end();
-        done(null);
       });
     })
     .catch((e) => {
@@ -508,9 +751,11 @@ httpServer.on('connect', (req, clientSocket, head) => {
       stats.connect++;
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length) sock.write(head);
-      // 用 pipeWithConfirm 代替 sock.pipe，才能在不丢字节的前提下降权坏 IP
-      if (ip !== host) pipeWithConfirm(sock, clientSocket, confirm, `${host}@${ip}`);
-      else sock.pipe(clientSocket);
+      // 统一走 pipeLimited：既能降权坏 IP（走 confirm），又能限速。
+      // 不能混用 sock.pipe() —— 那条路径不限速，而绝大多数域名都不在择优池里。
+      const lim = makeLimiter(a.user?.name);
+      if (ip !== host) pipeWithConfirm(sock, clientSocket, confirm, `${host}@${ip}`, lim);
+      else pipeLimited(sock, clientSocket, lim);
       clientSocket.pipe(sock);
 
       let closed = false;
@@ -657,8 +902,9 @@ const socksServer = net.createServer((client) => {
           // 成功回复：VER=5 REP=0 RSV=0 ATYP=1 BND.ADDR=0.0.0.0 BND.PORT=0
           client.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
           if (rest.length) sock.write(rest);
-          if (ip !== host) pipeWithConfirm(sock, client, confirm, `${host}@${ip}`);
-          else sock.pipe(client);
+          const lim = makeLimiter(userName);
+          if (ip !== host) pipeWithConfirm(sock, client, confirm, `${host}@${ip}`, lim);
+          else pipeLimited(sock, client, lim);
           client.pipe(sock);
           client.resume();
 
@@ -774,6 +1020,10 @@ function reviveTunnel() {
     child.stderr.on('data', relay('err'));
     child.on('exit', (code, sig) => {
       log(`  ! keeper 退出 code=${code} sig=${sig ?? '-'}（存活 ${Math.round((Date.now() - startedAtChild) / 1000)}s）`);
+      // keeper 走了，它拉起的 ssh 会变成孤儿继续占着端口。
+      // 实测踩过：反复重启 dual-proxy 后堆了 4 个 ssh 进程，
+      // 只有第一个能监听，其余全在空转，而隧道端口早就变了。
+      killOrphanSsh();
     });
     child.on('error', (e) => log(`  ! keeper spawn error: ${e.message}`));
     log(`  → keeper 已启动 (pid ${child.pid})`);
@@ -782,10 +1032,67 @@ function reviveTunnel() {
   }
 }
 
+/**
+ * 杀掉「占着某个 -D 端口但没人管」的 ssh。
+ *
+ * 为什么要：keeper 被强杀时，它前台跑的 ssh 不会跟着死（Windows 没有
+ * 进程组的强杀语义），于是 ssh 变成孤儿，继续监听原来的端口。
+ * dual-proxy 的端口是自动探测的，重启后端口会变，旧 ssh 占的旧端口
+ * 就再也用不上了 —— 但它们还连着远端，白占资源。
+ *
+ * 做法：找出所有 `ssh -D 127.0.0.1:<port>` 进程，凡是端口不是当前
+ * SOCKS_PORT 的一律杀掉；是当前端口的留下（那可能正是活的隧道）。
+ */
+function killOrphanSsh() {
+  try {
+    // 用 WMIC 而不是 powershell 嵌套引号 —— 实测后者在 node→cmd→powershell
+    // 三层转义下必坏（报「不是内部或外部命令」）。WMIC 是独立 exe，参数干净。
+    // CSV 输出形如：Node,CommandLine,ProcessId
+    // 注意 CommandLine 里可能含逗号，所以用 first/last comma 定位，不能 split(',')。
+    const out = execSync(
+      'wmic process where "name=\'ssh.exe\'" get ProcessId,CommandLine /format:csv',
+      { encoding: 'utf8', windowsHide: true, timeout: 10000 },
+    );
+    const lines = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const orphans = [];
+    for (const line of lines) {
+      const firstComma = line.indexOf(',');
+      if (firstComma < 0) continue;
+      const rest = line.slice(firstComma + 1);
+      const lastComma = rest.lastIndexOf(',');
+      if (lastComma < 0) continue;
+      const cmd = rest.slice(0, lastComma);
+      const pid = Number(rest.slice(lastComma + 1));
+      const m = /-D\s+127\.0\.0\.1:(\d+)/.exec(cmd);
+      if (m && Number.isInteger(pid)) orphans.push({ pid, port: Number(m[1]) });
+    }
+
+    let killed = 0;
+    for (const o of orphans) {
+      if (o.port === SOCKS_PORT) continue;   // 当前隧道的端口，别动
+      try {
+        process.kill(o.pid, 'SIGKILL');
+        killed++;
+        log(`  → 清理孤儿 ssh pid=${o.pid}（占着旧端口 ${o.port}）`);
+      } catch {
+        /* 进程可能已经没了 */
+      }
+    }
+    if (killed > 0) log(`  → 共清理 ${killed} 个孤儿 ssh`);
+  } catch (e) {
+    log(`  ! 清理孤儿 ssh 失败: ${e.message}`);
+  }
+}
+
 async function tunnelWatchdog() {
   const ok = await probeSocksPort();
   if (ok) {
-    if (tunnelFailStreak > 0) log(`  ✓ 隧道已恢复（SOCKS ${SOCKS_PORT} 可连）`);
+    if (tunnelFailStreak > 0) {
+      log(`  ✓ 隧道已恢复（SOCKS ${SOCKS_PORT} 可连）`);
+      // 隧道恢复后扫一次孤儿。放在这里而不是只在 keeper exit 里调，
+      // 是因为旧 keeper 常常是在新 keeper 成功之后才退的，那时再扫已经晚了。
+      killOrphanSsh();
+    }
     tunnelFailStreak = 0;
     tunnelHealth.alive = true;
     tunnelHealth.lastOkAt = Date.now();
@@ -856,7 +1163,7 @@ if (PANEL_PORT > 0) {
       return;
     }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(`<!doctype html><meta charset="utf-8"><title>借网代理状态</title>
+    res.end(`<!doctype html><meta charset="utf-8"><title>渡口代理状态</title>
 <style>
 body{font:14px/1.6 system-ui,"Microsoft YaHei";margin:0;padding:24px;background:#0f1115;color:#e6e6e6}
 h1{font-size:18px;margin:0 0 16px}
@@ -870,7 +1177,7 @@ th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #262b33}
 th{color:#8b95a5;font-weight:500}
 tr.bad td{color:#e5534b}
 </style>
-<h1>借网代理状态 <span id="up" style="font-size:12px;color:#8b95a5"></span></h1>
+<h1>渡口代理状态 <span id="up" style="font-size:12px;color:#8b95a5"></span></h1>
 <div class="grid">
   <div class="card"><div class="k">累计连接</div><div class="v" id="total">-</div></div>
   <div class="card"><div class="k">当前活跃</div><div class="v" id="active">-</div></div>

@@ -2,13 +2,13 @@
 <#
   ssh-tunnel-keeper.ps1 — 常驻保活：保持 ssh -D SOCKS 隧道连通远端办公网
 
-  由 borrow-net.ps1 / 借网助手.ps1 / dual-proxy.mjs watchdog 启动，或登录自启。
+  由 ferry.ps1 / 渡口助手.ps1 / dual-proxy.mjs watchdog 启动，或登录自启。
   设计要点：
     * 本进程前台跑 ssh，ssh 退出（断线/重启）自动重启，5s 间隔防风暴
     * 本进程被杀会带走子 ssh（父子进程），不会留孤儿
-    * 单例锁 borrow-net.keeper.lock 防止重复启动（带 PID 复用防护）
+    * 单例锁 ferry.keeper.lock 防止重复启动（带 PID 复用防护）
     * 只建立隧道，不改系统代理、不改路由
-    * 自己写 .borrow-net/keeper.log —— 被 spawn(stdio:'ignore') 拉起时没有 stdout，
+    * 自己写 .ferry/keeper.log —— 被 spawn(stdio:'ignore') 拉起时没有 stdout，
       日志是唯一的排查手段
 
   参数可与主脚本不一致，主脚本会按当前配置传参。
@@ -27,7 +27,7 @@ $ErrorActionPreference = 'Stop'
 #   这两种方式都没有可读的 stdout（前者 stdio:'ignore' 直接丢弃，后者无控制台）。
 #   实际踩过：watchdog 每 20 秒拉起一次 keeper，隧道始终不通，
 #   而所有输出都被丢掉，日志里只剩一句「keeper 已启动」的假象。
-$LogDir  = Join-Path $PSScriptRoot '.borrow-net'
+$LogDir  = Join-Path $PSScriptRoot '.ferry'
 $LogPath = Join-Path $LogDir 'keeper.log'
 
 function Write-KLog {
@@ -57,7 +57,7 @@ $sshArgs = @(
   '-D', "127.0.0.1:$SocksPort"
 )
 
-$lockPath = Join-Path $PSScriptRoot 'borrow-net.keeper.lock'
+$lockPath = Join-Path $PSScriptRoot 'ferry.keeper.lock'
 
 # --- 单例检查 ---
 # 坑：只比对 PID 是不够的。keeper 被强杀（任务管理器 / 注销 / Stop-Process）时
