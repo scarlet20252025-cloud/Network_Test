@@ -720,6 +720,44 @@ def _net_bytes():
 _hb_lock = threading.Lock()
 _hb = {}            # ip -> {rx, tx, at, rxBps, txBps, conns, running}
 HB_STALE_SEC = 30   # 超过这么久没心跳就当离线（客户端 5 秒一次，容 6 次丢包）
+HB_KEEP_HOURS = 24  # 每小时统计保留多久
+
+# ip -> { 'YYYYMMDDHH': {'peakRx','peakTx','rx','tx'} }
+_hourly = {}
+
+
+def _hour_key(t=None):
+    return time.strftime('%Y%m%d%H', time.localtime(t or time.time()))
+
+
+def note_hourly(ip, rx_bps, tx_bps, d_rx, d_tx):
+    """按小时累计：峰值速率 + 流量增量。只留最近 HB_KEEP_HOURS 小时。"""
+    slot = _hourly.setdefault(ip, {})
+    k = _hour_key()
+    cur = slot.get(k)
+    if cur is None:
+        cur = slot[k] = {'peakRx': 0, 'peakTx': 0, 'rx': 0, 'tx': 0}
+    if rx_bps > cur['peakRx']:
+        cur['peakRx'] = rx_bps
+    if tx_bps > cur['peakTx']:
+        cur['peakTx'] = tx_bps
+    cur['rx'] += max(0, d_rx)
+    cur['tx'] += max(0, d_tx)
+    # 清掉过老的
+    if len(slot) > HB_KEEP_HOURS + 2:
+        keep = sorted(slot.keys())[-HB_KEEP_HOURS:]
+        for old in list(slot.keys()):
+            if old not in keep:
+                del slot[old]
+
+
+def hourly_of(ip):
+    """最近若干小时的统计，按时间升序。"""
+    slot = _hourly.get(ip) or {}
+    keys = sorted(slot.keys())[-HB_KEEP_HOURS:]
+    return [{'hour': k,
+             'peakRx': slot[k]['peakRx'], 'peakTx': slot[k]['peakTx'],
+             'rx': slot[k]['rx'], 'tx': slot[k]['tx']} for k in keys]
 
 
 def note_heartbeat(ip, rx, tx, conns, running):
@@ -734,9 +772,12 @@ def note_heartbeat(ip, rx, tx, conns, running):
                 # 客户端重启会让计数归零，负数按 0 处理
                 rx_bps = max(0, int((rx - prev['rx']) / dt))
                 tx_bps = max(0, int((tx - prev['tx']) / dt))
+        d_rx = max(0, rx - prev['rx']) if prev is not None else 0
+        d_tx = max(0, tx - prev['tx']) if prev is not None else 0
         _hb[ip] = {'rx': rx, 'tx': tx, 'at': t,
                    'rxBps': rx_bps, 'txBps': tx_bps,
                    'conns': conns, 'running': bool(running)}
+        note_hourly(ip, rx_bps, tx_bps, d_rx, d_tx)
         return _hb[ip]
 
 
@@ -847,6 +888,8 @@ def sample_live(db):
             'at': int(t),
             'online': online,
             'list': ulist,
+            # 每小时统计给「流量」卡片用
+            'hourly': {u['ip']: hourly_of(u['ip']) for u in ulist if u['online']},
             'onlineCount': len(peers),
             'conns': sum(peers.values()),
             'rxBps': rx_bps,
@@ -932,7 +975,7 @@ def get_page(detected_ip=''):
   <div class="step"><div class="n">1</div><div class="t">
     <b>用命令行下载（不触发拦截，推荐）</b>
     <div class="hint">按 Win+R 输入 <code>powershell</code> 回车，粘贴下面这行：</div>
-    <div class="mono" style="background:#f4f6f8;padding:10px 12px;border-radius:8px;margin-top:8px;
+    <div class="mono" style="background:var(--code);color:var(--fg);padding:10px 12px;border-radius:8px;margin-top:8px;
          font-size:12px;word-break:break-all;user-select:all">
       Invoke-WebRequest 'http://10.13.24.1:8080/download' -OutFile "$env:USERPROFILE\\Downloads\\Ferry-Setup.exe"; Start-Process "$env:USERPROFILE\\Downloads\\Ferry-Setup.exe"
     </div>
@@ -1197,6 +1240,16 @@ tr[data-on="1"]{background:color-mix(in srgb, var(--accent) 5%, transparent)}
 .num.zero{color:var(--fg2)}
 .nowrap{white-space:nowrap}
 
+/* 上下行箭头：方向 + 颜色都不同，一眼分清哪个是哪个 */
+.arw{display:inline-block;font-weight:700;margin-right:4px;font-family:Consolas,monospace}
+.arw.down{color:#3ddc97}      /* ↓ 绿：远端 → 本机 */
+.arw.up{color:#ffa657}        /* ↑ 橙：本机 → 远端 */
+html[data-theme="light"] .arw.down{color:#1f9d63}
+html[data-theme="light"] .arw.up{color:#d97706}
+
+/* 密码列表 / 事件列表也限高滚动，几十条也不会把页面拉长 */
+.listwrap.sm{max-height:300px}
+
 /* 授权档位：一排可选按钮，比下拉框少一次点击 */
 .tiers{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 0}
 .tier{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
@@ -1306,11 +1359,12 @@ tr[data-on="1"]{background:color-mix(in srgb, var(--accent) 5%, transparent)}
         if (st) st.innerHTML = '<span class="dot' + (on ? '' : ' off') + '"></span>' +
                                '<span class="stx">' + (on ? '在线' : '离线') + '</span>';
 
+        // 箭头和数字一起写，避免箭头跟数字分离
         var rx = tr.querySelector('.rx');
         var tx = tr.querySelector('.tx');
         var cs = tr.querySelector('.cs');
-        if (rx) { rx.textContent = on ? fmtBps(u.rxBps) : '—'; rx.className = 'num rx' + (u.rxBps ? '' : ' zero'); }
-        if (tx) { tx.textContent = on ? fmtBps(u.txBps) : '—'; tx.className = 'num tx' + (u.txBps ? '' : ' zero'); }
+        if (rx) { rx.innerHTML = '<span class="arw down">&#8595;</span>' + (on ? fmtBps(u.rxBps) : '—'); rx.className = 'num rx' + (u.rxBps ? '' : ' zero'); }
+        if (tx) { tx.innerHTML = '<span class="arw up">&#8593;</span>' + (on ? fmtBps(u.txBps) : '—'); tx.className = 'num tx' + (u.txBps ? '' : ' zero'); }
         if (cs) { cs.textContent = on ? u.conns : '—'; cs.className = 'num cs' + (on ? '' : ' zero'); }
 
         // 没有心跳上报的在线用户，速率列加个提示
@@ -1326,9 +1380,44 @@ tr[data-on="1"]{background:color-mix(in srgb, var(--accent) 5%, transparent)}
       rows.forEach(function(r){ body.appendChild(r); });
     }
 
+    // 本小时 + 今日流量汇总（所有在线机器相加）
+    var hBody = document.getElementById('hourlyBody');
+    if (hBody && d.hourly) {
+      var hk = null, tRx = 0, tTx = 0, nowRx = 0, nowTx = 0;
+      var nowKey = null;
+      var dt = new Date();
+      nowKey = dt.getFullYear() + ('0' + (dt.getMonth()+1)).slice(-2) + ('0' + dt.getDate()).slice(-2) +
+               ('0' + dt.getHours()).slice(-2);
+      for (var ip in d.hourly) {
+        var arr = d.hourly[ip] || [];
+        for (var j = 0; j < arr.length; j++) {
+          tRx += arr[j].rx; tTx += arr[j].tx;
+          if (arr[j].hour === nowKey) { nowRx += arr[j].rx; nowTx += arr[j].tx;
+            if (!hk || arr[j].peakRx > hk.peakRx) hk = arr[j]; }
+        }
+      }
+      hBody.innerHTML =
+        '<tr><td class="mono">' + (nowKey.slice(0,4) + '-' + nowKey.slice(4,6) + '-' + nowKey.slice(6,8) +
+          ' ' + nowKey.slice(8,10) + ':00') + '</td>' +
+        '<td class="num"><span class="arw down">&#8595;</span>' + fmtBps(nowRx / 3600) + '</td>' +
+        '<td class="num"><span class="arw up">&#8593;</span>' + fmtBps(nowTx / 3600) + '</td>' +
+        '<td class="num"><span class="arw down">&#8595;</span>' + fmtBytes(nowRx) + '</td>' +
+        '<td class="num"><span class="arw up">&#8593;</span>' + fmtBytes(nowTx) + '</td></tr>';
+      var sumEl = document.getElementById('hourlySum');
+      if (sumEl) sumEl.innerHTML = '近 24 小时累计：下行 <b>' + fmtBytes(tRx) +
+        '</b> · 上行 <b>' + fmtBytes(tTx) + '</b>';
+    }
+
     var ts = document.getElementById('lvStamp');
     ts.className = 'livestamp';
     ts.textContent = '实时 · ' + new Date().toLocaleTimeString('zh-CN', {hour12:false});
+  }
+
+  function fmtBytes(n){
+    if (!n || n < 1) return '0 B';
+    var u = ['B','KB','MB','GB','TB'], i = 0, v = n;
+    while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
+    return (v >= 100 ? v.toFixed(0) : v.toFixed(v >= 10 ? 1 : 2)) + ' ' + u[i];
   }
   function fail(msg){
     var ts = document.getElementById('lvStamp');
@@ -1391,8 +1480,8 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   <td class="st"><span class="dot off"></span><span class="stx">离线</span></td>
   <td class="mono">{html.escape(r['ip'])}</td>
   <td class="muted">{html.escape(r['note']) or '<span class="muted">—</span>'}</td>
-  <td class="num rx">—</td>
-  <td class="num tx">—</td>
+  <td class="num rx"><span class="arw down">&#8595;</span>—</td>
+  <td class="num tx"><span class="arw up">&#8593;</span>—</td>
   <td class="num cs">—</td>
   <td>{'<span class="ok">启用</span>' if r['enabled'] else '<span class="bad">停用</span>'}</td>
   <td class="muted">{fmt_ts(r['last_seen']) or '从未'}</td>
@@ -1451,8 +1540,10 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
 
 <div class="card">
   <h2 style="margin-top:0">临时密钥（最近 40 条）</h2>
+  <div class="listwrap sm">
   <table><thead><tr><th>密钥前缀</th><th>备注</th><th>可用时长</th><th>状态</th><th>使用方</th><th>创建</th><th></th></tr></thead>
   <tbody>{inv_rows or '<tr><td colspan="7" class="muted">还没有密钥</td></tr>'}</tbody></table>
+  </div>
 </div>
 
 <div class="card">
@@ -1465,7 +1556,9 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   <table id="userTable">
     <thead><tr>
       <th>状态</th><th>局域网 IP</th><th>备注</th>
-      <th class="numh">下行</th><th class="numh">上行</th><th class="numh">连接</th>
+      <th class="numh"><span class="arw down">&#8595;</span>下行</th>
+      <th class="numh"><span class="arw up">&#8593;</span>上行</th>
+      <th class="numh">连接</th>
       <th>账号</th><th>最后活动</th><th>操作</th>
     </tr></thead>
     <tbody>{cli_rows}</tbody>
@@ -1474,9 +1567,30 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
 </div>
 
 <div class="card">
+  <h2 style="margin-top:0">流量统计</h2>
+  <div class="listwrap sm">
+  <table>
+    <thead><tr>
+      <th>时段</th>
+      <th class="numh"><span class="arw down">&#8595;</span>平均下行</th>
+      <th class="numh"><span class="arw up">&#8593;</span>平均上行</th>
+      <th class="numh"><span class="arw down">&#8595;</span>下行流量</th>
+      <th class="numh"><span class="arw up">&#8593;</span>上行流量</th>
+    </tr></thead>
+    <tbody id="hourlyBody"><tr><td colspan="5" class="muted">等客户端上报心跳后出现</td></tr></tbody>
+  </table>
+  </div>
+  <div class="hint" id="hourlySum" style="margin-top:10px">
+    速率来自客户端每 5 秒一次的心跳；流量是两次心跳之间的增量累加。
+  </div>
+</div>
+
+<div class="card">
   <h2 style="margin-top:0">最近事件</h2>
+  <div class="listwrap sm">
   <table><thead><tr><th>时间</th><th>类型</th><th>IP</th><th>说明</th></tr></thead>
   <tbody>{ev_rows or '<tr><td colspan="4" class="muted">无</td></tr>'}</tbody></table>
+  </div>
 </div>""")
 
 
