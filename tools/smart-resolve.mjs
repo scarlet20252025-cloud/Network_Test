@@ -58,27 +58,16 @@ const POOL = {
     { ip: '140.82.121.9', ok: '5/5' },
     { ip: '20.205.243.165', ok: '5/5' },
   ],
-  'raw.githubusercontent.com': [
-    // 2026-10-23 04:15 远端实测：108.133 = 0/3（黑洞），其余全通
-    { ip: '185.199.110.133', ok: '3/3' },
-    { ip: '185.199.111.133', ok: '3/3' },
-    { ip: '185.199.108.153', ok: '3/3' },
-    { ip: '185.199.109.153', ok: '3/3' },
-    { ip: '185.199.110.153', ok: '3/3' },
-    { ip: '185.199.111.153', ok: '3/3' },
-    { ip: '185.199.109.133', ok: '2/3' },
-    { ip: '185.199.108.133', ok: '0/3' }, // 排最后
-  ],
-  'objects.githubusercontent.com': [
-    { ip: '185.199.110.133', ok: '3/3' },
-    { ip: '185.199.111.133', ok: '3/3' },
-    { ip: '185.199.108.153', ok: '3/3' },
-    { ip: '185.199.109.153', ok: '3/3' },
-    { ip: '185.199.110.153', ok: '3/3' },
-    { ip: '185.199.111.153', ok: '3/3' },
-    { ip: '185.199.109.133', ok: '2/3' },
-    { ip: '185.199.108.133', ok: '0/3' },
-  ],
+  // ⚠️ raw / objects.githubusercontent.com 故意**不放进候选池**。
+  // 2026-10-23 实测（远端直连与经隧道各 6 次，两者成功率一致 ≈1/6）：
+  //   远端直连：000 301 000 000 000 000
+  //   经隧道  ：000 000 200 000 000 000
+  // 结论：这是办公网到 GitHub Fastly 边缘（185.199.x / 151.101.x）的链路问题，
+  // **与本工具无关**，固定 IP 也救不了 —— 逐 IP 采样每次结果都不同，
+  // 同一 IP 这一轮 301 下一轮就 timeout。
+  // 放进池里反而有害：connectBest 会把「TCP 通但 TLS 被 RST」的 IP 当成功，
+  // 白白多等一个超时才回落到 DNS 解析。
+  // 让 ssh -D 用远端 DNS 正常解析，成功率与任何固定策略相同，且不浪费重试预算。
 };
 
 /**
@@ -90,14 +79,13 @@ const POOL = {
  * gist.githubusercontent.com（真实 IP 185.199.x），SNI 和 IP 都不对，
  * 全部超时（实测 25s 失败）。
  *
- * 正确映射（远端 DNS 实测确认同一批 IP）：
- *   *.githubusercontent.com  → raw.githubusercontent.com 的池（185.199.x）
- *   *.github.com             → github.com 的池（140.82.x / 20.x）
- *   其他后缀无池 → null，让 ssh -D 用远端 DNS 正常解析
+ * 现在 `githubusercontent.com` 映射到 null：整族域名（raw / gist / objects）
+ * 都交给远端 DNS 解析。理由见 POOL 末尾的实测记录 —— 这些域名的失败是
+ * 办公网到 Fastly 边缘的链路问题，固定 IP 无效。
  */
 const SUFFIX_POOL = {
   'github.com': 'github.com',
-  'githubusercontent.com': 'raw.githubusercontent.com',
+  'githubusercontent.com': null,
   'githubassets.com': null,
   'github.io': null,
 };
@@ -304,10 +292,15 @@ function markFail(ip) {
  *     教训：第一版没有总预算，8 个 IP 各 6s + dual-proxy 再 fallback 20s，
  *     最坏 38s，浏览器直接判超时，用户看到的就是「打不开」。
  *
+ * ⚠️ 重要限制：这里只验证到 **SOCKS5 建连成功（TCP 层）**，不代表应用层可用。
+ * 实测 raw.githubusercontent.com / github.com 都有「TCP 通、TLS 被 RST」的 IP。
+ * 所以调用方若是 TLS/HTTP 场景，应传 deferConfirm:true，拿返回的 confirm()
+ * 在应用层真正跑通后再标记健康，否则坏 IP 会被永久当成好 IP。
+ *
  * @param {string} host  域名（用于查候选池）
  * @param {number} port
- * @param {object} opts  { socksPort, perTryTimeout, maxTries, concurrency, staggerMs, totalTimeoutMs }
- * @returns {Promise<{sock, ip, ms, tried}>}
+ * @param {object} opts  { socksPort, perTryTimeout, maxTries, concurrency, staggerMs, totalTimeoutMs, deferConfirm }
+ * @returns {Promise<{sock, ip, ms, tried, confirm}>}
  */
 export async function connectBest(host, port, opts = {}) {
   const socksPort = opts.socksPort || 10808;
@@ -316,6 +309,7 @@ export async function connectBest(host, port, opts = {}) {
   const concurrency = opts.concurrency || 4;
   const staggerMs = opts.staggerMs || 400;
   const totalTimeoutMs = opts.totalTimeoutMs || 8000;
+  const deferConfirm = opts.deferConfirm === true;
 
   const ips = await resolveBest(host);
   if (!ips.length) throw new Error(`无法解析 ${host}`);
@@ -365,9 +359,19 @@ export async function connectBest(host, port, opts = {}) {
         .then((r) => {
           if (done) { try { r.sock.destroy(); } catch {} return; }
           done = true;
-          markOk(ip);
+          if (!deferConfirm) markOk(ip);
           cleanup();
-          resolve({ ...r, tried, elapsed: Date.now() - t0 });
+          // confirm：调用方在应用层跑通后调用，才真正记一次成功；
+          // 失败则记一次失败，下次排序自动降权。
+          const confirm = (ok, detail) => {
+            if (ok) markOk(ip);
+            else markFail(ip);
+            if (detail) {
+              // 只在失败时留痕，避免正常请求刷屏
+              if (!ok) console.error?.(`[smart-resolve] ${host} ${ip} 应用层失败: ${detail}`);
+            }
+          };
+          resolve({ ...r, tried, elapsed: Date.now() - t0, confirm });
         })
         .catch((e) => {
           markFail(ip);
@@ -390,4 +394,4 @@ export async function connectBest(host, port, opts = {}) {
   });
 }
 
-export { POOL, matchPool, HEALTH };
+export { POOL, matchPool, HEALTH, markOk, markFail };

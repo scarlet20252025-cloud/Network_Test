@@ -1,0 +1,47 @@
+fix: 流确认丢字节 + 择优只看 TCP 层（v0.4.1）
+
+## 1. `'data'` 监听 + `pipe()` 争抢字节
+
+给 dual-proxy 加「确认上游能回数据」的逻辑时，第一版写成：
+
+    sock.on('data', onData)   // 数上游回了多少字节
+    sock.pipe(clientSocket)   // 又交给 pipe 转发
+
+给 Socket 挂 `'data'` 会让流进入 flowing 模式，pipe 的自动转发被抢先消费掉
+一部分字节。TLS ClientHello 的响应首字节丢了就永远握手不完成 ——
+表现为 `github.com` 从 10/10 掉到 4/10，且失败是 20s 超时而非秒失败。
+
+改为自实现 `pipeWithConfirm()`：自己 `src.on('data')` 转发 + `dst.write()`
+返回值做背压 + `dst.on('drain')` 恢复。修好后 **15/15，p50 2.2s**。
+
+## 2. 择优只验证到 TCP 层
+
+`connectBest()` 在 SOCKS5 建连成功就 `markOk(ip)`，但 GitHub 系存在
+「TCP 通、TLS 被中间设备 RST」的 IP，会被永久当成好 IP、排序永远靠前，
+用户看到「择优成功但浏览器连接被重置」。
+
+新增 `deferConfirm` 选项：返回 `confirm(ok, detail)` 回调，由调用方在
+应用层（CONNECT 隧道里真正跑通）后再计分。
+
+## 3. 移除 githubusercontent.com 整族候选池
+
+取证（同时刻双路径对比，各 6 次）：
+
+    远端直连（不经隧道）：000 301 000 000 000 000
+    经本工具隧道        ：000 000 200 000 000 000
+
+成功率一致 → 办公网到 GitHub Fastly 边缘（185.199.x / 151.101.x）的链路问题，
+与本工具无关。固定 IP 每次采样结果都不同，留在池里只会白耗一次超时预算。
+改为映射到 null，交给远端 DNS 正常解析。
+
+## 验证
+
+    github.com              15/15  p50 2.2s（min 1.59s）
+    api.github.com           5/5   p50 0.43s
+    codeload.github.com      5/5   p50 0.92s
+    www.bilibili.com         5/5   p50 0.27s
+    raw.githubusercontent.com 约 1/6（远端直连同样 1/6，非本工具问题）
+
+## 文档
+
+`docs/踩坑记录.md` 新增 24/25/26 条，含完整取证方法与代码正误对比。

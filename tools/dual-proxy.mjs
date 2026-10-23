@@ -107,20 +107,70 @@ function record(kind, target, ms, ok, err) {
 async function smartConnect(host, port, timeoutMs = 8000) {
   if (matchPool(host)) {
     try {
+      // deferConfirm：先不在 TCP 层记成功。
+      // 实测 raw.githubusercontent.com / github.com 都有「SOCKS5 建连成功但
+      // TLS 握手被 RST」的 IP。若这里直接 markOk，坏 IP 会被永久当成好 IP，
+      // 表现为「择优成功但浏览器连接被重置」。
       const r = await connectBest(host, port, {
         socksPort: SOCKS_PORT,
         perTryTimeout: 3500,
         totalTimeoutMs: 8000,
         concurrency: 4,
+        deferConfirm: true,
       });
-      return r.sock;
+      return { sock: r.sock, ip: r.ip, confirm: r.confirm };
     } catch (e) {
       // 候选池全失败则退回原路径，至少还有一次机会（但要短，别让用户干等）
       log(`  ! 择优失败 ${host}:${port} ${e.message.slice(0, 120)}，退回域名解析`);
     }
   }
   const r = await socksConnect(host, port, Math.min(timeoutMs, 8000));
-  return r.sock;
+  return { sock: r.sock, ip: host, confirm: () => {} };
+}
+
+/**
+ * 带确认的双向管道。
+ *
+ * 为什么不用 attachConfirm + pipe：给 sock 加 'data' 监听会让流进入 flowing
+ * 模式，早到的字节被确认逻辑吃掉、不会转发给客户端 —— 实测导致 TLS 握手
+ * 卡住、请求 20s 超时。必须由我们自己转发，一个字节都不能丢。
+ *
+ * 确认规则：上游只要回吐 ≥1 字节即认为该 IP 可用；若在上游首字节前就 close，
+ * 或 6 秒内零字节，则记一次失败（下次排序自动降权）。
+ */
+function pipeWithConfirm(src, dst, confirm, label) {
+  let bytes = 0;
+  let settled = false;
+  const settle = (ok, detail) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    confirm(ok, detail);
+  };
+  const timer = setTimeout(() => settle(false, `${label} 6s 无上游字节`), 6000);
+
+  src.on('data', (chunk) => {
+    if (bytes === 0) settle(true);
+    bytes += chunk.length;
+    if (!dst.write(chunk)) src.pause();
+  });
+  dst.on('drain', () => src.resume());
+
+  src.on('end', () => {
+    if (bytes === 0) settle(false, `${label} 上游零字节即结束`);
+    if (dst.writable) dst.end();
+  });
+  src.on('close', () => {
+    if (bytes === 0) settle(false, `${label} 上游零字节即关闭`);
+    else settle(true);
+    if (dst.writable) dst.end();
+  });
+  src.on('error', () => {
+    if (bytes === 0) settle(false, `${label} 上游 error`);
+    dst.destroy();
+  });
+  dst.on('error', () => src.destroy());
+  dst.on('close', () => src.destroy());
 }
 
 function socksConnect(host, port, timeoutMs = 20000) {
@@ -224,8 +274,7 @@ const httpServer = http.createServer((req, res) => {
   const t0 = Date.now();
   log(`HTTP  ${req.method} ${host}:${port}${target.pathname}`);
 
-  smartConnect(host, port)
-    .then((sock) => {
+  smartConnect(host, port).then(({ sock, ip, confirm }) => {
       stats.active++;
       const path = target.pathname + target.search;
       const headers = { ...req.headers, host: target.host };
@@ -237,7 +286,8 @@ const httpServer = http.createServer((req, res) => {
         '\r\n\r\n'
       );
       req.pipe(sock);
-      sock.pipe(res);
+      if (ip !== host) pipeWithConfirm(sock, res, confirm, `${host}@${ip}`);
+      else sock.pipe(res);
 
       const done = (err) => {
         stats.active--;
@@ -268,13 +318,14 @@ httpServer.on('connect', (req, clientSocket, head) => {
   const t0 = Date.now();
   log(`CONNECT ${host}:${port}`);
 
-  smartConnect(host, port)
-    .then((sock) => {
+  smartConnect(host, port).then(({ sock, ip, confirm }) => {
       stats.active++;
       stats.connect++;
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length) sock.write(head);
-      sock.pipe(clientSocket);
+      // 用 pipeWithConfirm 代替 sock.pipe，才能在不丢字节的前提下降权坏 IP
+      if (ip !== host) pipeWithConfirm(sock, clientSocket, confirm, `${host}@${ip}`);
+      else sock.pipe(clientSocket);
       clientSocket.pipe(sock);
 
       let closed = false;
@@ -375,12 +426,13 @@ const socksServer = net.createServer((client) => {
 
       const t0 = Date.now();
       smartConnect(host, port)
-        .then((sock) => {
+        .then(({ sock, ip, confirm }) => {
           stats.active++;
           // 成功回复：VER=5 REP=0 RSV=0 ATYP=1 BND.ADDR=0.0.0.0 BND.PORT=0
           client.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
           if (rest.length) sock.write(rest);
-          sock.pipe(client);
+          if (ip !== host) pipeWithConfirm(sock, client, confirm, `${host}@${ip}`);
+          else sock.pipe(client);
           client.pipe(sock);
           client.resume();
 

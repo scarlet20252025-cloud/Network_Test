@@ -1,3 +1,22 @@
+## v0.4.1 — 2026-10-23
+
+### 修复
+- **流确认逻辑丢字节**：`attachConfirm` 给 Socket 挂 `'data'` 监听后又调用 `sock.pipe()`，
+  两个消费者争抢同一份字节，TLS 握手首字节被吞 → `github.com` 从 10/10 掉到 4/10
+  且失败表现为 20s 超时。改为自实现 `pipeWithConfirm()`（自己转发 + 背压处理），
+  修复后 15/15 通过、p50 2.2s。
+- **择优只看 TCP 层**：`connectBest()` 在 SOCKS5 建连成功即 `markOk`，
+  但 GitHub 系存在「TCP 通、TLS 被 RST」的 IP，会被永久当成好 IP。
+  新增 `deferConfirm` 选项 + `confirm(ok, detail)` 回调，由调用方在应用层跑通后再计分。
+
+### 移除
+- `githubusercontent.com` 整族（raw / gist / objects）从候选池移除，交给远端 DNS 解析。
+  取证：远端直连与经隧道同时刻各 6 次，成功率均约 1/6，说明是办公网到
+  GitHub Fastly 边缘的链路问题，固定 IP 无效反而多耗一次超时预算。
+
+### 文档
+- `docs/踩坑记录.md` 新增第 24/25/26 条：`'data'` + `pipe()` 争抢字节、
+  只验证 TCP 的择优不可靠、识别「不是本工具的锅」的取证方法（同时刻双路径对比）。
 # CHANGELOG
 
 ## v0.4.0 — 2026-10-23
