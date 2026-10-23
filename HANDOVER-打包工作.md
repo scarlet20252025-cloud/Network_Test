@@ -2113,6 +2113,111 @@ Nagle 会攒小包到 200ms 再发，表现就是「每次点击都慢一拍」�
 如果哪天觉得这个字段也多余，直接删掉即可 —— 安装程序拿不到 `registered`
 会走 fallback 分支，行为一致。
 
+## 九点二十二、自动更新 —— 实测（不是「写了就算」）
+
+### 之前的状态：代码写了，但**从未真正触发过**
+
+版本号一直是 0.8.0，`/version.json` 也返回 0.8.0，比较结果永远是「相同」，
+那个「更新」按钮**一次都没出现过**。等于没验证。
+
+### 这次实际造了一个新版本，跑通了
+
+**造场景**：在 `dist/version.json` 写 `{"latest":"0.9.9",...}` 传到门户 dist 下，
+重启后 `/version.json` 就返回 0.9.9（`read_version_manifest` 优先读这个文件）。
+
+**验证一：判断链**
+
+```
+TestUpdate.exe http://10.13.24.1:8080 0.8.0.0
+
+[1] Api.Version -> Ok=True  latest=0.9.9  url=/download-latest
+[2] CompareVer(latest=0.9.9, mine=0.8.0.0) = 1
+    → 会提示更新
+
+    OK   新版四段 vs 老版四段  (0.9.9 vs 0.8.0.0 = 1)
+    OK   三段 vs 四段，等价  (0.8.0 vs 0.8.0.0 = 0)
+    OK   本地更新  (0.8.0 vs 0.8.1.0 = -1)
+    OK   主版本号进位  (1.0.0 vs 0.99.99.0 = 1)
+```
+
+**三段 vs 四段必须等价**：`Application.ProductVersion` 返回 `0.8.0.0`（四段），
+而 `/version.json` 里写的是 `0.8.0`（三段）。如果按字符串比，`"0.8.0"` ≠ `"0.8.0.0"`，
+会误判成「有新版本」，所有人每次启动都被提示更新。
+所以 `CompareVer` 是**逐段转整数比**，缺的段补 0。
+
+**验证二：客户端真的会提示**
+
+启动客户端后日志与界面：
+
+```
+[00:36:24] 发现新版本 0.9.9（当前 0.8.0.0）
+```
+
+界面右上角出现按钮：`更新 0.9.9`（UI 自动化读到的元素 #4 @1094,201,102×26）。
+
+**验证三：更新下载通道**
+
+`DoUpdate` 会从 `/download-latest` 拉安装包。实测：
+
+```
+GET /download-latest
+→ 200，2,143,966 字节，MZ 头
+→ MD5 6dcbd28567a8cbbe6c98d68234d4530c（与本机 dist 完全一致）
+```
+
+**验证四：安装动作**（未实测，说明原因）
+
+`DoUpdate` 里最后一步是：
+
+```csharp
+var psi = new ProcessStartInfo(tmp, "/SILENT /NORESTART /CLOSEAPPLICATIONS");
+psi.UseShellExecute = false;
+Process.Start(psi);
+Log("已启动安装程序，本程序即将退出");
+Thread.Sleep(600);
+RealQuit();
+```
+
+这一步**没在测试里点** —— 点了就真的会重装一遍当前机器，
+而且会打断正在进行的工作。逻辑上它是标准做法：
+- `/SILENT` 让用户看到进度（不是 `/VERYSILENT` 的静默无声）
+- `/CLOSEAPPLICATIONS` 处理文件占用
+- 先 `RealQuit()` 释放自己占的 exe，再让 Inno 覆盖
+
+**这条留给真实发版时验证**：把 `version.json` 改成 `0.9.0` + 放一个真的 0.9.0 安装包，
+点按钮，看是否能自动升上去。
+
+### 清理
+
+测试完把 `dist/version.json`（本地和远端）都删了，
+`/version.json` 回到 `{"latest": "0.8.0"}` —— 否则用户每次打开都会被提示
+「更新 0.9.9」，点进去却装的是同一个版本，会当成 bug。
+
+### 当前自动更新的完整行为
+
+| 时机 | 动作 |
+|---|---|
+| 启动时 | 拉 `/version.json`，比版本；有新版本就显示「更新 x.y.z」按钮 + 记日志 |
+| 每 6 小时 | 同上 |
+| 点按钮 | 确认框 → 下载到 `%TEMP%\Ferry-Setup-<ver>.exe` → `/SILENT` 启动 → 自己退出 |
+
+**刻意不做全自动后台升级**：这个软件会改系统代理设置，
+静默升级中途失败（下载断、磁盘满、被杀软拦）会让用户「全网上不去」——
+必须有用户确认这一道。
+
+### 一个遗留的小瑕疵
+
+ssh 的中文错误消息在 GUI 日志里还是显示成 `\262\273\326\252...` 这种八进制。
+
+原因：`Process.StartInfo.StandardErrorEncoding` 只影响
+`StandardError.ReadToEnd()`，**不影响** `ErrorDataReceived` 事件的 `Data` ——
+后者用的是进程级的 `Console.OutputEncoding`，而 GUI 程序没有控制台，
+设了也未必生效。
+
+不影响功能（英文部分 `channel open failed: connect failed` 是清晰的），
+只是中文目标地址显示不出来。要彻底解决得自己读 `BaseStream` 再解码，
+会多一层阻塞读逻辑，暂时不值得。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`
