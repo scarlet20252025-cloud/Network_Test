@@ -41,3 +41,5 @@ ferry-client/test/out/
 
 # WireGuard 客户端私钥 —— 绝不入库
 wireguard/*.key
+
+versions/
