@@ -2626,6 +2626,130 @@ New-NetNat -Name FerryWG -InternalIPInterfaceAddressPrefix 10.66.67.0/24
 WireGuard 的 `.conf` **不认 UTF-8 中文注释**，会显示成 `???`。
 注释必须用英文，或者干脆不写。
 
+## 九点二十七、WireGuard 实验结论：UDP 通，但「全流量」卡在 NAT
+
+### 这一轮跑出来的硬事实
+
+**① 校园网 UDP 完全可通 —— 这是最关键的结论**
+
+不用 WG、不用管理员，直接在两台机器之间做 UDP echo 测试：
+
+```
+xt (10.113.66.6) 起 UDP:51821 echo
+本机 → 10.113.66.6:51821
+
+OK 第1次: 收到 b'PONG:FERRY-UDP-TEST' 来自 ('10.113.66.6', 51821)  往返 10.1 ms
+```
+
+**一次就通、往返 10.1ms、零丢包。** 校园网不封 UDP，WireGuard 这条路本身没问题。
+
+**② WG 服务端在 xt 上配好了**
+
+```
+interface: ferry-wg
+  public key: X+scTvaG8j3k+DvHvR8hWTCqs3DoxSNH2IQ+Bc+adwU=
+  listening port: 51820
+
+peer: 5BRJp596ch9lrB58bP9kfNq0QEDFVSIYll6quX05NGw=
+  allowed ips: 10.66.67.3/32
+```
+
+网段 `10.66.67.0/24`，防火墙已放行（规则 `Ferry WG 51820`），隧道服务已安装。
+
+**③ 但服务端 NAT 建不起来 —— 这是死结**
+
+```
+New-NetNat -Name FerryWG -InternalIPInterfaceAddressPrefix 10.66.67.0/24
+→ CimException: 无效
+→ HRESULT 0x80041010
+```
+
+`0x80041010` = **WBEM_E_INVALID_CLASS**，WMI 类根本不存在。
+`vmms` / `hns` 服务也没有。
+
+**所以 `Get-Command New-NetNat` 能查到 cmdlet 不代表能用** ——
+我之前把「cmdlet 存在」误判成「NAT 可用」，实际底层提供程序缺失。
+`docs/` 里早先记的「远端 WinNAT 缺失，放弃 NAT 路线」是对的，这一轮重新验证又是同一个结论。
+
+**没有 NAT 会怎样**：客户端把 `AllowedIPs` 设成 `0.0.0.0/0` 后，
+所有流量被塞进 WG 隧道，xt 收到包却没有转发出网的能力 →
+**客户端直接断网**。所以全流量这一步不能在 NAT 没通的情况下做。
+
+**④ 本机装隧道服务需要管理员，当前会话做不到**
+
+`Start-Process -Verb RunAs` 静默失败（没有 UAC 弹窗、没有进程起来），
+`schtasks /RU SYSTEM` 报 `Access is denied`。
+
+虽然 `ConsentPromptBehaviorAdmin=0`（提权不提示）且 `63526` 在管理员组，
+但 DSH 会话这个 token 就是拿不到提权 —— 这是运行环境的限制，不是配置问题。
+
+### 结论：全流量需要 NAT，而 Windows 客户端版都没有
+
+三条路都堵：
+
+| 方案 | 状态 |
+|---|---|
+| `New-NetNat`（xt / pcs / 本机） | WMI 类缺失，不可用 |
+| ICS（Internet Connection Sharing） | xt 上 `192.168.137.1` 已被 WLAN 占用，改共享会把 wg0 改成同一段，冲突；且配错会直接把 xt 网络打断，我在这台机器上是远程操作，**不能冒这个险** |
+| 用户态 NAT | 要自己写 UDP/TCP 转发 + NAT 表 + 校验和重算，工程量远超这个项目其余部分 |
+
+**换句话说**：「打游戏」这件事不是渡口写错了，是**服务端缺 NAT**。
+换成一台 Linux 服务端（`iptables -t nat MASQUERADE` 一行搞定）就通了。
+
+### 「独立」还是「结合」—— 我的判断
+
+**结合，但 WG 只作为可选线路，不当默认。**
+
+理由：
+
+1. **WG 每次启用都要管理员**（装/卸隧道服务）。SSH 线路不需要。
+   把需要提权的东西设成默认，等于每次开借网都弹 UAC。
+2. **WG 在当前环境只能访问 10.66.67.0/24**（隧道内网），因为没 NAT。
+   拿它当默认出口会让用户「看着连上了但什么都没通」。
+3. **SSH 线路已经稳定跑通全流程**（激活 → 隧道 → 代理 → 出口 IP 变化）。
+   WG 没有任何一项比它强的地方 —— 除非 NAT 解决。
+4. **但 WG 有价值**：延迟低（10ms UDP）、能访问远端内网段。
+   将来如果 NAT 解决（换 Linux 服务端），它就是打游戏的唯一路径。
+
+**所以**：SSH 保持默认；WG 作为「高级选项」存在，等 NAT 具备条件再启用。
+
+### 当前状态
+
+- WG 服务端在 xt 上**配好了、没启用到客户端**
+- 客户端材料在 `wireguard/`（配置、密钥、测试脚本）
+- **没有改动 SSH 线路任何代码**
+- 全流量开关**故意没开**（避免断网）
+
+### 已经准备好的下一步（等条件具备）
+
+**如果换一台能做 NAT 的服务端**：
+
+```bash
+# Linux 服务端一条命令
+iptables -t nat -A POSTROUTING -s 10.66.67.0/24 -o eth0 -j MASQUERADE
+sysctl -w net.ipv4.ip_forward=1
+```
+
+然后客户端 `AllowedIPs = 0.0.0.0/0`，游戏就能走。
+
+**如果继续用 Windows 服务端**：需要用户态 NAT，估算 500+ 行代码（UDP 会话表 + 校验和）＋
+需要抓包转发权限，收益和风险都不划算。
+
+### 版本存档
+
+新增 `tools/snapshot.ps1` + `VERSIONS.md`。
+
+每个阶段跑一次：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\snapshot.ps1 -Label "阶段说明"
+```
+
+会存 `versions/<时间戳>/`（exe、安装包、portal-server.py、ferry.iss、源码 zip、META 含 MD5），
+同时打 git tag `snapshot-<时间戳>`。
+
+**第一次快照**：`versions/20261024-0224/`，标签「WG 实验前 / SSH 线路稳定版」。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`
