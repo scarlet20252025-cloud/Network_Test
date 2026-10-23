@@ -1294,6 +1294,8 @@ tr[data-on="1"]{background:color-mix(in srgb, var(--accent) 5%, transparent)}
 
 def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
     csrf_in = f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">' if csrf else ''
+    _ld = int(CFG.get('license_days') or 0)
+    license_days_txt = '永久' if _ld <= 0 else (str(_ld) + ' 天')
     inv = db.q('SELECT * FROM invites ORDER BY id DESC LIMIT 40')
     cli = db.q('SELECT * FROM clients ORDER BY created_at DESC')
     ev = db.q('SELECT * FROM events ORDER BY id DESC LIMIT 30')
@@ -1364,9 +1366,14 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
         <input type="text" name="note" placeholder="例如 张三-3楼" maxlength="60">
       </div>
       <div style="flex:0 0 150px">
-        <label>有效小时数</label>
+        <label>密钥有效期（小时）</label>
         <input type="number" name="hours" value="{new_hours}" min="1" max="720">
       </div>
+    </div>
+    <div class="hint" style="margin:10px 0 12px;line-height:1.8">
+      这个「小时」是<b>密钥本身</b>的有效期 —— 生成后必须在这个时间内用掉，过期作废。<br>
+      激活成功后，<b>账号</b>可借网的时长是另一回事：当前配置 <b>{license_days_txt}</b>
+      （服务端 <code>--license-days</code> 参数，0 = 永久）。
     </div>
     <button type="submit">生成密钥</button>
   </form>
@@ -2900,6 +2907,8 @@ def main():
     ap.add_argument('--public-host', default='', help='使用者连的远端地址')
     ap.add_argument('--ssh-user', default='pcserver')
     ap.add_argument('--ssh-port', type=int, default=22)
+    ap.add_argument('--license-days', type=int, default=None,
+                    help='激活后账号可借网的天数（0 = 永久；缺省用内置 30）')
     args = ap.parse_args()
 
     CFG.update({
@@ -2907,6 +2916,9 @@ def main():
         'public_host': args.public_host, 'ssh_user': args.ssh_user,
         'ssh_port': args.ssh_port,
     })
+    # 授权天数：0 = 永久。缺省沿用内置 30，显式传了才覆盖。
+    if args.license_days is not None:
+        CFG['license_days'] = int(args.license_days)
 
     db = DB(args.db)
     Handler.db = db
