@@ -40,9 +40,15 @@ Write-AppLog "======== 借网助手启动 pid=$PID PS=$($PSVersionTable.PSVersio
 # ---------------- 配置 ----------------
 $RemoteHost   = 'pcs'
 $SocksPort    = 10808
+# ⚠️ Windows 系统代理（WinINET 的 ProxyServer）只支持 HTTP 代理，不支持 SOCKS5。
+# 必须把系统代理指向 dual-proxy 的 HTTP 端口，绝不能填 $SocksPort。
+# 历史事故：这里曾写成 "127.0.0.1:$SocksPort"，导致浏览器 / .NET / Electron
+# 把 SOCKS5 端口当 HTTP 代理去连 —— 全部秒失败，用户看到「开了借网浏览器打不开」。
+$HttpPort     = 10809
 $ProxyMode    = 'System'
 $ToolsDir     = $PSScriptRoot
 $KeeperScript = Join-Path $ToolsDir 'ssh-tunnel-keeper.ps1'
+$BridgeScript = Join-Path $ToolsDir 'dual-proxy.mjs'
 
 # ---------------- 工具函数（与 CLI 版共用逻辑） ----------------
 
@@ -114,6 +120,44 @@ public class InetOptRefresh {
     Add-Type -TypeDefinition $sig -Language CSharp -ErrorAction SilentlyContinue
   }
   try { [InetOptRefresh]::Refresh() } catch {}
+}
+
+function Test-PortOpen {
+  param([int]$Port, [int]$TimeoutMs = 300)
+  try {
+    $c = New-Object Net.Sockets.TcpClient
+    $iar = $c.BeginConnect('127.0.0.1', $Port, $null, $null)
+    $ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+    $c.Close()
+    return [bool]$ok
+  } catch { return $false }
+}
+
+function Test-BridgeAlive { return (Test-PortOpen -Port $HttpPort -TimeoutMs 300) }
+
+function Start-Bridge {
+  # 启动 dual-proxy（HTTP+SOCKS5 单端口），已存在则复用。
+  # 为什么必须启动它：系统代理只能填 HTTP 端口，没有这一层就没法让浏览器工作。
+  if (Test-BridgeAlive) { return 'running' }
+  $node = 'D:\nodejs\node.exe'
+  if (-not (Test-Path $node)) {
+    $nc = Get-Command node -ErrorAction SilentlyContinue
+    if ($nc) { $node = $nc.Source }
+  }
+  if (-not (Test-Path $node) -or -not (Test-Path $BridgeScript)) { return 'missing' }
+
+  $cmdLine = "`"$node`" `"$BridgeScript`" --listen $HttpPort --socks $SocksPort"
+  try {
+    # WMI 创建：完全脱离父进程，不会随 GUI 退出被回收
+    $cr = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine }
+    if ($cr.ReturnValue -ne 0) { return "failed:$($cr.ReturnValue)" }
+  } catch { return "error:$($_.Exception.Message)" }
+
+  for ($i = 0; $i -lt 20; $i++) {
+    if (Test-BridgeAlive) { return 'started' }
+    Start-Sleep -Milliseconds 300
+  }
+  return 'timeout'
 }
 
 function Start-Keeper {
@@ -225,9 +269,17 @@ function Complete-Probe {
 
 function Get-State {
   $alive  = Test-SocksAlive
+  $bridge = Test-BridgeAlive
   $st     = Get-ProxyState
   $keeper = [bool](Get-KeeperProc)
-  $borrowing = ($st.Enabled -and $st.Server -eq "127.0.0.1:$SocksPort" -and $alive)
+
+  # 「借网生效」的判据：系统代理指向 HTTP 端口（浏览器真能用）+ 隧道存活 + bridge 存活。
+  # 注意：如果系统代理还是历史的 SOCKS 端口写法，这里判为「未生效」并置 StaleProxy，
+  # 让 UI 提示用户重新点一次「开启借网」来修复，而不是把它当成正常状态。
+  $httpProxy = "http://127.0.0.1:$HttpPort"
+  $socksProxy = "127.0.0.1:$SocksPort"
+  $stale = ($st.Enabled -and $st.Server -eq $socksProxy)
+  $borrowing = ($st.Enabled -and $st.Server -eq $httpProxy -and $alive -and $bridge)
 
   # 出口 IP 一律读后台缓存，绝不在 UI 线程里发网络请求
   $directIp = "$($script:Probe.Direct)"
@@ -235,6 +287,8 @@ function Get-State {
 
   [PSCustomObject]@{
     SocksAlive = $alive
+    BridgeAlive = $bridge
+    StaleProxy = $stale
     ProxyOn    = $st.Enabled
     ProxySrv   = $st.Server
     Keeper     = $keeper
@@ -334,8 +388,19 @@ $mnuExit.Add_Click({
         $bak = (Get-Content $bakFile -Raw).Trim()
         $en, $srv = $bak -split '\|', 2
         $enVal = if ($en -match '^(1|true)$') { 1 } else { 0 }
-        Set-Proxy -Enable $enVal -Server $srv
-        Write-AppLog "退出前已还原系统代理: $srv"
+        # 备份若也是 SOCKS 写法（历史污染）则不还原，直接关代理
+        if ($srv -eq "127.0.0.1:$SocksPort") {
+          Set-Proxy -Enable 0 -Server ''
+          Write-AppLog "退出前：备份是 SOCKS 写法，已关闭系统代理"
+        }
+        else {
+          Set-Proxy -Enable $enVal -Server $srv
+          Write-AppLog "退出前已还原系统代理: $srv"
+        }
+      }
+      else {
+        Set-Proxy -Enable 0 -Server ''
+        Write-AppLog '退出前：无备份，已关闭系统代理'
       }
     } catch { Write-AppLog "退出前还原代理失败: $($_.Exception.Message)" 'WARN' }
     if ($script:NotifyIcon) { $script:NotifyIcon.Visible = $false; $script:NotifyIcon.Dispose() }
@@ -567,11 +632,25 @@ function Update-Status {
       Add-Log "SOCKS 127.0.0.1:$SocksPort 已就绪"
       if ($ProxyMode -eq 'System') {
         try {
-          if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir -Force }
-          $cur = Get-ProxyState
-          Set-Content (Join-Path $StateDir 'proxy-backup.txt') -Value "$($cur.Enabled)|$($cur.Server)" -Encoding ASCII
-          Set-Proxy -Enable 1 -Server "127.0.0.1:$SocksPort"
-          Add-Log '系统代理已切换'
+          # 先确保 dual-proxy（HTTP 端口）活着 —— 系统代理只能填它
+          $br = Start-Bridge
+          if ($br -eq 'missing') {
+            Add-Log '❌ 找不到 node 或 dual-proxy.mjs，无法建 HTTP 代理，已跳过系统代理切换'
+          }
+          elseif (-not (Test-BridgeAlive)) {
+            Add-Log "❌ HTTP 代理 $HttpPort 未就绪（$br），已跳过系统代理切换（写 SOCKS 端口会让浏览器全部打不开）"
+          }
+          else {
+            if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir -Force }
+            $cur = Get-ProxyState
+            # 备份只在「当前值不是我们自己的 HTTP 代理」时覆盖，避免把备份刷成借网地址
+            $bakFile = Join-Path $StateDir 'proxy-backup.txt'
+            if ($cur.Server -ne "http://127.0.0.1:$HttpPort") {
+              Set-Content $bakFile -Value "$($cur.Enabled)|$($cur.Server)" -Encoding ASCII
+            }
+            Set-Proxy -Enable 1 -Server "http://127.0.0.1:$HttpPort"
+            Add-Log "系统代理已切换 → http://127.0.0.1:$HttpPort（HTTP 代理）"
+          }
         } catch { Add-Log "切换系统代理失败: $($_.Exception.Message)" }
       }
       $s = Get-State
@@ -625,9 +704,14 @@ function Update-Status {
             else { "$($s.ProbeAge)s 前" }
   $lblDetail.Text = @(
     "隧道 SOCKS : $(if ($s.SocksAlive) { '存活' } else { '未监听' })      保活进程 : $(if ($s.Keeper) { '运行中' } else { '未运行' })",
+    "HTTP 代理  : $(if ($s.BridgeAlive) { "存活 127.0.0.1:$HttpPort" } else { "未监听 127.0.0.1:$HttpPort" })",
     "系统代理   : $(if ($s.ProxyOn) { '开' } else { '关' })  $($s.ProxySrv)",
     "网络可用   : $(if ($s.HasNet) { '是' } else { '否' })      出口探测 : $ageTxt"
   ) -join "`n"
+
+  if ($s.StaleProxy) {
+    $lblDetail.Text += "`n⚠ 系统代理是旧版 SOCKS 写法，浏览器会打不开 —— 点「开启借网」自动修复"
+  }
 
   $btnOn.Enabled  = -not $s.Borrowing
   $btnOff.Enabled = $s.Borrowing
@@ -644,9 +728,19 @@ $btnOn.Add_Click({
       Add-Log '借网已在运行'
     }
     else {
+      # 历史遗留：系统代理被旧版写成 SOCKS 端口，先清掉避免被当成正常状态
+      if ($s.StaleProxy) {
+        Add-Log "⚠ 检测到系统代理是旧版 SOCKS 写法（$($s.ProxySrv)），浏览器会全部失败，正在修复"
+      }
+
       Add-Log '启动保活隧道…'
       $r = Start-Keeper
       Add-Log "keeper: $r"
+
+      # 立即尝试拉起 HTTP 代理（不依赖 PendingOn，隧道没起来也能先建 bridge）
+      $br = Start-Bridge
+      Add-Log "HTTP 代理(dual-proxy): $br"
+
       $script:PendingOn = (Get-Date).AddSeconds(20)   # 20s 内自动检测端口就绪
       Add-Log '等待 SOCKS 就绪（后台检测，界面可继续操作）'
     }
@@ -664,8 +758,15 @@ $btnOff.Add_Click({
       $bak = (Get-Content $bakFile -Raw).Trim()
       $en, $srv = $bak -split '\|', 2
       $enVal = if ($en -match '^(1|true)$') { 1 } else { 0 }
-      Set-Proxy -Enable $enVal -Server $srv
-      Add-Log "已还原为 $srv"
+      # 备份里如果存的也是 SOCKS 端口写法（历史污染），不能还原它 —— 直接关代理
+      if ($srv -eq "127.0.0.1:$SocksPort") {
+        Add-Log "备份里是 SOCKS 写法（$srv），不还原，直接关闭系统代理"
+        Set-Proxy -Enable 0 -Server ''
+      }
+      else {
+        Set-Proxy -Enable $enVal -Server $srv
+        Add-Log "已还原为 $srv"
+      }
     }
     else {
       Set-Proxy -Enable 0 -Server ''
@@ -673,7 +774,7 @@ $btnOff.Add_Click({
     }
     Add-Log '停止隧道…'
     Stop-Keeper
-    Add-Log '已切回直连'
+    Add-Log '已切回直连（HTTP 代理进程保留，下次开启直接复用）'
   }
   catch { Add-Log "错误: $($_.Exception.Message)" }
   finally { Set-UiBusy $false; $null = Update-Status }
