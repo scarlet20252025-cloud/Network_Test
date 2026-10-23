@@ -26,3 +26,4 @@ portal/*.db
 portal/*.db-*
 .ferry/
 portal/ck*.txt
+*.keeper.lock
