@@ -1218,7 +1218,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(204)
                 self.end_headers()
             else:
-                self.send_html(page('404', '<h1>404</h1><div class="sub">没有这个页面</div>'), 404)
+                # 404 要给出路，而不是只告诉人「没有这个页面」。
+                # 常见来路：地址栏多打了字符（比如 /0）、旧书签、
+                # 或者把域名和端口拼错了。
+                self.send_html(page('404 · Ferry', f"""
+<h1>404</h1>
+<div class="sub">没有这个页面：<code class="mono">{html.escape(path)}</code></div>
+
+<div class="card">
+  <h2 style="margin-top:0">你可能想找</h2>
+  <div class="step"><div class="n">→</div><div class="t">
+    <a href="/" style="color:var(--accent)">登录页</a>
+    <div class="hint">用管理员给的临时密钥登录</div>
+  </div></div>
+  <div class="step"><div class="n">→</div><div class="t">
+    <a href="/about" style="color:var(--accent)">关于 Ferry</a>
+    <div class="hint">它是什么、怎么工作、有哪些限制</div>
+  </div></div>
+  <div class="step"><div class="n">→</div><div class="t">
+    <a href="/setup-hosts" style="color:var(--accent)">配置局域网域名</a>
+    <div class="hint">让 ferry.internal 能直接打开</div>
+  </div></div>
+  <div class="step"><div class="n">→</div><div class="t">
+    <a href="/api/status" style="color:var(--accent)">运行状态</a>
+    <div class="hint">JSON，给排查用的</div>
+  </div></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">访问地址</h2>
+  <div class="kv"><div class="k">本页地址</div><div class="v mono">
+    http://{html.escape(CFG['public_host'] or '10.13.24.1')}:{CFG['port']}/</div></div>
+  <div class="kv"><div class="k">局域网域名</div><div class="v mono">
+    http://{CFG['domain']}:{CFG['port']}/</div></div>
+  <div class="hint">端口 {CFG['port']} 不能省；域名需在 hosts 里配置过才生效。</div>
+</div>
+"""), 404)
         except BrokenPipeError:
             # 客户端提前断开（刷新 / 关标签页 / curl --max-time 到点）不是错误。
             # 这类异常在 HTTP 服务里随时可能发生，打日志只会淹没真问题。
