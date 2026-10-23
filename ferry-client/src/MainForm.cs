@@ -20,7 +20,7 @@ namespace Ferry
         Panel _card, _logCard, _actCard;
         Label _lblActTitle, _lblActHint;
         TextBox _txtCode;
-        Button _btnActivate, _btnOn, _btnOff, _btnRefresh, _btnUninstall, _btnUpd, _btnSettings;
+        Button _btnActivate, _btnOn, _btnOff, _btnRefresh, _btnUpd, _btnSettings;
         TextBox _log;
         NotifyIcon _tray;
         System.Windows.Forms.Timer _fast, _slow, _licTimer, _hbTimer;
@@ -151,15 +151,9 @@ namespace Ferry
             Controls.Add(_btnRefresh);
 
             _btnSettings = Theme.FlatButton("设置", false);
-            _btnSettings.SetBounds(148, 438, 96, 30);
+            _btnSettings.SetBounds(274, 438, 96, 30);
             _btnSettings.Click += delegate { OpenSettings(); };
             Controls.Add(_btnSettings);
-
-            _btnUninstall = Theme.FlatButton("卸载", false);
-            _btnUninstall.SetBounds(390, 438, 110, 30);
-            _btnUninstall.ForeColor = Theme.Muted;
-            _btnUninstall.Click += delegate { DoUninstall(); };
-            Controls.Add(_btnUninstall);
 
             // ── 日志 ──
             _logCard = Theme.Card(10);
@@ -553,7 +547,7 @@ namespace Ferry
 
         void OpenSettings()
         {
-            using (var dlg = new SettingsDialog(_cfg, _cfgPath, _appDir))
+            using (var dlg = new SettingsDialog(_cfg, _cfgPath, _appDir, DoUninstall))
             {
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
                 // 间隔可能改了，热更新定时器
@@ -794,7 +788,6 @@ namespace Ferry
             _btnOn.Enabled = !b;
             _btnOff.Enabled = !b;
             _btnRefresh.Enabled = !b;
-            _btnUninstall.Enabled = !b;
             _btnActivate.Enabled = !b && !_activating;
             Cursor = b ? Cursors.WaitCursor : Cursors.Default;
             // DoEvents：让「启动中…」这类文字在长操作前先画出来，
