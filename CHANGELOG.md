@@ -1,3 +1,59 @@
+## v0.5.0 — 2026-10-23
+
+### 多用户与便捷接入
+
+对应用户要求「多用户管理要便捷且容易管理，状态显示也要合格」，
+以及「尽可能简化配置，确保没见过的局域网主机也能顺利配置成功」。
+
+**新增**
+
+- `tools/proxy-users.mjs`：用户库与双协议认证。
+  HTTP 用 `Proxy-Authorization: Basic`，SOCKS5 用 RFC 1929，
+  **同一套 name+token**。零依赖，单文件存储。
+- `tools/proxy-admin.mjs`：管理 CLI。`add` 直接打印可转发的令牌；
+  `show` 输出该用户的完整接入说明（含浏览器/命令行两种写法）。
+- `tools/client-config.mjs`：生成接入配置，`--format cmd|sh|md`。
+  自动识别本机 IP（排除 Radmin/easytier/Tailscale 等虚拟网卡）。
+- `tools/setup-client.ps1`：使用者机器上一键接入 —— 建密钥、测直连、
+  起隧道、打印配置。**不需要管理员权限**。
+- `docs/多人使用管理.md`：接入架构、管理命令、面板字段、认证与配额说明。
+
+**端口自适应（用户要求：不能因为客户机端口不一样软件就死了）**
+
+- `dual-proxy.mjs` 加 `--port auto`（默认）：从 10800 起探测可用端口，
+  结果写进 `.proxy-state/ports.json`。
+- `tools/Get-BorrowPorts.ps1`：端口解析唯一入口，`borrow-net.ps1` /
+  `借网助手.ps1` / `startup.ps1` 共用。优先级：显式参数 > 状态文件 > 默认值。
+- 自启 `.cmd` 不再写死端口，改传 `--keeper` 让 dual-proxy 自己探测。
+
+**热加载**
+
+- `UserStore.watch()`：`users.json` 被 `proxy-admin.mjs` 改完后 120ms 内生效，
+  加人、改配额、停用都不需要重启代理。用 `fs.watch` + 5 秒兜底轮询
+  （Windows 上 rename 替换不可靠）。
+
+**踩坑修复**
+
+- `findPort` 忘了 `await`，`isFree` 返回的 Promise 恒为真值，
+  于是每次都返回 base 端口，撞占就 `EADDRINUSE` 崩掉。
+- 端口探测没避开面板端口，导致 `http` 与 `panel` 撞成同一个数。
+- `users.json` 中文用户名写盘乱码：`writeFileSync(str,'utf8')` 在本机
+  仍会按 GBK 落盘。改为 `Buffer.from(str,'utf8')` 不经编码转换。
+  （另发现 `Get-Content -Raw` 也会把正确 UTF-8 读成乱码， PowerShell 侧
+  统一改用 `[Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes())`。）
+
+**实测**
+
+| 项 | 结果 |
+|---|---|
+| 无认证访问 | HTTP `407`，SOCKS5 直接断开 |
+| 错误令牌 / 未知用户 / 停用用户 | 分别 `407`，面板记录原因 |
+| 双协议同令牌 | HTTP 与 SOCKS5 均 `200` |
+| 用户隔离 | 乙用甲的令牌 `407` |
+| 局域网 IP 访问 | `200`（`--allow-lan` 下） |
+| 单用户连接上限 1 | 4 并发 → 1 个 `200` + 3 个 `too-many-connections` |
+| 热加载 | 改上限后 3 秒内面板值变化，无需重启 |
+| 端口自适应 | `10802/10803/20800` 自动分配，全通 |
 ## v0.4.2 — 2026-10-23
 
 ### 新增

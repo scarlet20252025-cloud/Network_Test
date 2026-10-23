@@ -39,16 +39,25 @@ Write-AppLog "======== 借网助手启动 pid=$PID PS=$($PSVersionTable.PSVersio
 
 # ---------------- 配置 ----------------
 $RemoteHost   = 'pcs'
-$SocksPort    = 10808
 # ⚠️ Windows 系统代理（WinINET 的 ProxyServer）只支持 HTTP 代理，不支持 SOCKS5。
-# 必须把系统代理指向 dual-proxy 的 HTTP 端口，绝不能填 $SocksPort。
-# 历史事故：这里曾写成 "127.0.0.1:$SocksPort"，导致浏览器 / .NET / Electron
+# 必须把系统代理指向 dual-proxy 的 HTTP 端口，绝不能填 SOCKS 端口。
+# 历史事故：这里曾写成 "127.0.0.1:10808"，导致浏览器 / .NET / Electron
 # 把 SOCKS5 端口当 HTTP 代理去连 —— 全部秒失败，用户看到「开了借网浏览器打不开」。
-$HttpPort     = 10809
+#
+# 端口不再写死：dual-proxy 启动时自动探测可用端口并写进 .proxy-state\ports.json，
+# 这里读它。这样端口被别人的 Clash / 公司代理占了也能正常工作。
+# 想手动指定就改下面两个数字（>0 即生效）。
+$SocksPort    = 0
+$HttpPort     = 0
 $ProxyMode    = 'System'
 $ToolsDir     = $PSScriptRoot
 $KeeperScript = Join-Path $ToolsDir 'ssh-tunnel-keeper.ps1'
 $BridgeScript = Join-Path $ToolsDir 'dual-proxy.mjs'
+
+. (Join-Path $ToolsDir 'Get-BorrowPorts.ps1')
+$_ports    = Get-BorrowPorts -SocksPort $SocksPort -HttpPort $HttpPort
+$SocksPort = $_ports.SocksPort
+$HttpPort  = $_ports.HttpPort
 
 # ---------------- 工具函数（与 CLI 版共用逻辑） ----------------
 

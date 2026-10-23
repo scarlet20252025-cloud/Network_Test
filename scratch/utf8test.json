@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "settings": {
+    "requireAuth": true,
+    "maxConnsPerUser": 40,
+    "dailyBytesPerUser": 0,
+    "authRealm": "borrow-net"
+  },
+  "users": [
+    {
+      "name": "用户991",
+      "token": "gcnc2t-nyrmkg-w5p32n-y7nt6s",
+      "enabled": true,
+      "note": "",
+      "createdAt": "2026-10-23T07:06:46.548Z",
+      "stats": {
+        "totalConns": 0,
+        "bytesIn": 0,
+        "bytesOut": 0,
+        "denied": 0,
+        "lastSeen": null
+      }
+    }
+  ]
+}

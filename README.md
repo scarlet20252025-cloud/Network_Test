@@ -97,6 +97,11 @@ SSH 走校园网直连（3 跳，RTT 3–14 ms），不经 WireGuard 网段。
 | `tools/verify-outage-remote.ps1` | 在**实验机**上断网验证（路由表方案，不影响本机会话） |
 | `tools/push-with-retry.sh` | 借网环境下的 git 推送封装（必需参数 + 重试） |
 | `tools/make-shortcut.ps1` | 生成桌面与开始菜单快捷方式（含自绘 ICO） |
+| `tools/Get-BorrowPorts.ps1` | **端口解析唯一入口**：读 `.proxy-state/ports.json`，三个脚本共用 |
+| `tools/proxy-users.mjs` | 多用户库：令牌认证（HTTP Basic + SOCKS5 RFC1929）、配额、热加载 |
+| `tools/proxy-admin.mjs` | 用户管理 CLI：`add` / `list` / `disable` / `reset` / `settings` / `show` |
+| `tools/client-config.mjs` | 生成使用者接入配置：`--format cmd|sh|md`，自动识别本机 IP |
+| `tools/setup-client.ps1` | 使用者机器上一键接入（建密钥、测直连、起隧道、打印配置） |
 | `config/wg0-remote.conf.example` | 远端 WireGuard 服务端配置样例（当前未启用） |
 
 ## 设计原则
@@ -131,6 +136,7 @@ git -c http.version=HTTP/1.1 -c http.proxy=http://127.0.0.1:10809 -c http.sslBac
 | [docs/实测数据.md](docs/实测数据.md) | **全部实测数据**：可达性 / 抖动 / 带宽多源对比 / DNS / 稳定性 / 断网验证 |
 | [docs/远端部署.md](docs/远端部署.md) | 远端 sshd、WireGuard、端口转发部署步骤 |
 | [docs/断网验证方法.md](docs/断网验证方法.md) | 怎么验证「断网后借网还能用」：模拟断网脚本、判定表、手动验证步骤 |
+| [docs/多人使用管理.md](docs/多人使用管理.md) | 多人接入架构、用户管理 CLI、面板字段说明、认证与配额 |
 
 ## 已知边界
 

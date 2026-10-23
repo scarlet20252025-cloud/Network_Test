@@ -13,13 +13,12 @@
     3. 断线自动重连：由 ssh-tunnel-keeper.ps1 保活（常驻，5s 间隔重启）
     4. 开机自启：可选 -Action InstallStartup 注册计划任务
 
-  用法：
-    .\borrow-net.ps1 -Action On             # 启用借网（启动隧道 + 切系统代理）
-    .\borrow-net.ps1 -Action Off            # 切回直连（停隧道 + 还原系统代理）
-    .\borrow-net.ps1 -Action Status         # 看当前状态 + 出口 IP 对照
-    .\borrow-net.ps1 -Action InstallStartup # 注册登录自启
+   端口说明：
+     不再需要记端口。dual-proxy 启动时自动探测可用端口并写进
+     .proxy-state\ports.json，本脚本和 GUI 都读它。端口被别人占了也能跑。
+     只有极少数情况才需要手动指定：-SocksPort / -HttpPort。
 
-  注：脚本用 UTF-8 with BOM 保存（PS 5.1 要求），改内容时务必保留 BOM。
+   注：脚本用 UTF-8 with BOM 保存（PS 5.1 要求），改内容时务必保留 BOM。
 #>
 [CmdletBinding()]
 param(
@@ -28,18 +27,25 @@ param(
   [string]$Action,
 
   [string]$RemoteHost = 'pcs',
-  [int]$SocksPort = 10808,
+  # 0 = 自动（读 .proxy-state\ports.json，没有再退回 10808/10809）
+  [int]$SocksPort = 0,
   # HTTP 代理端口：Windows 系统代理只认 HTTP，不能直接填 SOCKS 端口
-  [int]$HttpPort = 10809,
+  [int]$HttpPort = 0,
   [string]$ProxyMode = 'System'   # System = 切系统代理；App = 只建隧道，自己给应用配
 )
 
 $ErrorActionPreference = 'Stop'
 
-$ToolsDir   = $PSScriptRoot
+$ToolsDir     = $PSScriptRoot
 $KeeperScript = Join-Path $ToolsDir 'ssh-tunnel-keeper.ps1'
-$StateDir   = Join-Path $ToolsDir '.borrow-net'
-$TaskName   = 'borrow-net-keeper'
+$StateDir     = Join-Path $ToolsDir '.borrow-net'
+$TaskName     = 'borrow-net-keeper'
+
+# ---- 端口解析（唯一入口，GUI/CLI/自启共用）----
+. (Join-Path $ToolsDir 'Get-BorrowPorts.ps1')
+$_ports    = Get-BorrowPorts -SocksPort $SocksPort -HttpPort $HttpPort
+$SocksPort = $_ports.SocksPort
+$HttpPort  = $_ports.HttpPort
 
 # ---- 工具函数 ----
 

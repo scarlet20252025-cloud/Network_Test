@@ -27,8 +27,9 @@ param(
   [ValidateSet('Status', 'Install', 'Uninstall', 'Test')]
   [string]$Action = 'Status',
   [string]$RemoteHost = 'pcs',
-  [int]$SocksPort = 10808,
-  [int]$HttpPort = 10809
+  # 0 = 自动（读 .proxy-state\ports.json）。写死只在极少数调试场景用。
+  [int]$SocksPort = 0,
+  [int]$HttpPort = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,6 +40,12 @@ $StartupDir   = [Environment]::GetFolderPath('Startup')
 $CmdPath      = Join-Path $StartupDir 'BorrowNetKeeper.cmd'
 $LnkPath      = Join-Path $StartupDir 'BorrowNetKeeper.lnk'
 $LockPath     = Join-Path $PSScriptRoot 'borrow-net.keeper.lock'
+
+# ---- 端口解析（与 borrow-net.ps1 / 借网助手.ps1 共用同一入口）----
+. (Join-Path $PSScriptRoot 'Get-BorrowPorts.ps1')
+$_ports    = Get-BorrowPorts -SocksPort $SocksPort -HttpPort $HttpPort
+$SocksPort = $_ports.SocksPort
+$HttpPort  = $_ports.HttpPort
 
 function Write-Ok($m)   { Write-Host "  $m" -ForegroundColor Green }
 function Write-Warn($m) { Write-Host "  $m" -ForegroundColor Yellow }
@@ -138,7 +145,14 @@ switch ($Action) {
       'ping -n 6 127.0.0.1 >nul'
     )
     if ($node -and (Test-Path $BridgeScript)) {
-      $lines += "start `"`" /min `"$node`" `"$BridgeScript`" --listen $HttpPort --socks $SocksPort"
+      # 不传 --listen / --socks：让 dual-proxy 自己探测可用端口。
+      # 写死端口在「客户机环境」会撞车（别人的 Clash / 公司代理爱占 10808/10809），
+      # 一旦被占，自启就起不来，用户看到的是「软件死了」。
+      # dual-proxy 会把实际端口写进 .proxy-state\ports.json，GUI/CLI 都读它。
+      $usersArg = ''
+      $usersFile = Join-Path (Split-Path -Parent $PSScriptRoot) 'users.json'
+      if (Test-Path $usersFile) { $usersArg = " --users `"$usersFile`"" }
+      $lines += "start `"`" /min `"$node`" `"$BridgeScript`" --keeper `"$KeeperScript`" --remote $RemoteHost$usersArg"
     } else {
       Write-Warn '找不到 node 或 dual-proxy.mjs，只装隧道部分'
     }

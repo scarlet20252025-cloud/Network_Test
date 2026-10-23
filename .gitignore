@@ -9,3 +9,8 @@ proxy-backup.txt
 config/wg0-remote.conf
 config/wg0-local.conf
 .commitmsg.txt
+
+# 用户库含明文令牌，绝不入库
+users.json
+client-configs/
+.proxy-state/
