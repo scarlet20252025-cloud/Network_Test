@@ -1604,6 +1604,108 @@ GET /api/license?ip=10.141.59.235&token=sngsb4-...
 3. **一次性凭据必须对「同一主体重复提交」幂等。**
    现实里网络会重试、用户会连点、写盘会失败 —— 这些都不是攻击。
 
+## 九点十七、密钥 12 小时 vs 账号 30 天 —— 两个完全不同的时长
+
+### 用户的疑问（合理的困惑）
+
+> 为什么设置的 12 小时的密钥，激活了显示是 30 天
+
+因为这是**两个独立的东西**，而界面上没说清楚：
+
+| 时长 | 存在哪 | 含义 | 当前值 |
+|---|---|---|---|
+| **密钥有效期** | `invites.expires_at` | 密钥生成后**多久内必须用掉**，过期作废 | 12 小时（生成时可填） |
+| **账号授权时长** | `clients.expires_at` | 激活成功后**能借网多久** | 30 天（`CFG['license_days']`） |
+
+流程是：`密钥（12h 内用掉）→ 换到 30 天授权`。
+密钥那 12 小时是「取票窗口」，不是「票的使用期限」。
+
+### 修法
+
+**① 表单文案说清楚**
+
+原来只有一个输入框「有效小时数」，谁都会以为是「能用多少小时」。
+改成：
+
+```
+密钥有效期（小时）  [12]
+
+这个「小时」是密钥本身的有效期 —— 生成后必须在这个时间内用掉，过期作废。
+激活成功后，账号可借网的时长是另一回事：当前配置 30 天
+（服务端 --license-days 参数，0 = 永久）。
+```
+
+**② 授权天数改成可配**
+
+新增命令行参数：
+
+```python
+ap.add_argument('--license-days', type=int, default=None,
+                help='激活后账号可借网的天数（0 = 永久；缺省用内置 30）')
+...
+if args.license_days is not None:
+    CFG['license_days'] = int(args.license_days)
+```
+
+想改成 7 天就 `--license-days 7`，想永久就 `--license-days 0`。
+
+**③ 管理页动态显示当前配置**
+
+`admin_page` 里算一次 `license_days_txt`（`'永久'` 或 `'30 天'`），
+表单文案直接引用 —— 改参数后页面上的说明会跟着变，不会说了不算。
+
+### 顺带：ssh 输出中文乱码
+
+用户日志里出现：
+
+```
+[ssh] channel 1: open failed: connect failed: 262.273\326\252\252\265\300\325\342...
+```
+
+那串 `\326\252` 是 **GBK 字节被逐字节当拉丁编码处理**的结果。
+
+**根因**：`ProcessStartInfo` 的 `StandardErrorEncoding` / `StandardOutputEncoding`
+没设置。GUI 程序（winexe）没有控制台，`Console.OutputEncoding` 不可靠，
+`DataReceivedEventArgs.Data` 就按单字节编码解释了。
+
+**修法**：
+
+```csharp
+try
+{
+    var gbk = System.Text.Encoding.GetEncoding(936);
+    psi.StandardErrorEncoding = gbk;
+    psi.StandardOutputEncoding = gbk;
+}
+catch (Exception) { }
+```
+
+中文 Windows 上 ssh.exe 输出 GBK（代码页 936）。
+.NET Framework 4.8 默认带这个编码，不需要 `CodePagesEncodingProvider`。
+
+> 注：那些 `channel open failed: connect failed` 本身是**正常噪音** ——
+> 用户访问的某个站点远端也连不上，ssh 就报这个。不是隧道故障。
+
+### 一个成功的现场（这轮最有价值的一次验证）
+
+用户激活后界面显示：
+
+```
+正在走渡口
+流量经远端主机中转 · 出口 IP: 218.107.0.47  来自于: 中国 广东 广州 chinanet.com.cn
+剩余 30 天 · 2026-11-22 到期
+隧道     已连接（端口 10800）
+本地代理  运行中（端口 10801）
+系统代理  开  http://127.0.0.1:10801
+```
+
+**出口 IP 218.107.0.47 正是文档里记录过的远端出口**（联通，与实验机自己的
+116.23.159.136 电信不同）。这条链终于端到端跑通了：
+
+```
+网页下 exe → 装 → 软件内输密钥 → 激活成功 → 建隧道 → 改系统代理 → 出口变了
+```
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`

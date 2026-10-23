@@ -87,6 +87,16 @@ namespace Ferry
                 psi.CreateNoWindow = true;
                 psi.RedirectStandardError = true;
                 psi.RedirectStandardOutput = true;
+                // 中文 Windows 上 ssh.exe 输出的是 GBK（代码页 936）。
+                // 不显式指定的话，GUI 程序没有控制台，DataReceivedEventArgs
+                // 会按单字节拉丁编码处理 —— 日志里就是一串 Öª 这样的八进制。
+                try
+                {
+                    var gbk = System.Text.Encoding.GetEncoding(936);
+                    psi.StandardErrorEncoding = gbk;
+                    psi.StandardOutputEncoding = gbk;
+                }
+                catch (Exception) { }
 
                 var p = new Process();
                 p.StartInfo = psi;
