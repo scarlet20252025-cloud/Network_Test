@@ -90,13 +90,11 @@ SSH 走校园网直连（3 跳，RTT 3–14 ms），不经 WireGuard 网段。
 | `tools/gh-stability.mjs` | GitHub 稳定性对比（直连 vs 隧道） |
 | `tools/longrun.mjs` | 长跑稳定性测试（多目标 × 多轮，输出 p50 / p95） |
 | `tools/correlate.mjs` | 同时刻对比远端直连与隧道，定位波动源 |
-| `tools/gh-probe.mjs` | GitHub 可达性采样（成功率 / 失败阶段分布） |
 | `tools/socks-layer-probe.mjs` | 分层定位 SOCKS 隧道失败阶段 |
-| `tools/egress-diag.ps1` | 逐源逐方式打印出口 IP 探测的耗时与错误 |
 | `tools/verify-outage.ps1` | **一键验证断网可用性**：模拟断网 → 测借网 → 自动恢复（需管理员） |
 | `tools/simulate-outage.ps1` | 模拟「局域网通 / 公网断」的防火墙开关（Start / Stop / Status） |
 | `tools/outage-watch.ps1` | 断网存活监控，持续记录直连 / 借网 / SSH 三态，`-Report` 出统计 |
-| `tools/test-smart-resolve.mjs` | smart-resolve 自检 |
+| `tools/verify-outage-remote.ps1` | 在**实验机**上断网验证（路由表方案，不影响本机会话） |
 | `tools/push-with-retry.sh` | 借网环境下的 git 推送封装（必需参数 + 重试） |
 | `tools/make-shortcut.ps1` | 生成桌面与开始菜单快捷方式（含自绘 ICO） |
 | `config/wg0-remote.conf.example` | 远端 WireGuard 服务端配置样例（当前未启用） |
@@ -129,12 +127,9 @@ git -c http.version=HTTP/1.1 -c http.proxy=http://127.0.0.1:10809 -c http.sslBac
 
 | 文档 | 内容 |
 |---|---|
-| [docs/实测报告.md](docs/实测报告.md) | 可达性 / 抖动 / 丢包 / 长连接 / DNS 完整实测数据 |
-| [docs/性能瓶颈诊断.md](docs/性能瓶颈诊断.md) | 网卡 / DNS / 带宽瓶颈排查与多源测速对比 |
-| [docs/稳定性验证.md](docs/稳定性验证.md) | 关键缺陷的根因、修复与修复前后对比 |
 | [docs/踩坑记录.md](docs/踩坑记录.md) | 实测踩坑清单（PowerShell 5.1 / 远端 / WinForms / git） |
+| [docs/实测数据.md](docs/实测数据.md) | **全部实测数据**：可达性 / 抖动 / 带宽多源对比 / DNS / 稳定性 / 断网验证 |
 | [docs/远端部署.md](docs/远端部署.md) | 远端 sshd、WireGuard、端口转发部署步骤 |
-| [docs/局域网共享方案.md](docs/局域网共享方案.md) | 局域网共享预留设计（认证 / ACL / 性能预期），未实施 |
 | [docs/断网验证方法.md](docs/断网验证方法.md) | 怎么验证「断网后借网还能用」：模拟断网脚本、判定表、手动验证步骤 |
 
 ## 已知边界
