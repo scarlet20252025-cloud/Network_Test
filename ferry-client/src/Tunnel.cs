@@ -134,6 +134,19 @@ namespace Ferry
             // 服务器断开就退出，让看护线程重连；不设的话 ssh 会挂着不动
             sb.Append("-o ServerAliveInterval=15 -o ServerAliveCountMax=3 ");
             sb.Append("-o ExitOnForwardFailure=yes ");
+
+            // ── 下面是纯粹为吞吐/延迟调的，不改安全性 ──
+            // ssh 自带的压缩对已经是压缩态的流量（HTTPS、图片、视频）几乎没有收益，
+            // 白耗 CPU 还增加延迟。关掉。
+            sb.Append("-o Compression=no ");
+            // 默认 IPQoS 是 lowdelay，会让中间路由按「低延迟」排队，牺牲吞吐；
+            // 我们这里主要是搬数据，改 throughput。
+            sb.Append("-o IPQoS=throughput ");
+            // 优先用带 AES-NI 硬件加速的 AEAD 套件（x86 上比 chacha20 快一截），
+            // 后面的作为不支持时的回退 —— 不能只写一个，老 sshd 可能没有。
+            sb.Append("-o Ciphers=aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com ");
+            // 多路复用：一条 TCP 连接上并发开通道，避免每个新连接都重新握手
+            sb.Append("-o ControlMaster=no ");
             // 首次连接自动接受主机密钥（用户没有交互终端可以回答 yes）
             sb.Append("-o StrictHostKeyChecking=accept-new ");
             sb.Append("-o BatchMode=yes ");   // 绝不停下来问密码

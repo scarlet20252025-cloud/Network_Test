@@ -2042,6 +2042,77 @@ _hourly[ip][YYMMDDHH] = {'peakRx': 峰值, 'peakTx': 峰值, 'rx': 累计增量,
 
 **教训**：主题化的页面里不要写死颜色值，否则换个主题就有一块看不见。
 
+## 九点二十一、卸载入口下沉 + 网络提速 + 砍掉多余功能
+
+### 1. 卸载从主界面挪进设置
+
+原来主界面底部一行：`刷新 | 设置 | 卸载`。
+
+「卸载」是不可逆的破坏性操作，摆在「开始借网」旁边太容易误点。
+移到 `SettingsDialog` 左下角一个 `LinkLabel`「卸载渡口…」，
+灰色、hover 才显示下划线、hover 变色为警示红。
+
+主界面现在只剩 `刷新 | 设置`，两个按钮居中。
+
+实现细节：`SettingsDialog` 接受一个 `Action onUninstall` 回调，
+点链接时先 `DialogResult = Abort` 关掉自己，再调主界面的 `DoUninstall`
+—— 避免「设置窗口还开着、卸载流程已经在跑」这种状态叠加。
+
+### 2. SSH 参数：为吞吐调的四项
+
+```csharp
+sb.Append("-o Compression=no ");
+sb.Append("-o IPQoS=throughput ");
+sb.Append("-o Ciphers=aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com ");
+```
+
+| 参数 | 为什么 |
+|---|---|
+| `Compression=no` | ssh 自带压缩对**已经是压缩态**的流量（HTTPS/图片/视频）几乎无收益，白耗 CPU 还加延迟 |
+| `IPQoS=throughput` | 默认是 `lowdelay`，会让中间路由按「低延迟」排队，牺牲吞吐。我们是搬数据 |
+| `Ciphers=aes128-gcm` 优先 | x86 上有 AES-NI 硬件加速，比 chacha20-poly1305 快一截。后面两个是回退——不能只写一个，老 sshd 可能没有 |
+| `ControlMaster=no` | 明确关闭。多路复用对「单条长连接 + 多个通道」有用，但我们只有一个 ssh 进程，开了反而多一层状态 |
+
+TCP 层本来就有（检查后确认，没动）：
+
+```csharp
+client.NoDelay = true;              // 关 Nagle，小包立刻发，不攒到 200ms
+s.NoDelay = true;                   // 上游 SOCKS 连接同样
+var buf = new byte[65536];          // 上一轮从 16KB 提上来的
+```
+
+**为什么关 Nagle 对代理特别重要**：走代理的大多是请求-响应型流量（点一下等一个响应）。
+Nagle 会攒小包到 200ms 再发，表现就是「每次点击都慢一拍」。
+
+### 3. 砍掉「重置令牌」
+
+用户原话：「别搞什么充值令牌这种累赘的功能」。
+
+删了三处：
+- 管理页行内的「重置令牌」按钮
+- `handle_admin_resettoken` 处理函数
+- `do_POST` 里的 `/admin/resettoken` 路由
+
+**为什么它确实是累赘**：令牌是客户端自动管理的，用户从来看不见也不需要知道。
+「重置」唯一的效果是踢掉已登录的客户端，让它下次激活换一个新令牌 ——
+而同一台机器重新激活本来就是幂等的，等于什么也没解决。
+
+真要收回权限，「停用」就够了。
+
+### 4. 关于「账号只跟 IP 关联，没有是否注册」
+
+当前实现其实已经是这个语义：
+
+- `clients` 表有记录 = 有账号
+- 没有记录 = 不存在（用户输密钥激活那一刻才创建）
+- 管理页显示**在线 / 离线 / 停用**三态，没有「未注册」
+
+`/api/config` 里的 `registered` 字段保留着（未注册时返回 `false` 但仍给完整配置），
+这是给安装程序判断「要不要提示找管理员」用的，不影响账号模型。
+
+如果哪天觉得这个字段也多余，直接删掉即可 —— 安装程序拿不到 `registered`
+会走 fallback 分支，行为一致。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`

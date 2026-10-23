@@ -1487,7 +1487,6 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   <td class="muted">{fmt_ts(r['last_seen']) or '从未'}</td>
   <td class="nowrap">
     <form method="post" action="/admin/toggle" style="display:inline">{csrf_in}<input type="hidden" name="ip" value="{html.escape(r['ip'])}"><button class="sm ghost" type="submit">{'停用' if r['enabled'] else '启用'}</button></form>
-    <form method="post" action="/admin/resettoken" style="display:inline">{csrf_in}<input type="hidden" name="ip" value="{html.escape(r['ip'])}"><button class="sm ghost" type="submit">重置令牌</button></form>
   </td>
 </tr>""" for i, r in enumerate(cli))
 
@@ -2213,8 +2212,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_admin_revoke(form)
             elif path == '/admin/toggle':
                 self.handle_admin_toggle(form)
-            elif path == '/admin/resettoken':
-                self.handle_admin_resettoken(form)
             elif path == '/admin/unlock':
                 self.handle_unlock(form)
             else:
@@ -2870,18 +2867,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.db.x('UPDATE clients SET enabled = ? WHERE ip = ?', (newval, ip))
         self.db.log('client_toggle', self.client_ip(), f'{ip} -> {newval}')
         self.send_html(admin_page(self.db, msg=f'{ip} 已{"启用" if newval else "停用"}', csrf=csrf_set('admin|' + self.client_ip())))
-
-    def handle_admin_resettoken(self, form):
-        if not self._require_admin():
-            return
-        ip = (form.get('ip') or '').strip()
-        if not self.db.q1('SELECT 1 FROM clients WHERE ip = ?', (ip,)):
-            self.send_html(admin_page(self.db, err='找不到这个 IP', csrf=csrf_set('admin|' + self.client_ip())), 404)
-            return
-        tok = new_token()
-        self.db.x('UPDATE clients SET token = ? WHERE ip = ?', (tok, ip))
-        self.db.log('client_resettoken', self.client_ip(), ip)
-        self.send_html(admin_page(self.db, msg=f'{ip} 的新令牌：{tok}（请重新下发部署包）', csrf=csrf_set('admin|' + self.client_ip())))
 
     def handle_about(self):
         """关于页：讲清楚它是什么、怎么工作、边界在哪。

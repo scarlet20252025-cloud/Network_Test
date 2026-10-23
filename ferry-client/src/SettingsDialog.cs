@@ -22,6 +22,7 @@ namespace Ferry
         readonly Cfg _cfg;
         readonly string _cfgPath;
         readonly string _appDir;
+        readonly Action _onUninstall;
 
         CheckBox _chkAutoStart;
         CheckBox _chkAutoBorrow;
@@ -31,10 +32,14 @@ namespace Ferry
         Label _lblHint;
 
         public SettingsDialog(Cfg cfg, string cfgPath, string appDir)
+            : this(cfg, cfgPath, appDir, null) { }
+
+        public SettingsDialog(Cfg cfg, string cfgPath, string appDir, Action onUninstall)
         {
             _cfg = cfg;
             _cfgPath = cfgPath;
             _appDir = appDir;
+            _onUninstall = onUninstall;
             BuildUi();
         }
 
@@ -155,6 +160,24 @@ namespace Ferry
             cancel.SetBounds(350, 452, 104, 34);
             cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
             Controls.Add(cancel);
+
+            // 卸载放这里而不是主界面 —— 它是低频且不可逆的操作，
+            // 摆在「开始借网」旁边太容易被误点。
+            var lnkUninstall = new LinkLabel();
+            lnkUninstall.Text = "卸载渡口…";
+            lnkUninstall.Font = Theme.FSmall;
+            lnkUninstall.LinkColor = Theme.Muted;
+            lnkUninstall.ActiveLinkColor = Theme.Bad;
+            lnkUninstall.LinkBehavior = LinkBehavior.HoverUnderline;
+            lnkUninstall.SetBounds(22, 456, 150, 20);
+            lnkUninstall.LinkClicked += delegate
+            {
+                if (_onUninstall == null) return;
+                DialogResult = DialogResult.Abort;   // 让调用方知道要卸载
+                Close();
+                _onUninstall();
+            };
+            Controls.Add(lnkUninstall);
 
             AcceptButton = ok;
             CancelButton = cancel;
