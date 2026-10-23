@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
   borrow-net.ps1 — 借网主控脚本（常驻版）
 
@@ -102,6 +102,98 @@ function Get-ProxyState {
   return @{ Enabled = [bool]($en -eq 1); Server = "$srv" }
 }
 
+# ---- 系统代理的备份与还原（与 GUI 版逻辑一致，改动要两边同步） ----
+#
+# 核心规则：
+#   1. 备份只在「当前代理不是借网地址」时才写 —— 绝不把借网地址存进备份
+#   2. 还原时若发现备份内容本身是借网地址（历史污染），视为无效备份
+#   3. 无效备份时优先回落到 Clash（本机原有代理），其次直接关闭系统代理
+#      —— 绝不留一个指向已停隧道的代理
+
+$script:ClashPort = 7897   # 本机 Clash Verge 的 mixed-port
+
+function Test-BorrowProxyValue {
+  param([string]$Server)
+  if (-not $Server) { return $false }
+  $s = $Server.Trim()
+  return ($s -eq "127.0.0.1:$SocksPort") -or
+         ($s -eq "http://127.0.0.1:$HttpPort") -or
+         ($s -eq "127.0.0.1:$HttpPort") -or
+         ($s -eq "http://127.0.0.1:$SocksPort")
+}
+
+function Save-ProxyBackup {
+  $cur = Get-ProxyState
+  if (Test-BorrowProxyValue $cur.Server) {
+    Write-Host "  跳过备份：当前代理是借网地址（$($cur.Server)）" -ForegroundColor DarkGray
+    return
+  }
+  if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir -Force }
+  $bakFile = Join-Path $StateDir 'proxy-backup.txt'
+  if (Test-Path $bakFile) {
+    $old = (Get-Content $bakFile -Raw).Trim()
+    if ($old) {
+      $oEn, $oSrv = $old -split '\|', 2
+      if (-not (Test-BorrowProxyValue $oSrv)) {
+        Write-Host "  保留已有备份: $old" -ForegroundColor DarkGray
+        return
+      }
+    }
+  }
+  Set-Content $bakFile -Value "$($cur.Enabled)|$($cur.Server)" -Encoding ASCII
+  Write-Host "  已备份系统代理: $($cur.Enabled)|$($cur.Server)" -ForegroundColor DarkGray
+}
+
+function Restore-ProxyBackup {
+  $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+  $bakFile = Join-Path $StateDir 'proxy-backup.txt'
+  $enVal = 0
+  $srv = ''
+  $valid = $false
+
+  if (Test-Path $bakFile) {
+    $bak = (Get-Content $bakFile -Raw).Trim()
+    if ($bak) {
+      $en, $s = $bak -split '\|', 2
+      if (-not (Test-BorrowProxyValue $s)) {
+        # 备份里写的是 $true/$false 字符串，转回 1/0
+        $enVal = if ($en -match '^(1|true)$') { 1 } else { 0 }
+        $srv = "$s"
+        $valid = $true
+      }
+      else {
+        Write-Host "  备份内容本身是借网地址（$s），判定无效，不还原" -ForegroundColor Yellow
+      }
+    }
+  }
+
+  if (-not $valid) {
+    if (Test-PortOpen -Port $script:ClashPort) {
+      Set-ItemProperty $k -Name ProxyEnable -Value 1 -Type DWord
+      Set-ItemProperty $k -Name ProxyServer -Value "127.0.0.1:$($script:ClashPort)" -Type String
+      Write-Host "  已回落到 Clash 代理 127.0.0.1:$($script:ClashPort)" -ForegroundColor DarkGray
+      return
+    }
+    Set-ItemProperty $k -Name ProxyEnable -Value 0 -Type DWord
+    Write-Host "  无有效备份且 Clash 未运行，已关闭系统代理（恢复直连）" -ForegroundColor DarkGray
+    return
+  }
+
+  # 有效备份，但目标端口若已关闭则不要指过去（会全网不通）
+  if ($enVal -eq 1 -and $srv -match '^(?:https?://)?(?:127\.0\.0\.1|localhost):(\d+)$') {
+    $p = [int]$Matches[1]
+    if (-not (Test-PortOpen -Port $p)) {
+      Write-Host "  备份指向 $srv 但该端口未监听，改为关闭系统代理" -ForegroundColor Yellow
+      Set-ItemProperty $k -Name ProxyEnable -Value 0 -Type DWord
+      return
+    }
+  }
+
+  Set-ItemProperty $k -Name ProxyEnable -Value $enVal -Type DWord
+  if ($srv) { Set-ItemProperty $k -Name ProxyServer -Value $srv -Type String }
+  Write-Host "  已还原为 ProxyEnable=$enVal ProxyServer=$srv" -ForegroundColor DarkGray
+}
+
 # ---- 主逻辑 ----
 
 switch ($Action) {
@@ -196,10 +288,11 @@ switch ($Action) {
       }
 
       Write-Step "切换系统代理到 HTTP 127.0.0.1:$HttpPort"
-      # 备份当前值，供 Off 还原
+      # 备份当前值，供 Off 还原。
+      # ⚠️ 绝不备份借网地址本身 —— 否则 Off 会「还原成借网地址」，
+      # 而那时隧道已停，所有网站打不开（实测踩过这个坑）。
       if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir }
-      $cur = Get-ProxyState
-      Set-Content (Join-Path $StateDir 'proxy-backup.txt') -Value "$($cur.Enabled)|$($cur.Server)" -Encoding ASCII
+      Save-ProxyBackup
       Set-ItemProperty $k -Name ProxyEnable -Value 1 -Type DWord
       $sysProxy = "http://127.0.0.1:$HttpPort"
       Set-ItemProperty $k -Name ProxyServer -Value $sysProxy -Type String
@@ -239,21 +332,8 @@ public class InetOptRefresh {
 
   'Off' {
     Write-Step "还原系统代理"
-    $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-    $bakFile = Join-Path $StateDir 'proxy-backup.txt'
-    if (Test-Path $bakFile) {
-      $bak = (Get-Content $bakFile -Raw).Trim()
-      $en, $srv = $bak -split '\|', 2
-      # 备份里写的是 $true/$false 字符串（Get-ProxyState 返回 [bool]），这里转回 1/0
-      $enVal = if ($en -match '^(1|true)$') { 1 } else { 0 }
-      Set-ItemProperty $k -Name ProxyEnable -Value $enVal -Type DWord
-      if ($srv) { Set-ItemProperty $k -Name ProxyServer -Value $srv -Type String }
-      Write-Host "  已还原为 ProxyEnable=$enVal ProxyServer=$srv" -ForegroundColor DarkGray
-    }
-    else {
-      Set-ItemProperty $k -Name ProxyEnable -Value 0 -Type DWord
-      Write-Host "  无备份，直接关闭系统代理" -ForegroundColor DarkGray
-    }
+    # 先还原代理（此时借网端口还活着，端口存活检查才准），再停隧道。
+    Restore-ProxyBackup
 
     Write-Step "停止保活进程与隧道"
     $procs = Get-KeeperProc

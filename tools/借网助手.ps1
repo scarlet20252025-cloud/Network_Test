@@ -135,6 +135,101 @@ function Test-PortOpen {
 
 function Test-BridgeAlive { return (Test-PortOpen -Port $HttpPort -TimeoutMs 300) }
 
+# ---------------- 系统代理的备份与还原（唯一实现，两处入口都调它） ----------------
+#
+# 为什么单独抽出来：这个逻辑曾在「开启」「切回直连」「托盘退出」三处各写一遍，
+# 改一处漏两处。实测事故：备份文件被写成借网地址本身（True|http://127.0.0.1:10809），
+# 于是「切回直连」= 还原成借网地址，但隧道已停 → 所有网站打不开。
+#
+# 核心规则：
+#   1. 备份只在「当前代理不是借网地址」时才写 —— 绝不把借网地址存进备份
+#   2. 还原时若发现备份内容本身就是借网地址（历史污染），视为无效备份
+#   3. 无效备份时：优先回落到 Clash（本机原有代理），其次直接关闭系统代理
+#      —— 绝不留一个指向已停隧道的代理
+
+$script:ClashPort = 7897   # 本机 Clash Verge 的 mixed-port（verge.yaml: enable_system_proxy=true）
+
+function Test-BorrowProxyValue {
+  param([string]$Server)
+  if (-not $Server) { return $false }
+  $s = $Server.Trim()
+  return ($s -eq "127.0.0.1:$SocksPort") -or
+         ($s -eq "http://127.0.0.1:$HttpPort") -or
+         ($s -eq "127.0.0.1:$HttpPort") -or
+         ($s -eq "http://127.0.0.1:$SocksPort")
+}
+
+function Save-ProxyBackup {
+  $cur = Get-ProxyState
+  # 当前值就是借网地址 → 不能备份它（会污染）
+  if (Test-BorrowProxyValue $cur.Server) {
+    Write-AppLog "跳过备份：当前代理是借网地址（$($cur.Server)），不能存进备份"
+    return
+  }
+  if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir -Force }
+  $bakFile = Join-Path $StateDir 'proxy-backup.txt'
+  # 已有有效备份就不覆盖 —— 保留最原始的直连/Clash 设置
+  if (Test-Path $bakFile) {
+    $old = (Get-Content $bakFile -Raw).Trim()
+    if ($old) {
+      $oEn, $oSrv = $old -split '\|', 2
+      if (-not (Test-BorrowProxyValue $oSrv)) {
+        Write-AppLog "保留已有备份: $old"
+        return
+      }
+    }
+  }
+  Set-Content $bakFile -Value "$($cur.Enabled)|$($cur.Server)" -Encoding ASCII
+  Write-AppLog "已备份系统代理: $($cur.Enabled)|$($cur.Server)"
+}
+
+function Restore-ProxyBackup {
+  $bakFile = Join-Path $StateDir 'proxy-backup.txt'
+  $enVal = 0
+  $srv = ''
+  $valid = $false
+
+  if (Test-Path $bakFile) {
+    $bak = (Get-Content $bakFile -Raw).Trim()
+    if ($bak) {
+      $en, $s = $bak -split '\|', 2
+      if (-not (Test-BorrowProxyValue $s)) {
+        $enVal = if ($en -match '^(1|true)$') { 1 } else { 0 }
+        $srv = "$s"
+        $valid = $true
+      }
+      else {
+        Write-AppLog "备份内容本身是借网地址（$s），已判定无效，不还原" 'WARN'
+      }
+    }
+  }
+
+  if (-not $valid) {
+    # 无效备份：优先回落到 Clash（用户原本的系统代理），否则直接关闭
+    if (Test-PortOpen -Port $script:ClashPort -TimeoutMs 300) {
+      Set-Proxy -Enable 1 -Server "127.0.0.1:$($script:ClashPort)"
+      Write-AppLog "已回落到 Clash 代理 127.0.0.1:$($script:ClashPort)"
+      return
+    }
+    Set-Proxy -Enable 0 -Server ''
+    Write-AppLog '无有效备份且 Clash 未运行，已关闭系统代理（恢复直连）'
+    return
+  }
+
+  # 有效备份，但目标端口若已关闭则不要指过去（会全网不通）
+  if ($enVal -eq 1 -and $srv -match '^(?:https?://)?(?:127\.0\.0\.1|localhost):(\d+)$') {
+    $p = [int]$Matches[1]
+    if (-not (Test-PortOpen -Port $p -TimeoutMs 300)) {
+      Write-AppLog "备份指向 $srv 但该端口未监听，改为关闭系统代理" 'WARN'
+      Set-Proxy -Enable 0 -Server ''
+      return
+    }
+  }
+
+  Set-Proxy -Enable $enVal -Server $srv
+  Write-AppLog "已还原为 $srv"
+}
+
 function Start-Bridge {
   # 启动 dual-proxy（HTTP+SOCKS5 单端口），已存在则复用。
   # 为什么必须启动它：系统代理只能填 HTTP 端口，没有这一层就没法让浏览器工作。
@@ -382,27 +477,8 @@ $mnuExit.Text = '退出'
 $mnuExit.Add_Click({
     Write-AppLog '托盘菜单: 退出'
     # 退出前把系统代理还原，避免留下指向已停隧道的代理导致全网不通
-    try {
-      $bakFile = Join-Path $StateDir 'proxy-backup.txt'
-      if (Test-Path $bakFile) {
-        $bak = (Get-Content $bakFile -Raw).Trim()
-        $en, $srv = $bak -split '\|', 2
-        $enVal = if ($en -match '^(1|true)$') { 1 } else { 0 }
-        # 备份若也是 SOCKS 写法（历史污染）则不还原，直接关代理
-        if ($srv -eq "127.0.0.1:$SocksPort") {
-          Set-Proxy -Enable 0 -Server ''
-          Write-AppLog "退出前：备份是 SOCKS 写法，已关闭系统代理"
-        }
-        else {
-          Set-Proxy -Enable $enVal -Server $srv
-          Write-AppLog "退出前已还原系统代理: $srv"
-        }
-      }
-      else {
-        Set-Proxy -Enable 0 -Server ''
-        Write-AppLog '退出前：无备份，已关闭系统代理'
-      }
-    } catch { Write-AppLog "退出前还原代理失败: $($_.Exception.Message)" 'WARN' }
+    try { Restore-ProxyBackup }
+    catch { Write-AppLog "退出前还原代理失败: $($_.Exception.Message)" 'WARN' }
     if ($script:NotifyIcon) { $script:NotifyIcon.Visible = $false; $script:NotifyIcon.Dispose() }
     [System.Windows.Forms.Application]::Exit()
     [Environment]::Exit(0)
@@ -641,13 +717,7 @@ function Update-Status {
             Add-Log "❌ HTTP 代理 $HttpPort 未就绪（$br），已跳过系统代理切换（写 SOCKS 端口会让浏览器全部打不开）"
           }
           else {
-            if (-not (Test-Path $StateDir)) { $null = New-Item -ItemType Directory -Path $StateDir -Force }
-            $cur = Get-ProxyState
-            # 备份只在「当前值不是我们自己的 HTTP 代理」时覆盖，避免把备份刷成借网地址
-            $bakFile = Join-Path $StateDir 'proxy-backup.txt'
-            if ($cur.Server -ne "http://127.0.0.1:$HttpPort") {
-              Set-Content $bakFile -Value "$($cur.Enabled)|$($cur.Server)" -Encoding ASCII
-            }
+            Save-ProxyBackup
             Set-Proxy -Enable 1 -Server "http://127.0.0.1:$HttpPort"
             Add-Log "系统代理已切换 → http://127.0.0.1:$HttpPort（HTTP 代理）"
           }
@@ -753,25 +823,9 @@ $btnOff.Add_Click({
   Set-UiBusy $true
   try {
     Add-Log '还原系统代理…'
-    $bakFile = Join-Path $StateDir 'proxy-backup.txt'
-    if (Test-Path $bakFile) {
-      $bak = (Get-Content $bakFile -Raw).Trim()
-      $en, $srv = $bak -split '\|', 2
-      $enVal = if ($en -match '^(1|true)$') { 1 } else { 0 }
-      # 备份里如果存的也是 SOCKS 端口写法（历史污染），不能还原它 —— 直接关代理
-      if ($srv -eq "127.0.0.1:$SocksPort") {
-        Add-Log "备份里是 SOCKS 写法（$srv），不还原，直接关闭系统代理"
-        Set-Proxy -Enable 0 -Server ''
-      }
-      else {
-        Set-Proxy -Enable $enVal -Server $srv
-        Add-Log "已还原为 $srv"
-      }
-    }
-    else {
-      Set-Proxy -Enable 0 -Server ''
-      Add-Log '无备份，已关闭系统代理'
-    }
+    # 顺序很重要：先停隧道再还原代理会让「端口是否监听」的检查失效。
+    # 这里先还原（此时借网端口还活着，检查才准），再停隧道。
+    Restore-ProxyBackup
     Add-Log '停止隧道…'
     Stop-Keeper
     Add-Log '已切回直连（HTTP 代理进程保留，下次开启直接复用）'
