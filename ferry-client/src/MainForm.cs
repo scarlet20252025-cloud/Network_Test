@@ -67,7 +67,7 @@ namespace Ferry
             title.SetBounds(24, 16, 120, 28);
             Controls.Add(title);
 
-            var sub = Theme.Text2("在借网与直连之间切换", Theme.FSmall, Theme.Muted);
+            var sub = Theme.Text2("断网时借一台能上网的内网主机中转流量", Theme.FSmall, Theme.Muted);
             sub.SetBounds(24, 44, 300, 18);
             Controls.Add(sub);
 
@@ -405,6 +405,7 @@ namespace Ferry
                     _cfg.Save(_cfgPath);
 
                     _txtCode.Text = "";
+                    _txtCode.Text = "";   // 激活后立刻清空 —— 别让旧密钥留在框里
                     Log("激活成功 · 账号 " + _cfg.AccountIp);
                     if (r.ExpiresAt > 0)
                         Log("授权到 " + FromUnix(r.ExpiresAt).ToString("yyyy-MM-dd") + "（" + r.DaysLeft + " 天）");
@@ -430,11 +431,19 @@ namespace Ferry
                 else Log("授权有效（永久）");
             }
 
-            // 到期/停用就把借网掐掉 —— 不能等用户自己发现。
-            if (_cfg.Activated && !st.Enabled && FerryCore.IsBorrowing(_cfg))
+            // 到期/停用就把借网掐掉，并清空本地令牌 —— 强制回到「未激活」，
+            // 用户必须重新输入密钥。不能只断网却留着令牌：
+            // 那样界面还显示"已激活"，用户会反复点开始借网然后失败。
+            var borrowingNow = FerryCore.IsBorrowing(_cfg) || (_rt != null && _rt.Running);
+            if (_cfg.Activated && !st.Enabled && borrowingNow)
             {
                 Log("授权失效，正在恢复直连…");
-                FerryCore.StopAll(_cfg, _appDir);
+                FerryCore.RestoreDirect(_cfg, _appDir);   // 先还原代理，避免指向死端口
+                if (_rt != null) { try { _rt.Stop(); } catch (Exception) { } _rt = null; }
+                FerryCore.StopAll(_cfg, _appDir);         // 清残留进程
+                _cfg.Token = "";
+                try { _cfg.Save(_cfgPath); } catch (Exception) { }
+                Log("授权已失效，请重新输入密钥激活");
             }
 
             try { BeginInvoke(new Action(RefreshUi)); } catch (Exception) { }

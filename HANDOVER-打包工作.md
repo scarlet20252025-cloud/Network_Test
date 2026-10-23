@@ -1928,6 +1928,120 @@ SecurityException / 不允许所请求的注册表访问权
 
 这不是代码问题 —— 用户双击运行的 exe 不受这个沙箱约束。
 
+## 九点二十、客户端交互细节 + 管理页图形化
+
+### 客户端
+
+**① 激活成功后清空输入框**
+
+```csharp
+_txtCode.Text = "";   // 激活后立刻清空 —— 别让旧密钥留在框里
+```
+
+不清的话，万一后来掉激活重新显示输入框，框里还残留上一个密钥，
+用户会以为是新的、直接点激活然后失败。
+
+**② 已激活时隐藏输入框**（本来就有）
+
+`RefreshUi` 里 `_txtCode.Visible = false; _btnActivate.Visible = false;`
+激活卡改成只显示「账号 x.x.x.x · 剩余 N 天 · 某日到期」。
+**已激活的账号填不了第二个密钥** —— 这是刻意的：一个账号一份授权，
+重复填只会把 expires_at 覆盖成另一个档位。
+
+**③ 授权失效 → 强制恢复直连 + 清空令牌**
+
+原来的实现有两个问题：
+
+```csharp
+if (_cfg.Activated && !st.Enabled && FerryCore.IsBorrowing(_cfg))
+    FerryCore.StopAll(_cfg, _appDir);      // 没管 _rt，也没清 token
+```
+
+- 只用 `FerryCore.IsBorrowing` 判断，漏掉了「隧道在跑但代理没切」的情况
+- 停掉之后**令牌还在**，界面继续显示「已激活」，用户反复点开始借网然后失败
+
+改成：
+
+```csharp
+var borrowingNow = FerryCore.IsBorrowing(_cfg) || (_rt != null && _rt.Running);
+if (_cfg.Activated && !st.Enabled && borrowingNow)
+{
+    FerryCore.RestoreDirect(_cfg, _appDir);   // 先还原代理，避免指向死端口
+    if (_rt != null) { _rt.Stop(); _rt = null; }
+    FerryCore.StopAll(_cfg, _appDir);         // 清残留进程
+    _cfg.Token = "";                          // 清令牌 → 回到未激活
+    _cfg.Save(_cfgPath);
+    Log("授权已失效，请重新输入密钥激活");
+}
+```
+
+清令牌后 `_cfg.Activated` 变 false，`RefreshUi` 自动把激活卡切回输入框 ——
+用户必须重新输密钥。**这才是「失效」该有的样子**。
+
+**④ 主页说明改得具体**
+
+副标题从「在借网与直连之间切换」改成「断网时借一台能上网的内网主机中转流量」。
+原来那句是描述*界面操作*，新的是描述*这个软件干什么* —— 第一次打开的人需要后者。
+
+### 管理页
+
+**① 上下行加方向箭头**
+
+```css
+.arw.down{color:#3ddc97}   /* ↓ 绿：远端 → 本机 */
+.arw.up{color:#ffa657}     /* ↑ 橙：本机 → 远端 */
+```
+
+表头和每个数据格都带。方向 + 颜色双重区分，扫一眼就知道哪列是什么。
+浅色主题单独给了两个更深的色值（`#1f9d63` / `#d97706`），否则在白底上太淡。
+
+**② 每小时峰值与流量统计**
+
+服务端在心跳里顺手累计（`note_hourly`）：
+
+```python
+_hourly[ip][YYMMDDHH] = {'peakRx': 峰值, 'peakTx': 峰值, 'rx': 累计增量, 'tx': 累计增量}
+```
+
+- 只留最近 24 小时（`HB_KEEP_HOURS`）
+- 增量 = 本次累计字节 − 上次累计字节（客户端重启归零时按 0 处理）
+- 管理页「流量统计」卡片显示本小时的平均速率和累计量，
+  底下汇总「近 24 小时累计：下行 X · 上行 Y」
+
+**为什么记「峰值」而不是只记平均**：一条 10 秒的突发会把平均值稀释掉，
+但用户感觉到的卡顿就是那 10 秒。峰值能反映「最差的时候有多差」。
+
+**③ 三张表全部限高滚动**
+
+```css
+.listwrap{max-height:420px;overflow-y:auto}      /* 用户列表 */
+.listwrap.sm{max-height:300px}                    /* 密钥列表、事件、流量 */
+```
+
+表头 `position:sticky` 吸顶，滚到底也看得见列名。
+密钥列表和事件列表原来没有容器，几十条就把页面拉得很长。
+
+### 顺手修的白底白字
+
+下载页「用命令行下载」那段代码块：
+
+```html
+<div class="mono" style="background:#f4f6f8; ...">   <!-- 写死的浅色底 -->
+```
+
+深色主题下文字是 `var(--fg)`（近白），背景被写死成 `#f4f6f8`（近白）——
+**白底白字，完全看不见**。
+
+改成走主题变量：
+
+```html
+<div class="mono" style="background:var(--code);color:var(--fg); ...">
+```
+
+`--code` 在深色主题下是 `#101820`，浅色主题下是 `#eef2f5`，两套都对。
+
+**教训**：主题化的页面里不要写死颜色值，否则换个主题就有一块看不见。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`
