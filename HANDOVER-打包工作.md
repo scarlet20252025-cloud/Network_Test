@@ -2504,6 +2504,128 @@ Filename: "{app}\渡口助手.exe"; Parameters: "/uninstall"; Flags: runhidden w
 两次清理都幂等，重复执行没有副作用。多这一道是为了覆盖
 「用户从控制面板 → 卸载程序」这条不经过客户端的路径 —— 那条路上没人帮它还原代理。
 
+## 九点二十六、WireGuard 第二条线路（进行中）
+
+### 用户的判断
+
+> 如果真的完全断网了，连上这个是只能在浏览器上网吗，能不能打游戏
+
+答案：**现有 SSH 线路不能**，三个硬限制 ——
+
+1. **只转 TCP**：`ssh -D` 是 SOCKS5，`Proxy.cs` 里搜不到任何 UDP 处理。
+   实时对战游戏几乎全靠 UDP，这些包根本进不了隧道。
+2. **抖动放大 4.55 倍**：直连 29ms → 渡口 132ms（`docs/实测数据.md` 实测）。
+3. **系统代理只影响认它的程序**：浏览器/Electron/.NET 会读，大部分游戏客户端直接连服务器。
+
+### 为什么选 WireGuard
+
+- 原生支持 UDP + 全流量（虚拟网卡接管所有 IP 包）
+- 内核态转发，延迟比 SSH 用户态隧道低
+- 不需要程序"认代理"
+
+### 用户的要求：**复制一条独立线路，不动现有 SSH 方案**
+
+所以 WG 是**并行新增**，`Tunnel.cs` / `Proxy.cs` / `FerryRuntime.cs` 一行没改。
+
+### 用 xt（10.113.66.6）做实验，不动 10.13.24.1
+
+10.13.24.1 上跑着门户，不该在上面折腾网络配置。
+
+**xt 的环境**（侦察结果）：
+
+```
+系统        Windows 10 企业版 LTSC
+WireGuard   未装 → 已装 0.5.3
+New-NetNat  可用          ← 之前文档说"缺失"是误判
+IPEnableRouter = 0       ← 待改
+权限        Administrator / 管理员 True  ← 比 10.13.24.1 方便，不用 UAC
+网卡        以太网 10.113.66.6 / etgame 10.126.126.1 / WLAN 9 192.168.137.1（ICS 段）
+```
+
+### 已完成
+
+**① 装 WireGuard**
+
+`download.wireguard.com` 从 xt 访问不通（连接被拒）。本机走代理也下不到完整包 ——
+`wireguard-installer.exe` 只有 86,664 字节，是个**联网下载的 stub**。
+
+换成 msi 直链拿到完整包：
+
+```
+https://download.wireguard.com/windows-client/wireguard-amd64-0.5.3.msi
+→ 2,842,624 字节（完整）
+```
+
+scp 到 xt → `msiexec /i wg.msi /qn /norestart` → 退出码 0，装好 0.5.3。
+
+**② 服务端隧道**
+
+```
+interface: ferry-wg
+  public key: X+scTvaG8j3k+DvHvR8hWTCqs3DoxSNH2IQ+Bc+adwU=
+  listening port: 51820
+
+peer: 5BRJp596ch9lrB58bP9kfNq0QEDFVSIYll6quX05NGw=   ← 客户端
+  allowed ips: 10.66.67.3/32
+```
+
+- 配置路径 `C:\ProgramData\WireGuard\ferry-wg.conf`
+- 网段 **10.66.67.0/24**（刻意避开 10.13.24.1 那个已经占用的 10.66.66.0/24）
+- 防火墙已放行 UDP 51820 入站（规则名 `Ferry WG 51820`）
+- 隧道服务已安装（`wireguard.exe /installtunnelservice`）
+
+**③ 客户端材料**（放 `borrow-net/wireguard/`）
+
+| 文件 | 用途 |
+|---|---|
+| `client.key` / `client.pub` | 客户端密钥对 |
+| `ferry-wg.conf` | 指向 xt 的配置 |
+| `测试WG线路.cmd` | 右键管理员运行：装隧道 → 等 8 秒 → `wg show` + ping 对端 |
+| `stop-wg.cmd` | 卸掉隧道 |
+
+### 分阶段，先验证握手
+
+客户端配置第一步只路由隧道内网：
+
+```ini
+AllowedIPs = 10.66.67.0/24
+```
+
+**不是 `0.0.0.0/0`** —— 先确认「UDP 51820 通不通、握手成不成功」，
+再去碰全流量和 NAT。这一步失败的话后面全都白搭，而且不会破坏本机网络。
+
+跑 `测试WG线路.cmd` 后看两件事：
+
+- 出现 `latest handshake: N seconds ago` → UDP 通
+- `ping 10.66.67.1` 通 → 隧道端到端可用
+
+### 尚未完成
+
+**① 全流量（0.0.0.0/0）需要服务端 NAT**
+
+xt 上 `New-NetNat` 可用、`IPEnableRouter` 还是 0，两样都要配：
+
+```powershell
+Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' -Name IPEnableRouter -Value 1
+New-NetNat -Name FerryWG -InternalIPInterfaceAddressPrefix 10.66.67.0/24
+```
+
+**注意**：xt 上已经有一个 `192.168.137.1`（ICS 共享段），
+`New-NetNat` 和 ICS 在同机可能冲突，配之前要确认。
+
+**② 接进客户端**
+
+现在的 `ferry-wg.conf` + 两个 .cmd 是**手工验证用**的。
+验证通过后才考虑把它接进 `FerryRuntime`，做成「线路：SSH / WireGuard」二选一。
+
+**为什么先不接管**：WG 要装系统级驱动 + 提权，接进客户端意味着每次启用都弹 UAC。
+如果 UDP 本来就被校园网封了，这些工作量全是白费 —— 所以必须先验。
+
+### 一个坑
+
+WireGuard 的 `.conf` **不认 UTF-8 中文注释**，会显示成 `???`。
+注释必须用英文，或者干脆不写。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`
