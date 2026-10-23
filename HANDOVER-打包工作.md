@@ -2750,6 +2750,124 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\snapshot.ps1 -Label "�
 
 **第一次快照**：`versions/20261024-0224/`，标签「WG 实验前 / SSH 线路稳定版」。
 
+## 九点二十八、绕开 NAT：远端跑 SOCKS5，流量走 WG
+
+### 需求收敛
+
+> 那我的目的只有断网能用，还低延迟
+
+这句话把两个硬条件钉死了：
+
+1. **断网能用** → 服务端必须在**局域网内**（公网 Linux 在断网时够不着）
+2. **低延迟** → 必须走 WG（SSH 实测抖动 4.55 倍：29ms → 132ms）
+
+于是目标变成：**局域网内的服务端 + WG + 能上网**。
+
+### 死结和解法
+
+**死结**：WG 只把包送到远端，远端要发出去必须有 NAT。
+Windows 客户端版没有可用的 `New-NetNat`（`HRESULT 0x80041010`，WMI 类缺失）。
+
+**解法**：**不在 IP 层转发，改在应用层代理。**
+
+```
+浏览器 → 系统/浏览器代理 → 10.66.67.1:1080（走 WG）→ 远端 SOCKS5 直连目标
+```
+
+这样**完全不改包的源 IP**，也就不需要 NAT。代价是只有「认代理」的程序能走。
+
+### 远端 SOCKS5 服务（已跑起来）
+
+`wireguard/ferry-socks5-server.py`，纯标准库（asyncio），零依赖：
+
+- 只支持 CONNECT（够用：HTTPS 全走 CONNECT）
+- **按来源网段白名单**（默认只允许 `10.66.67.0/24`，别人扫到也没用）
+- 域名走 IDNA 解码，支持 IPv4/IPv6/域名三种 ATYP
+
+**实测**（在 xt 上从本地打）：
+
+```
+curl --socks5-hostname 127.0.0.1:1080 http://www.baidu.com
+→ 200  2381B  0.042726s      ← 42ms
+
+curl --socks5-hostname 127.0.0.1:1080 https://www.baidu.com
+→ 200  2443B
+```
+
+**42ms**，对比 SSH 线路的 p50 97ms / 抖动 132ms，这条路确实快。
+
+### 踩的坑
+
+**`.decode('idna', 'ignore')` 会抛异常**
+
+```python
+host = raw.decode('idna', 'ignore')   # 错
+# → Unsupported error handling: ignore
+```
+
+`idna` 是**编码名**，不是 errors 处理器。`bytes.decode()` 的第二个参数只接受
+`strict` / `ignore` / `replace` 这类。写成 `decode('idna', 'ignore')` 会直接抛，
+表现是「curl 返回 000，服务端日志一条异常」，很容易误判成网络问题。
+
+正确写法：
+
+```python
+try:
+    host = raw.decode('idna')
+except Exception:
+    host = raw.decode('ascii', 'ignore')
+```
+
+### 部署状态
+
+**远端 10.113.66.6（xt）**：
+
+| 组件 | 状态 |
+|---|---|
+| WireGuard 0.5.3 | 已装 |
+| 隧道 `ferry-wg` | 已配（10.66.67.1/24，UDP 51820） |
+| 防火墙 | UDP 51820 + TCP 1080 已放行 |
+| SOCKS5 服务 | 计划任务 `FerrySocks5` 运行中，PID 动态 |
+| 日志 | `C:\Windows\Temp\socks5.log` |
+
+**本机 `wireguard/`**：
+
+| 文件 | 用途 |
+|---|---|
+| `client.key` / `client.pub` | 客户端密钥 |
+| `ferry-wg.conf` | 指向 xt，`AllowedIPs=10.66.67.0/24` |
+| `启用WG线路.cmd` | 一键连 WG + 自测 SOCKS5 + 用法提示 |
+| `stop-wg.cmd` | 断开 |
+| `ferry-socks5-server.py` | 远端 SOCKS5（部署在 xt） |
+| `ferry-wg-server.sh` | 备用的 Linux 服务端一键脚本 |
+
+### 这条路能覆盖什么
+
+| 场景 | 能不能 |
+|---|---|
+| 浏览器（Firefox 直接配 SOCKS5） | ✅ |
+| Chrome/Edge（启动参数 `--proxy-server="socks5://10.66.67.1:1080"`） | ✅ |
+| curl / git / 支持 SOCKS5 的工具 | ✅ |
+| Windows 系统代理 | ❌ 系统代理只认 HTTP 代理 |
+| **游戏（UDP）** | ❌ SOCKS5 不转 UDP，NAT 又做不了 |
+
+### 为什么游戏还是不行
+
+**SOCKS5 的 UDP ASSOCIATE 我们没实现，即使实现了，远端 `ssh -D` 那条不转 UDP，
+WG 这边转了但没有 NAT 仍然出不去。**
+
+要打游戏只有两条路：
+1. **服务端有真 NAT**（Linux：`iptables MASQUERADE` 一行）
+2. **用户态 NAT**（Windows 上手写，500+ 行）
+
+**在"断网 + 局域网 Windows 服务端"这个约束下，这两条都走不通。**
+这是环境限制，不是实现缺陷。
+
+### 阶段存档
+
+`versions/20261024-0237/`，标签「WG 服务端 + 远端 SOCKS5 就绪」。
+上一个存档 `versions/20261024-0224/`（WG 实验前 / SSH 稳定版）保留着。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`
