@@ -27,6 +27,8 @@
 
 import net from 'node:net';
 import http from 'node:http';
+import { spawn } from 'node:child_process';
+import { appendFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { connectBest, matchPool } from './smart-resolve.mjs';
 
@@ -38,6 +40,12 @@ const { values } = parseArgs({
     'allow-lan': { type: 'boolean', default: false },
     panel: { type: 'string', default: '0' },
     quiet: { type: 'boolean', default: false },
+    // 隧道自愈：传 keeper 脚本路径即启用；不传则只告警不重启
+    keeper: { type: 'string', default: '' },
+    remote: { type: 'string', default: 'pcs' },
+    // 日志文件：被 WMI / 计划任务以无控制台方式启动时 stdout 会被丢弃，
+    // 没有日志文件就完全无法排查自愈为什么失败。
+    log: { type: 'string', default: '' },
   },
 });
 
@@ -46,6 +54,7 @@ const SOCKS_PORT = Number(values.socks);
 const BIND = values['allow-lan'] ? '0.0.0.0' : values.host;
 const PANEL_PORT = Number(values.panel);
 const QUIET = values.quiet;
+const LOG_FILE = values.log || '';
 
 /* ---------------- 统计（给面板用） ---------------- */
 
@@ -63,7 +72,15 @@ const stats = {
 };
 
 function log(...a) {
-  if (!QUIET) console.log(new Date().toISOString().slice(11, 23), ...a);
+  const line = `${new Date().toISOString().slice(11, 23)} ${a.join(' ')}`;
+  if (!QUIET) console.log(line);
+  if (LOG_FILE) {
+    try {
+      appendFileSync(LOG_FILE, `${new Date().toISOString()} ${a.join(' ')}\n`);
+    } catch {
+      /* 日志写不进去不能影响代理本身 */
+    }
+  }
 }
 
 function record(kind, target, ms, ok, err) {
@@ -391,6 +408,120 @@ const socksServer = net.createServer((client) => {
   });
 });
 
+/* ---------------- 隧道守护（自愈） ---------------- */
+
+/**
+ * 为什么需要这一层：
+ *   ssh -D 隧道会因远端重启 / 网络抖动 / 休眠恢复而死掉。keeper 只在
+ *   「ssh 自己退出」时重启 ssh；一旦 keeper 进程本身被杀（注销、任务管理器、
+ *   崩溃），就没有任何人会再拉起它 —— 但 dual-proxy 还在跑、系统代理还指着
+ *   10809，于是所有请求都被转发到一个没人监听的 10808，表现为「能开网页
+ *   但 GitHub 全挂」。
+ *
+ * 策略：每 TUNNEL_CHECK_MS 探一次上游 SOCKS 端口；连续 TUNNEL_FAIL_MAX 次
+ * 不通就按顺序尝试拉起 keeper 脚本。拉起前做冷却，避免风暴。
+ */
+
+const TUNNEL_CHECK_MS = 5000;
+const TUNNEL_FAIL_MAX = 2;
+const TUNNEL_REVIVE_COOLDOWN_MS = 20000;
+
+let tunnelFailStreak = 0;
+let lastReviveAt = 0;
+let reviveAttempts = 0;
+
+const tunnelHealth = {
+  alive: true,
+  lastOkAt: Date.now(),
+  lastFailAt: 0,
+  failStreak: 0,
+  reviveAttempts: 0,
+  lastReviveAt: 0,
+};
+
+function probeSocksPort(timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host: '127.0.0.1', port: SOCKS_PORT });
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      s.destroy();
+      resolve(ok);
+    };
+    s.setTimeout(timeoutMs, () => finish(false));
+    s.on('connect', () => finish(true));
+    s.on('error', () => finish(false));
+  });
+}
+
+function reviveTunnel() {
+  const now = Date.now();
+  if (now - lastReviveAt < TUNNEL_REVIVE_COOLDOWN_MS) return;
+  lastReviveAt = now;
+  reviveAttempts++;
+  tunnelHealth.reviveAttempts = reviveAttempts;
+  tunnelHealth.lastReviveAt = now;
+
+  const script = values['keeper'];
+  if (!script) {
+    log('  ! 隧道已断，但未配置 --keeper 脚本，无法自动恢复');
+    return;
+  }
+  log(`  ! 隧道已断（连续 ${tunnelFailStreak} 次探测失败），尝试拉起 keeper: ${script}`);
+  try {
+    // 坑（实测）：Windows 上 spawn(..., {detached:true}) 拉 powershell.exe，
+    // 子进程会在 ~300ms 内以 code=0 退出，脚本一行都没执行 —— 连它自己的
+    // 日志文件都不会生成。必须用**非 detached**，keeper 才能正常常驻。
+    // 也不再 unref：dual-proxy 靠监听端口维持事件循环，不会因为持有子进程引用而
+    // 提前退出；而 unref 会让 stdio 管道在父进程空闲时被回收。
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+       '-RemoteHost', values['remote'] || 'pcs',
+       '-SocksPort', String(SOCKS_PORT)],
+      { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+    );
+    const startedAtChild = Date.now();
+    const relay = (tag) => (buf) => {
+      const s = buf.toString().trimEnd();
+      if (!s) return;
+      for (const line of s.split(/\r?\n/)) log(`  [keeper ${tag}] ${line}`);
+    };
+    child.stdout.on('data', relay('out'));
+    child.stderr.on('data', relay('err'));
+    child.on('exit', (code, sig) => {
+      log(`  ! keeper 退出 code=${code} sig=${sig ?? '-'}（存活 ${Math.round((Date.now() - startedAtChild) / 1000)}s）`);
+    });
+    child.on('error', (e) => log(`  ! keeper spawn error: ${e.message}`));
+    log(`  → keeper 已启动 (pid ${child.pid})`);
+  } catch (e) {
+    log(`  ! keeper 启动失败: ${e.message}`);
+  }
+}
+
+async function tunnelWatchdog() {
+  const ok = await probeSocksPort();
+  if (ok) {
+    if (tunnelFailStreak > 0) log(`  ✓ 隧道已恢复（SOCKS ${SOCKS_PORT} 可连）`);
+    tunnelFailStreak = 0;
+    tunnelHealth.alive = true;
+    tunnelHealth.lastOkAt = Date.now();
+    tunnelHealth.failStreak = 0;
+    return;
+  }
+  tunnelFailStreak++;
+  tunnelHealth.alive = false;
+  tunnelHealth.lastFailAt = Date.now();
+  tunnelHealth.failStreak = tunnelFailStreak;
+  if (tunnelFailStreak === 1) {
+    log(`  ! SOCKS ${SOCKS_PORT} 探测失败（第 ${tunnelFailStreak} 次）`);
+  }
+  if (tunnelFailStreak >= TUNNEL_FAIL_MAX) {
+    reviveTunnel();
+  }
+}
+
 /* ---------------- 单端口分流 ---------------- */
 
 const front = net.createServer((socket) => {
@@ -417,6 +548,9 @@ front.listen(LISTEN_PORT, BIND, () => {
   if (values['allow-lan']) {
     log(`  ⚠️ 已开启局域网共享，同网段可用 本机IP:${LISTEN_PORT}`);
   }
+  // 启动即探一次，别等 5 秒
+  tunnelWatchdog();
+  setInterval(tunnelWatchdog, TUNNEL_CHECK_MS).unref();
 });
 
 /* ---------------- 状态面板（可选） ---------------- */
@@ -427,6 +561,7 @@ if (PANEL_PORT > 0) {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
         ...stats,
+        tunnel: tunnelHealth,
         uptimeSec: Math.floor((Date.now() - stats.startedAt) / 1000),
         listen: `${BIND}:${LISTEN_PORT}`,
         upstream: `127.0.0.1:${SOCKS_PORT}`,

@@ -2,7 +2,7 @@
 <#
   borrow-net.ps1 — 借网主控脚本（常驻版）
 
-  场景：本机被学校断网时，借远端 10.13.24.1（办公网）的出口上网。
+  场景：本机被学校断网时，借远端主机（办公网）的出口上网。
   远端已就绪：WireGuard 隧道 Running + IP 转发 Enabled + 防火墙放行；
   远端 Windows 10 教育版缺 WinNAT 组件，所以不走 NAT，改走 SSH SOCKS。
 
