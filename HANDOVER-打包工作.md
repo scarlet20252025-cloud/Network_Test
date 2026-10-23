@@ -1706,6 +1706,111 @@ catch (Exception) { }
 网页下 exe → 装 → 软件内输密钥 → 激活成功 → 建隧道 → 改系统代理 → 出口变了
 ```
 
+## 九点十八、密钥分档：1 / 2 / 3 / 7 / 30 天
+
+### 需求
+
+> 激活之后能借网的时间取决于不同等级密钥，管理界面也这样设置，
+> 生成密钥变为对应不同的激活 1天、2天、3天、7天、30天
+
+之前授权天数是**全局**的（`CFG['license_days']`，默认 30），
+所有密钥换来的时长都一样。现在改成**每个密钥自带档位**。
+
+### 数据
+
+`invites` 表加一列：
+
+```sql
+license_days INTEGER DEFAULT NULL     -- 0 = 永久；NULL = 老密钥，回退全局
+```
+
+迁移用现有的 `DB._migrate()`（`PRAGMA table_info` 判断后 `ALTER`，幂等）：
+
+```python
+icols = {r['name'] for r in self.conn.execute('PRAGMA table_info(invites)')}
+if 'license_days' not in icols:
+    self.conn.execute('ALTER TABLE invites ADD COLUMN license_days INTEGER DEFAULT NULL')
+```
+
+**为什么老密钥留 NULL 而不是 30**：那样会「悄悄地」把历史密钥的时长改掉。
+NULL 表达的是「这条记录生成时还没有这个概念」，
+读取时回退到全局默认 —— 语义准确。
+
+### 统一的时长计算
+
+```python
+LICENSE_TIERS = (1, 2, 3, 7, 30)
+
+def license_days_for(inv):
+    """优先级：密钥自带的 license_days → 全局 CFG['license_days']。"""
+    v = inv['license_days'] if inv is not None and 'license_days' in inv.keys() else None
+    if v is not None:
+        return int(v)
+    return int(CFG.get('license_days') or 0)
+
+def expiry_of(days):
+    return 0 if (days is None or days <= 0) else now() + int(days) * 86400
+
+def days_left_of(exp):
+    return 0 if not exp or exp <= 0 else max(0, int((exp - now()) // 86400))
+```
+
+**两条建号路径都改成用它**（`handle_login` 网页登录、`handle_api_activate` 软件激活）——
+否则「网页登录换来的账号」和「软件激活换来的账号」时长会不一致，那才是真 bug。
+
+### 管理页
+
+档位用一排可点的按钮（比下拉框少一次点击）：
+
+```html
+<div class="tiers">
+  <label class="tier"><input type="radio" name="license_days" value="1"><span>1 天</span></label>
+  ...
+  <label class="tier"><input type="radio" name="license_days" value="30" checked><span>30 天</span></label>
+  <label class="tier"><input type="radio" name="license_days" value="0"><span>永久</span></label>
+</div>
+```
+
+选中态用 `:has(input:checked)` 做（现代浏览器都支持），
+不用 JS 去监听 radio 的 change：
+
+```css
+.tier:has(input:checked){border-color:var(--accent);
+  background:color-mix(in srgb, var(--accent) 12%, transparent)}
+```
+
+密钥列表也加了一列「可用时长」，老密钥显示「默认」。
+
+### 实测（六个档位逐个验证）
+
+```
+密钥 CODE1XXX  -> license_days=1   -> 到期 2026-10-24  剩余 1 天
+密钥 CODE2XXX  -> license_days=2   -> 到期 2026-10-25  剩余 2 天
+密钥 CODE3XXX  -> license_days=3   -> 到期 2026-10-26  剩余 3 天
+密钥 CODE7XXX  -> license_days=7   -> 到期 2026-10-30  剩余 7 天
+密钥 CODE30XX  -> license_days=30  -> 到期 2026-11-22  剩余 30 天
+密钥 CODE0XXX  -> license_days=0   -> 永久             剩余 0 天（前端显示"永久"）
+
+老密钥 license_days = None -> 回退天数 = 30 | 全局 CFG = 30
+```
+
+管理页 9 项结构检查全部通过（档位容器、六个选项、30 天默认选中、
+两时长说明、列表新列）。
+
+### 这一轮踩的坑
+
+**`tier_text(r)` 传了整行而不是字段**
+
+```python
+<td>{_tier_txt(r)}</td>              # 错：传入 sqlite3.Row
+<td>{_tier_txt(r['license_days'])}</td>   # 对
+```
+
+报 `TypeError: int() argument must be... not 'sqlite3.Row'`。
+**教训**：`sqlite3.Row` 看起来像字典（支持 `r['col']`），
+但 `int(r)` 不会像 `int(dict)` 那样失败得早 —— 它会一路传到函数内部才炸。
+这类错误在模板拼接里很难一眼看出来。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`
