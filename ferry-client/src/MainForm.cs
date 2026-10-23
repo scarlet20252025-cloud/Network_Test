@@ -350,6 +350,13 @@ namespace Ferry
         void DoInlineActivate()
         {
             if (_activating) return;
+            // 已激活就别再走一遍。输入框和按钮本来就隐藏了，但 Enter 键
+            // 可能还挂在上面（焦点没移走），按一下就会重复提交一次激活。
+            if (_cfg.Activated)
+            {
+                Log("已经激活过了，不需要重复输入密钥");
+                return;
+            }
             if (_cfg.PortalUrl.Length == 0)
             {
                 MessageBox.Show(this, "配置里没有门户地址，请向管理员索取正确的安装包。",
