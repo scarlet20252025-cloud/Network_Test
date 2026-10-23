@@ -2403,6 +2403,107 @@ void DoInlineActivate()
 上一版我是按「同一台机器」划的，于是把「同一台机器故意再用一次」也放行了。
 正确维度是**时间** —— 重试是秒级的，故意复用是分钟级的。
 
+## 九点二十五、点「卸载」根本不卸载
+
+### 用户反馈
+
+> 点卸载根本不卸载
+
+### 根因：`DoUninstall` 只清了周边，没动程序本体
+
+旧实现只做三件事：
+
+```csharp
+FerryCore.RestoreDirect(_cfg, _appDir);   // 还原系统代理
+FerryCore.StopAll(_cfg, _appDir);         // 杀隧道/代理进程
+// 删 Startup 里的开机自启快捷方式
+...
+MessageBox.Show("已切回直连并删除自启。\n\n如果完全不需要了，可以手动删除目录：" + _appDir);
+```
+
+然后弹一句「**可以手动删除目录**」。
+
+**程序文件一个都没删**，开始菜单和桌面的快捷方式也还在。
+
+用户点的是「卸载」，得到的是「帮你断了网，剩下的自己删」—— 当然会说「根本不卸载」。
+
+### 修法：调 Inno 生成的 `unins000.exe`
+
+```csharp
+var unins = Path.Combine(_appDir, "unins000.exe");
+if (!File.Exists(unins)) { 提示绿色版需手动删目录; return; }
+
+if (确认框 != Yes) return;
+
+// 必须在启动 unins000.exe **之前**做 —— 程序一退出就没人还原代理了
+FerryCore.RestoreDirect(_cfg, _appDir);
+if (_rt != null) { _rt.Stop(); _rt = null; }
+FerryCore.StopAll(_cfg, _appDir);
+
+Process.Start(unins, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
+Thread.Sleep(600);
+Environment.Exit(0);   // 必须退出，否则文件被占用删不掉
+```
+
+**分工**：
+
+| 谁 | 干什么 |
+|---|---|
+| 客户端 `DoUninstall` | 清卸载器管不了的东西：系统代理、隧道/代理进程。然后**退出自己** |
+| `unins000.exe` | 跑 `[UninstallRun]` 再清一遍（幂等），然后删程序、快捷方式、注册表卸载项 |
+
+**为什么清理要在启动卸载器之前**：一旦客户端退出，就再没有进程知道「用户原来的系统代理是什么」。
+卸载器只删文件，不懂代理。所以必须先还原再退出。
+
+**确认框也重写了**，明确列出会删什么：
+
+```
+卸载渡口会：
+· 切回直连（还原你原来的系统代理设置）
+· 停止隧道与本地代理
+· 删除程序、开始菜单/桌面快捷方式、开机自启
+· 删除账号配置（下次安装需要重新输密钥）
+
+继续？
+```
+
+而且 `MessageBoxDefaultButton.Button2` —— **默认按钮是「否」**，防误触。
+
+### 实测
+
+**直接调 `unins000.exe`（等于用户点卸载后的效果）**：
+
+```
+安装后：渡口助手.exe / config.json / unins000.dat / unins000.exe
+卸载退出码=0
+卸载后目录内容：（空）
+```
+
+程序文件、配置、卸载器自己的数据全删了。
+
+**目录本身有时会残留为空目录** —— 那是 Inno 的已知行为（删自己所在目录要等句柄释放），
+空目录不影响任何事，重装也照常。
+
+### 一个之前就想清楚的问题：`[UninstallRun]` 的循环
+
+`ferry.iss` 里有：
+
+```ini
+[UninstallRun]
+Filename: "{app}\渡口助手.exe"; Parameters: "/uninstall"; Flags: runhidden waituntilterminated
+```
+
+它会在卸载时调 `渡口助手.exe /uninstall`。
+
+**这会不会和 `DoUninstall` 打架？** 不会 ——
+
+- `DoUninstall` 是**用户主动点卸载**：先清理 → 启动 `unins000.exe` → 退出
+- `unins000.exe` 随后跑 `[UninstallRun]` → 又启动一次 `渡口助手.exe /uninstall`
+  → 走 `Program.cs` 的 `DoSilentUninstall`（只清代理和进程，不弹窗）→ 退出
+
+两次清理都幂等，重复执行没有副作用。多这一道是为了覆盖
+「用户从控制面板 → 卸载程序」这条不经过客户端的路径 —— 那条路上没人帮它还原代理。
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`

@@ -564,36 +564,76 @@ namespace Ferry
             }
         }
 
+        /// <summary>
+        /// 卸载 = 调 Inno 生成的 unins000.exe，不是「自己删几个文件」。
+        ///
+        /// 之前只做了三件事（还原代理、停进程、删自启），程序本体一动没动 ——
+        /// 用户点「卸载」期待的是**真的消失**，结果发现还在，当然会说「根本不卸载」。
+        ///
+        /// 正确分工：
+        ///   · 本方法：清掉卸载器管不了的东西（系统代理、隧道/代理进程），
+        ///     然后启动 unins000.exe 并退出自己（不然文件被占用删不掉）
+        ///   · unins000.exe：`[UninstallRun]` 会再调一次 `渡口助手.exe /uninstall`
+        ///     做同样的清理，然后删文件、删快捷方式、删注册表卸载项
+        /// 两次清理都幂等，重复执行没有副作用。
+        /// </summary>
         void DoUninstall()
         {
+            var unins = Path.Combine(_appDir, "unins000.exe");
+            if (!File.Exists(unins))
+            {
+                MessageBox.Show(this,
+                    "找不到卸载程序 unins000.exe。\n\n" +
+                    "如果你用的是绿色版（直接拷 exe 过来跑的），\n" +
+                    "手动删除这个目录即可：\n" + _appDir,
+                    "卸载渡口", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
             var r = MessageBox.Show(this,
-                "卸载会：\n· 切回直连\n· 停止隧道与代理\n· 删除开机自启\n\n（不会自动删文件，方便你保留日志）\n\n继续？",
-                "卸载渡口", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                "卸载渡口会：\n" +
+                "· 切回直连（还原你原来的系统代理设置）\n" +
+                "· 停止隧道与本地代理\n" +
+                "· 删除程序、开始菜单/桌面快捷方式、开机自启\n" +
+                "· 删除账号配置（下次安装需要重新输密钥）\n\n" +
+                "继续？",
+                "卸载渡口", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);   // 默认选「否」，防误触
             if (r != DialogResult.Yes) return;
 
             SetBusy(true);
-            ThreadPool.QueueUserWorkItem(delegate
+            Log("正在卸载：先恢复直连，再交给卸载程序…");
+
+            // 这一步必须在启动 unins000.exe 之前做完 ——
+            // 一旦程序退出就没人还原代理了，用户会直接断网。
+            try
             {
                 FerryCore.RestoreDirect(_cfg, _appDir);
-                if (_rt != null) { _rt.Stop(); _rt = null; }
-                try
-                {
-                    var startup = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
-                    foreach (var pat in new[] { "*渡口*", "*Ferry*" })
-                        foreach (var f in Directory.GetFiles(startup, pat))
-                            try { File.Delete(f); } catch (Exception) { }
-                }
-                catch (Exception) { }
+                if (_rt != null) { try { _rt.Stop(); } catch (Exception) { } _rt = null; }
+                FerryCore.StopAll(_cfg, _appDir);
+            }
+            catch (Exception e) { Log("清理失败（继续卸载）：" + e.Message); }
 
-                BeginInvoke(new Action(delegate
-                {
-                    SetBusy(false);
-                    Log("已卸载（文件保留在 " + _appDir + "）");
-                    MessageBox.Show(this, "已切回直连并删除自启。\n\n如果完全不需要了，可以手动删除目录：\n" + _appDir,
-                        "渡口", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    RefreshUi();
-                }));
-            });
+            try
+            {
+                var psi = new ProcessStartInfo(unins, "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
+                psi.UseShellExecute = false;
+                psi.WorkingDirectory = _appDir;
+                Process.Start(psi);
+            }
+            catch (Exception e)
+            {
+                SetBusy(false);
+                MessageBox.Show(this, "启动卸载程序失败：" + e.Message + "\n\n可以手动运行：\n" + unins,
+                    "卸载渡口", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            Log("已启动卸载程序，本程序即将退出");
+            Thread.Sleep(600);
+
+            if (_tray != null) { _tray.Visible = false; _tray.Dispose(); }
+            Environment.Exit(0);
         }
 
         // ── 更新 ────────────────────────────────────────────────
