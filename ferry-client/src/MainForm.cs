@@ -599,7 +599,7 @@ namespace Ferry
                 var v = Api.Version(_cfg.PortalUrl);
                 if (!v.Ok) return;
                 var mine = Application.ProductVersion;
-                if (CompareVer(v.Latest, mine) > 0)
+                if (Api.CompareVer(v.Latest, mine) > 0)
                     BeginInvoke(new Action(delegate
                     {
                         _btnUpd.Text = "更新 " + v.Latest;
@@ -633,28 +633,6 @@ namespace Ferry
             {
                 MessageBox.Show(this, "下载失败：" + e.Message, "更新");
             }
-        }
-
-        static int CompareVer(string a, string b)
-        {
-            var pa = (a ?? "").Split('.');
-            var pb = (b ?? "").Split('.');
-            int n = Math.Max(pa.Length, pb.Length);
-            for (int i = 0; i < n; i++)
-            {
-                int x = i < pa.Length ? ParseInt(pa[i]) : 0;
-                int y = i < pb.Length ? ParseInt(pb[i]) : 0;
-                if (x != y) return x > y ? 1 : -1;
-            }
-            return 0;
-        }
-
-        static int ParseInt(string s)
-        {
-            var sb = new System.Text.StringBuilder();
-            foreach (var c in s) { if (char.IsDigit(c)) sb.Append(c); else break; }
-            int v;
-            return int.TryParse(sb.ToString(), out v) ? v : 0;
         }
 
         // ── 刷新 ────────────────────────────────────────────────

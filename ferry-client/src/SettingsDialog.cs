@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Windows.Forms;
@@ -29,7 +30,7 @@ namespace Ferry
         CheckBox _chkMinimized;
         CheckBox _chkReconnect;
         NumericUpDown _numInterval;
-        Label _lblHint;
+        Label _lblHint, _lblVer;
 
         public SettingsDialog(Cfg cfg, string cfgPath, string appDir)
             : this(cfg, cfgPath, appDir, null) { }
@@ -90,7 +91,7 @@ namespace Ferry
         void BuildUi()
         {
             Text = "设置";
-            ClientSize = new Size(470, 512);
+            ClientSize = new Size(470, 566);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = false;
@@ -152,12 +153,12 @@ namespace Ferry
             Controls.Add(_lblHint);
 
             var ok = Theme.FlatButton("保存", true);
-            ok.SetBounds(238, 452, 104, 34);
+            ok.SetBounds(238, 512, 104, 34);
             ok.Click += delegate { SaveAll(); };
             Controls.Add(ok);
 
             var cancel = Theme.FlatButton("取消", false);
-            cancel.SetBounds(350, 452, 104, 34);
+            cancel.SetBounds(350, 512, 104, 34);
             cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
             Controls.Add(cancel);
 
@@ -169,7 +170,7 @@ namespace Ferry
             lnkUninstall.LinkColor = Theme.Muted;
             lnkUninstall.ActiveLinkColor = Theme.Bad;
             lnkUninstall.LinkBehavior = LinkBehavior.HoverUnderline;
-            lnkUninstall.SetBounds(22, 456, 150, 20);
+            lnkUninstall.SetBounds(24, 458, 110, 20);
             lnkUninstall.LinkClicked += delegate
             {
                 if (_onUninstall == null) return;
@@ -178,6 +179,26 @@ namespace Ferry
                 _onUninstall();
             };
             Controls.Add(lnkUninstall);
+
+            // 主动检查更新的入口。主界面那个「更新」按钮只在**有新版本时**出现，
+            // 平时看不到，用户会以为这软件没有更新功能。
+            _lblVer = new Label();
+            _lblVer.Text = "当前版本 " + Application.ProductVersion;
+            _lblVer.Font = Theme.FSmall;
+            _lblVer.ForeColor = Theme.Muted;
+            _lblVer.AutoSize = true;
+            _lblVer.SetBounds(142, 459, 150, 18);
+            Controls.Add(_lblVer);
+
+            var lnkCheck = new LinkLabel();
+            lnkCheck.Text = "检查更新";
+            lnkCheck.Font = Theme.FSmall;
+            lnkCheck.LinkColor = Theme.Accent;
+            lnkCheck.ActiveLinkColor = Theme.Accent;
+            lnkCheck.LinkBehavior = LinkBehavior.HoverUnderline;
+            lnkCheck.SetBounds(300, 458, 80, 20);
+            lnkCheck.LinkClicked += delegate { CheckUpdateManual(); };
+            Controls.Add(lnkCheck);
 
             AcceptButton = ok;
             CancelButton = cancel;
@@ -217,6 +238,67 @@ namespace Ferry
                     p.Controls.Add(h);
                     h.BringToFront();
                 }
+            }
+        }
+
+        void CheckUpdateManual()
+        {
+            if (_cfg.PortalUrl.Length == 0)
+            {
+                MessageBox.Show(this, "配置里没有门户地址，无法检查更新。", "检查更新",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            Cursor = Cursors.WaitCursor;
+            var v = Api.Version(_cfg.PortalUrl);
+            Cursor = Cursors.Default;
+
+            if (!v.Ok)
+            {
+                MessageBox.Show(this, "检查失败：连不上门户，或门户没有版本信息。" + Environment.NewLine + _cfg.PortalUrl,
+                    "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            var mine = Application.ProductVersion;
+            if (Api.CompareVer(v.Latest, mine) > 0)
+            {
+                var r = MessageBox.Show(this,
+                    "发现新版本 " + v.Latest + "（当前 " + mine + "）。" + Environment.NewLine + Environment.NewLine +
+                    "要现在下载安装吗？" + Environment.NewLine +
+                    "安装会静默覆盖程序，配置和授权不受影响。",
+                    "有新版本", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                if (r == DialogResult.Yes) DoUpdateInline(v);
+            }
+            else
+            {
+                MessageBox.Show(this, "已经是最新版本（" + mine + "）。", "检查更新",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        void DoUpdateInline(VersionInfo v)
+        {
+            try
+            {
+                var url = v.Url.StartsWith("http") ? v.Url : _cfg.PortalUrl.TrimEnd('/') + v.Url;
+                var tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "Ferry-Setup-" + v.Latest + ".exe");
+                Cursor = Cursors.WaitCursor;
+                var wc = new System.Net.WebClient();
+                wc.Proxy = null;
+                wc.DownloadFile(url, tmp);
+                Cursor = Cursors.Default;
+                var psi = new ProcessStartInfo(tmp, "/SILENT /NORESTART /CLOSEAPPLICATIONS");
+                psi.UseShellExecute = false;
+                Process.Start(psi);
+                DialogResult = DialogResult.Abort;
+                Close();
+                Application.Exit();
+            }
+            catch (Exception e)
+            {
+                Cursor = Cursors.Default;
+                MessageBox.Show(this, "下载失败：" + e.Message, "更新",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
