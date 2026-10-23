@@ -239,6 +239,34 @@ namespace Ferry
             return v;
         }
 
+        /// <summary>
+        /// 版本比较。逐段转整数比、缺的段补 0 ——
+        /// 不能用字符串比：Application.ProductVersion 是 "0.8.0.0"（四段），
+        /// /version.json 里写的是 "0.8.0"（三段），字符串比会判成"有新版本"，
+        /// 于是每次启动都误报更新。
+        /// </summary>
+        public static int CompareVer(string a, string b)
+        {
+            var pa = (a ?? "").Split('.');
+            var pb = (b ?? "").Split('.');
+            int n = Math.Max(pa.Length, pb.Length);
+            for (int i = 0; i < n; i++)
+            {
+                int x = i < pa.Length ? VersionPart(pa[i]) : 0;
+                int y = i < pb.Length ? VersionPart(pb[i]) : 0;
+                if (x != y) return x > y ? 1 : -1;
+            }
+            return 0;
+        }
+
+        static int VersionPart(string s)
+        {
+            var sb = new StringBuilder();
+            foreach (var c in s) { if (char.IsDigit(c)) sb.Append(c); else break; }
+            int v;
+            return int.TryParse(sb.ToString(), out v) ? v : 0;
+        }
+
         public static bool LocalStillValid(Cfg cfg)
         {
             return cfg.ExpiresAt <= 0 || cfg.ExpiresAt > NowUnix();

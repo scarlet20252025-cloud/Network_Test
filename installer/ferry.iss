@@ -281,13 +281,32 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  Url, CfgPath, Fallback: string;
+  Url, CfgPath, Fallback, ExistingStr: string;
+  ExistingCfg: AnsiString;
   Fetched: Boolean;
 begin
   if CurStep = ssPostInstall then
   begin
     CfgPath := ExpandConstant('{app}\config.json');
     Fetched := False;
+
+    { 重装/升级时**绝不能覆盖已有的激活状态**。
+      用户装过一次、输过密钥，config.json 里就有 token 和 expiresAt；
+      安装程序再按 /api/config 重写一份（token 固定为空）就等于把激活清掉了。
+      所以只要现有文件里有非空 token，就整份保留，只更新程序本体。 }
+    if FileExists(CfgPath) then
+    begin
+      ExistingCfg := '';
+      if LoadStringFromFile(CfgPath, ExistingCfg) then
+      begin
+        ExistingStr := string(ExistingCfg);   // AnsiString → Unicode
+        if JsonStr(ExistingStr, 'token') <> '' then
+        begin
+          Log('现有 config.json 含激活令牌，保留不动（重装不丢激活）');
+          exit;
+        end;
+      end;
+    end;
 
     if AccountIP <> '' then
     begin

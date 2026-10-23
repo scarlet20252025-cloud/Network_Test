@@ -2218,6 +2218,103 @@ ssh 的中文错误消息在 GUI 日志里还是显示成 `\262\273\326\252...` 
 只是中文目标地址显示不出来。要彻底解决得自己读 `BaseStream` 再解码，
 会多一层阻塞读逻辑，暂时不值得。
 
+## 九点二十三、重装丢失激活（真 bug）+ 检查更新入口
+
+### 1. 重装会清掉激活 —— 用户实测撞到
+
+**现象**：装过一次、输过密钥的机器，重新跑一遍安装包，激活状态没了。
+
+**根因**：`installer/ferry.iss` 的 `CurStepChanged(ssPostInstall)` **无条件**写
+`{app}\config.json`：
+
+```pascal
+Url := '{#PortalBase}/api/config?ip=' + AccountIP;
+FetchedCfg := HttpGet(Url, 8000);
+SaveStringToFile(CfgPath, FetchedCfg, False);   // ← 覆盖掉已有的 token
+```
+
+而 `/api/config` 返回的 `token` 是**固定空串**（这是刻意的设计，
+令牌只能由 `POST /api/activate` 签发）。于是每次重装都把用户的令牌抹掉。
+
+**修法**：写之前先看现有文件里有没有非空 token，有就整份保留。
+
+```pascal
+if FileExists(CfgPath) then
+begin
+  ExistingCfg := '';
+  if LoadStringFromFile(CfgPath, ExistingCfg) then
+  begin
+    ExistingStr := string(ExistingCfg);          // AnsiString → Unicode
+    if JsonStr(ExistingStr, 'token') <> '' then
+    begin
+      Log('现有 config.json 含激活令牌，保留不动（重装不丢激活）');
+      exit;
+    end;
+  end;
+end;
+```
+
+**踩的坑**：`LoadStringFromFile(CfgPath, ExistingCfg)` 的第二个参数必须是
+**`AnsiString`**，不是 `string`（Inno 内部这个函数是 ANSI 版）。
+直接用 `string` 编译报 `Type mismatch`。
+
+**实测**：预置一份带 `"token": "PRESERVE-ME-TOKEN-1234"` 的 config，跑
+`/VERYSILENT` 重装，退出码 0，之后：
+
+```
+✅ 激活与设置全部保留（token / autoBorrow / netCheckSec 都在）
+```
+
+注意连自定义设置（`autoBorrow=true`、`netCheckSec=20`）也保住了 ——
+因为整份文件都没动。
+
+### 2. 看不到更新入口
+
+**原因**：主界面那个「更新 x.y.z」按钮**只在有新版本时出现**。
+当前版本和门户一致，按钮一直隐藏，用户以为没有更新功能。
+
+**修**：设置面板底部加常驻入口。
+
+```
+卸载渡口…     当前版本 0.8.0.0     检查更新
+                       [保存]  [取消]
+```
+
+点「检查更新」：
+- 有新版 → 弹框问是否下载，确认后下载到 `%TEMP%` 并 `/SILENT` 启动安装
+- 已最新 → 弹「已经是最新版本（0.8.0.0）」
+
+**布局踩的坑**：第一版把「卸载/版本/检查更新」和「保存/取消」放在同一行，
+坐标重叠 —— 点「检查更新」实际点到了「保存」，日志里出现
+`设置已保存（断网自动借网 关…）` 而不是版本对话框。
+
+窗口从 512 加高到 566，两行分开：
+
+| 行 | y | 内容 |
+|---|---|---|
+| 第一行 | 458 | 卸载渡口… / 当前版本 / 检查更新 |
+| 第二行 | 512 | 保存 / 取消 |
+
+**教训**：WinForms 手动 `SetBounds` 一定算一遍**区间是否相交**，
+不能只看「看起来分开了」。`963+104=1067` 和 `1025+80=1105` 相交了 42px，
+正好把点击吃掉。
+
+### 3. 顺带：版本比较函数提到 Api
+
+`CompareVer` 原来只在 `MainForm` 里私有，`SettingsDialog` 也要用，
+提到 `Api.CompareVer`，两处共用一份。
+
+理由和上一轮一样：**三段 vs 四段必须等价**（`0.8.0` == `0.8.0.0`），
+否则每次启动都误报有新版本。放一个地方就不会出现「两处逻辑不一致」。
+
+### 当前更新能力总览
+
+| 入口 | 何时可见 | 作用 |
+|---|---|---|
+| 主界面「更新 x.y.z」按钮 | **仅当有新版本** | 一键更新（确认 → 下载 → 安装） |
+| 设置 → 检查更新 | **常驻** | 手动查一次，无论有没有新版都给反馈 |
+| 自动检查 | 启动时 + 每 6 小时 | 发现新版就在主界面显示按钮 |
+
 ## 十、还没做的
 
 1. **图标**：现在用 `SystemIcons.Application`。要专业点得配一个 `.ico`
