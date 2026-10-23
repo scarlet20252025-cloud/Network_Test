@@ -93,6 +93,9 @@ SSH 走校园网直连（3 跳，RTT 3–14 ms），不经 WireGuard 网段。
 | `tools/gh-probe.mjs` | GitHub 可达性采样（成功率 / 失败阶段分布） |
 | `tools/socks-layer-probe.mjs` | 分层定位 SOCKS 隧道失败阶段 |
 | `tools/egress-diag.ps1` | 逐源逐方式打印出口 IP 探测的耗时与错误 |
+| `tools/verify-outage.ps1` | **一键验证断网可用性**：模拟断网 → 测借网 → 自动恢复（需管理员） |
+| `tools/simulate-outage.ps1` | 模拟「局域网通 / 公网断」的防火墙开关（Start / Stop / Status） |
+| `tools/outage-watch.ps1` | 断网存活监控，持续记录直连 / 借网 / SSH 三态，`-Report` 出统计 |
 | `tools/test-smart-resolve.mjs` | smart-resolve 自检 |
 | `tools/push-with-retry.sh` | 借网环境下的 git 推送封装（必需参数 + 重试） |
 | `tools/make-shortcut.ps1` | 生成桌面与开始菜单快捷方式（含自绘 ICO） |
@@ -132,6 +135,7 @@ git -c http.version=HTTP/1.1 -c http.proxy=http://127.0.0.1:10809 -c http.sslBac
 | [docs/踩坑记录.md](docs/踩坑记录.md) | 实测踩坑清单（PowerShell 5.1 / 远端 / WinForms / git） |
 | [docs/远端部署.md](docs/远端部署.md) | 远端 sshd、WireGuard、端口转发部署步骤 |
 | [docs/局域网共享方案.md](docs/局域网共享方案.md) | 局域网共享预留设计（认证 / ACL / 性能预期），未实施 |
+| [docs/断网验证方法.md](docs/断网验证方法.md) | 怎么验证「断网后借网还能用」：模拟断网脚本、判定表、手动验证步骤 |
 
 ## 已知边界
 
