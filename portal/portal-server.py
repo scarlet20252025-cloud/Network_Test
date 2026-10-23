@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS invites (
     expires_at  INTEGER NOT NULL,
     used_by_ip  TEXT DEFAULT '',
     used_at     INTEGER DEFAULT 0,
-    revoked     INTEGER DEFAULT 0
+    revoked     INTEGER DEFAULT 0,
+    license_days INTEGER DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS clients (
@@ -167,6 +168,13 @@ class DB:
             self.conn.commit()
             print('[db] migrated: clients.expires_at added', flush=True)
 
+        # 每个密钥自带的授权天数。老密钥留 NULL，回退到全局默认。
+        icols = {r['name'] for r in self.conn.execute('PRAGMA table_info(invites)')}
+        if 'license_days' not in icols:
+            self.conn.execute('ALTER TABLE invites ADD COLUMN license_days INTEGER DEFAULT NULL')
+            self.conn.commit()
+            print('[db] migrated: invites.license_days added', flush=True)
+
     def q(self, sql, args=()):
         with self.lock:
             cur = self.conn.execute(sql, args)
@@ -211,6 +219,42 @@ def fmt_left(ts):
     if d < 86400:
         return f'{d // 3600} 小时'
     return f'{d // 86400} 天'
+
+
+# 可选档位（天）。0 = 永久。
+LICENSE_TIERS = (1, 2, 3, 7, 30)
+
+
+def tier_text(days):
+    if days is None:
+        return '默认'
+    d = int(days)
+    return '永久' if d <= 0 else (str(d) + ' 天')
+
+
+def license_days_for(inv):
+    """这个密钥能换多少天授权。
+
+    优先级：密钥自带的 license_days → 全局 CFG['license_days']。
+    老密钥（迁移后是 NULL）就走全局默认，不会因为加了新列而失效。
+    """
+    v = inv['license_days'] if inv is not None and 'license_days' in inv.keys() else None
+    if v is not None:
+        return int(v)
+    return int(CFG.get('license_days') or 0)
+
+
+def expiry_of(days):
+    """天数 → 到期时间戳。0 或负数表示永久（返回 0）。"""
+    if days is None or days <= 0:
+        return 0
+    return now() + int(days) * 86400
+
+
+def days_left_of(exp):
+    if not exp or exp <= 0:
+        return 0
+    return max(0, int((exp - now()) // 86400))
 
 
 def hash_code(code):
@@ -1152,6 +1196,18 @@ tr[data-on="1"]{background:color-mix(in srgb, var(--accent) 5%, transparent)}
 .num{font-size:12.5px}
 .num.zero{color:var(--fg2)}
 .nowrap{white-space:nowrap}
+
+/* 授权档位：一排可选按钮，比下拉框少一次点击 */
+.tiers{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 0}
+.tier{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
+  border:1px solid var(--line2);border-radius:9px;padding:8px 14px;
+  font-size:13px;color:var(--fg);background:var(--card2);
+  transition:border-color .15s,background .15s;margin:0}
+.tier:hover{border-color:var(--accent)}
+.tier input{accent-color:var(--accent);margin:0;cursor:pointer}
+.tier:has(input:checked){border-color:var(--accent);
+  background:color-mix(in srgb, var(--accent) 12%, transparent)}
+.tier:has(input:checked) span{color:var(--accent);font-weight:600}
 </style>
 
 <div class="livehead" style="margin:2px 0 12px">
@@ -1296,6 +1352,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
     csrf_in = f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">' if csrf else ''
     _ld = int(CFG.get('license_days') or 0)
     license_days_txt = '永久' if _ld <= 0 else (str(_ld) + ' 天')
+    _tier_txt = tier_text
     inv = db.q('SELECT * FROM invites ORDER BY id DESC LIMIT 40')
     cli = db.q('SELECT * FROM clients ORDER BY created_at DESC')
     ev = db.q('SELECT * FROM events ORDER BY id DESC LIMIT 30')
@@ -1319,6 +1376,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
     inv_rows = ''.join(f"""<tr>
   <td class="mono">{html.escape(r['code_hint'])}</td>
   <td>{html.escape(r['note']) or '<span class="muted">—</span>'}</td>
+  <td class="mono">{_tier_txt(r['license_days'])}</td>
   <td>{'<span class="bad">已撤销</span>' if r['revoked'] else
        ('<span class="muted">已使用</span>' if r['used_by_ip'] else
         ('<span class="bad">已过期</span>' if r['expires_at'] < now() else
@@ -1370,10 +1428,22 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
         <input type="number" name="hours" value="{new_hours}" min="1" max="720">
       </div>
     </div>
-    <div class="hint" style="margin:10px 0 12px;line-height:1.8">
-      这个「小时」是<b>密钥本身</b>的有效期 —— 生成后必须在这个时间内用掉，过期作废。<br>
-      激活成功后，<b>账号</b>可借网的时长是另一回事：当前配置 <b>{license_days_txt}</b>
-      （服务端 <code>--license-days</code> 参数，0 = 永久）。
+
+    <label style="margin-top:14px">激活后可用时长</label>
+    <div class="tiers">
+      <label class="tier"><input type="radio" name="license_days" value="1"><span>1 天</span></label>
+      <label class="tier"><input type="radio" name="license_days" value="2"><span>2 天</span></label>
+      <label class="tier"><input type="radio" name="license_days" value="3"><span>3 天</span></label>
+      <label class="tier"><input type="radio" name="license_days" value="7"><span>7 天</span></label>
+      <label class="tier"><input type="radio" name="license_days" value="30" checked><span>30 天</span></label>
+      <label class="tier"><input type="radio" name="license_days" value="0"><span>永久</span></label>
+    </div>
+
+    <div class="hint" style="margin:14px 0 12px;line-height:1.8">
+      <b>这两个时长是两回事：</b><br>
+      · 上面的「密钥有效期」= 密钥本身必须在这个时间内用掉，过期作废（取票窗口）<br>
+      · 下面的「激活后可用时长」= 用掉之后账号能借网多久（票的使用期限）<br>
+      老密钥没有这个字段，按全局默认 <b>{license_days_txt}</b> 算。
     </div>
     <button type="submit">生成密钥</button>
   </form>
@@ -1381,8 +1451,8 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
 
 <div class="card">
   <h2 style="margin-top:0">临时密钥（最近 40 条）</h2>
-  <table><thead><tr><th>密钥前缀</th><th>备注</th><th>状态</th><th>使用方</th><th>创建</th><th></th></tr></thead>
-  <tbody>{inv_rows or '<tr><td colspan="6" class="muted">还没有密钥</td></tr>'}</tbody></table>
+  <table><thead><tr><th>密钥前缀</th><th>备注</th><th>可用时长</th><th>状态</th><th>使用方</th><th>创建</th><th></th></tr></thead>
+  <tbody>{inv_rows or '<tr><td colspan="7" class="muted">还没有密钥</td></tr>'}</tbody></table>
 </div>
 
 <div class="card">
@@ -2108,9 +2178,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         # 通过：绑定 IP
-        # 授权到期时间：license_days=0 表示永久
-        days = int(CFG.get('license_days') or 0)
-        exp = 0 if days <= 0 else now() + days * 86400
+        # 授权时长来自**这个密钥自己**的档位（1/2/3/7/30 天，0=永久）。
+        # 老密钥没有这个字段，license_days_for 会回退到全局默认。
+        days = license_days_for(inv)
+        exp = expiry_of(days)
 
         existing = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
         if existing:
@@ -2527,11 +2598,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({'ok': False, 'error': '密钥已过期，请向管理员索取新的'}, 401)
             return
 
-        # 授权时长（本函数作用域内必须有 —— 之前漏了，直接 NameError → 500，
-        # 客户端拿到一坨看不懂的错误，用户以为密钥失效）
-        days = int(CFG.get('license_days') or 0)
-        exp = 0 if days <= 0 else now() + days * 86400
-        days_left = 0 if exp <= 0 else max(0, int((exp - now()) // 86400))
+        # 授权时长来自这个密钥自己的档位（1/2/3/7/30 天，0=永久）。
+        # 老密钥没有该字段时回退到全局默认 —— 不能让历史密钥突然失效。
+        days = license_days_for(inv)
+        exp = expiry_of(days)
+        days_left = days_left_of(exp)
 
         # 通过：绑定 IP，建号或复活
         existing = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
@@ -2643,15 +2714,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             hours = DEFAULT_INVITE_HOURS
         hours = max(1, min(720, hours))
 
+        # 这个密钥能换多少天授权。0 = 永久；非法值回退到第一档。
+        try:
+            lic = int(form.get('license_days') or LICENSE_TIERS[-1])
+        except ValueError:
+            lic = LICENSE_TIERS[-1]
+        if lic != 0 and lic not in LICENSE_TIERS:
+            lic = LICENSE_TIERS[-1]
+
         code = new_invite_code()
         ch = hash_code(code)
         self.db.x(
-            'INSERT INTO invites (code_hash, code_hint, note, created_at, expires_at) '
-            'VALUES (?,?,?,?,?)',
-            (ch, code[:4] + '****', note, now(), now() + hours * 3600))
-        self.db.log('invite_new', self.client_ip(), f'note={note} hours={hours}')
+            'INSERT INTO invites (code_hash, code_hint, note, created_at, expires_at, license_days) '
+            'VALUES (?,?,?,?,?,?)',
+            (ch, code[:4] + '****', note, now(), now() + hours * 3600, lic))
+        self.db.log('invite_new', self.client_ip(), f'note={note} hours={hours} days={lic}')
         # 明文只在这一响应里出现一次
-        self.send_html(admin_page(self.db, new_code=code, new_hours=hours, csrf=csrf_set('admin|' + self.client_ip())))
+        self.send_html(admin_page(self.db, new_code=code, new_hours=hours,
+                                  csrf=csrf_set('admin|' + self.client_ip())))
 
     def handle_admin_revoke(self, form):
         if not self._require_admin():
