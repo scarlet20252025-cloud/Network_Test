@@ -26,4 +26,15 @@ portal/*.db
 portal/*.db-*
 .ferry/
 portal/ck*.txt
+__pycache__/
+*.pyc
 *.keeper.lock
+
+# 构建产物（安装包 2 MB 一个版本，不入库；需要时用 ISCC 重编）
+dist/
+
+# 代码签名私钥 —— 绝不入库（公钥 .cer 可以）
+installer/ferry-sign.pfx
+
+# 客户端测试程序的编译产物
+ferry-client/test/out/

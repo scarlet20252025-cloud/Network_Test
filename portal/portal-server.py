@@ -47,6 +47,7 @@ import hashlib
 import hmac
 import html
 import http.server
+import io
 import json
 import os
 import re
@@ -84,6 +85,9 @@ CFG = {
     # （不会被公网 DNS 解析到，也不可能被抢注）。
     # 比 .local（mDNS 占用）、.lan（非标准）都干净。
     'domain': 'ferry.internal',
+    # 激活后的授权天数。0 = 永久。
+    # 放在 CFG 里是为了让管理员能用 --license-days 改，不用动代码。
+    'license_days': 30,
 }
 
 
@@ -109,7 +113,10 @@ CREATE TABLE IF NOT EXISTS clients (
     note        TEXT DEFAULT '',
     created_at  INTEGER NOT NULL,
     last_seen   INTEGER DEFAULT 0,
-    invite_id   INTEGER DEFAULT 0
+    invite_id   INTEGER DEFAULT 0,
+    -- 授权到期时间（unix 秒）。0 = 永久。
+    -- 激活时写入，客户端据此显示剩余天数并决定能不能借网。
+    expires_at  INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -144,7 +151,21 @@ class DB:
         self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.execute('PRAGMA synchronous=NORMAL')
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self):
+        """给已经存在的库补新列。
+
+        SCHEMA 用的是 CREATE TABLE IF NOT EXISTS —— 对老库它什么都不做，
+        新增的 expires_at 不会出现。所以必须单独 ALTER。
+        重复 ALTER 会报 duplicate column，用异常吞掉即可（幂等）。
+        """
+        cols = {r['name'] for r in self.conn.execute('PRAGMA table_info(clients)')}
+        if 'expires_at' not in cols:
+            self.conn.execute('ALTER TABLE clients ADD COLUMN expires_at INTEGER DEFAULT 0')
+            self.conn.commit()
+            print('[db] migrated: clients.expires_at added', flush=True)
 
     def q(self, sql, args=()):
         with self.lock:
@@ -589,6 +610,216 @@ def footer():
 </div>"""
 
 
+# ─────────────────────── 实时借网监控 ───────────────────────
+
+_live_lock = threading.Lock()
+_live_cache = {'at': 0.0, 'data': None}
+_live_prev = {'at': 0.0, 'rx': 0, 'tx': 0, 'ready': False}
+_live_peak = {'rx': 0, 'tx': 0}
+
+
+def _sh(cmd, timeout=8):
+    """跑一条命令拿 stdout。失败一律返回空串 —— 监控挂了不能拖垮管理页。"""
+    try:
+        import subprocess
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, errors='ignore')
+        return p.stdout or ''
+    except Exception:
+        return ''
+
+
+def _ssh_peers():
+    """正在连本机 22 端口的外网地址 → 连接数。
+
+    只看 ESTABLISHED 且本地端口是 22 的。回环和空地址跳过
+    （管理员自己 ssh 上来运维不该算用户）。
+    """
+    out = _sh(['netstat', '-ano'])
+    peers = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        if parts[0].upper() != 'TCP':
+            continue
+        local, foreign, state = parts[1], parts[2], parts[3]
+        if state.upper() != 'ESTABLISHED':
+            continue
+        if not (local.endswith(':22') or local.endswith(']:22')):
+            continue
+        ip = foreign.rsplit(':', 1)[0].strip('[]')
+        if not ip or ip.startswith('127.') or ip == '::1':
+            continue
+        peers[ip] = peers.get(ip, 0) + 1
+    return peers
+
+
+def _net_bytes():
+    """全部网卡的累计收/发字节。取不到就返回 None。"""
+    out = _sh(['powershell', '-NoProfile', '-NonInteractive', '-Command',
+               '$r=0;$t=0;Get-NetAdapterStatistics|%{$r+=$_.ReceivedBytes;$t+=$_.SentBytes};"$r $t"'],
+              timeout=10)
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        seg = line.split()
+        if len(seg) == 2 and seg[0].isdigit() and seg[1].isdigit():
+            return int(seg[0]), int(seg[1])
+    return None
+
+
+
+# ─────────────────────── 用户心跳（每用户速率）───────────────────────
+
+_hb_lock = threading.Lock()
+_hb = {}            # ip -> {rx, tx, at, rxBps, txBps, conns, running}
+HB_STALE_SEC = 30   # 超过这么久没心跳就当离线（客户端 5 秒一次，容 6 次丢包）
+
+
+def note_heartbeat(ip, rx, tx, conns, running):
+    """记一次心跳并算速率。"""
+    t = time.time()
+    with _hb_lock:
+        prev = _hb.get(ip)
+        rx_bps = tx_bps = 0
+        if prev is not None:
+            dt = t - prev['at']
+            if dt > 0.2:
+                # 客户端重启会让计数归零，负数按 0 处理
+                rx_bps = max(0, int((rx - prev['rx']) / dt))
+                tx_bps = max(0, int((tx - prev['tx']) / dt))
+        _hb[ip] = {'rx': rx, 'tx': tx, 'at': t,
+                   'rxBps': rx_bps, 'txBps': tx_bps,
+                   'conns': conns, 'running': bool(running)}
+        return _hb[ip]
+
+
+def heartbeat_of(ip):
+    """拿某 IP 的心跳快照；过期返回 None。"""
+    with _hb_lock:
+        h = _hb.get(ip)
+        if not h:
+            return None
+        if time.time() - h['at'] > HB_STALE_SEC:
+            return None
+        return dict(h)
+
+
+def sample_live(db):
+    """采一次现场。带 2 秒缓存。"""
+    with _live_lock:
+        t = time.time()
+        if _live_cache['data'] is not None and t - _live_cache['at'] < 2.0:
+            return _live_cache['data']
+
+        peers = _ssh_peers()
+        nb = _net_bytes()
+
+        rx_bps = tx_bps = 0
+        if nb is not None:
+            if _live_prev['ready']:
+                dt = t - _live_prev['at']
+                if dt > 0.2:
+                    rx_bps = max(0, int((nb[0] - _live_prev['rx']) / dt))
+                    tx_bps = max(0, int((nb[1] - _live_prev['tx']) / dt))
+                    _live_peak['rx'] = max(_live_peak['rx'], rx_bps)
+                    _live_peak['tx'] = max(_live_peak['tx'], tx_bps)
+            _live_prev.update(at=t, rx=nb[0], tx=nb[1], ready=True)
+
+        # 补上账号信息（备注 / 是否停用），让管理页一眼看出是谁
+        users = {}
+        for ip in peers:
+            row = db.q1('SELECT ip, enabled, note FROM clients WHERE ip = ?', (ip,))
+            users[ip] = {'enabled': bool(row['enabled']) if row else False,
+                         'registered': row is not None,
+                         'note': (row['note'] if row else '') or ''}
+
+        # 把心跳里的速率并进 online 列表
+        online = []
+        for ip, n in peers.items():
+            h = heartbeat_of(ip) or {}
+            online.append({
+                'ip': ip,
+                'conns': n,
+                'rxBps': h.get('rxBps', 0),
+                'txBps': h.get('txBps', 0),
+                'reported': bool(h),
+            })
+        online.sort(key=lambda x: -(x['rxBps'] + x['txBps']))
+
+        # 全量账号（不只是在线的）——管理页要「在线的置顶、离线的往下」
+        users = []
+        try:
+            for r in db.q('SELECT ip, enabled, note, last_seen, created_at FROM clients'):
+                ip = r['ip']
+                h = heartbeat_of(ip) or {}
+                on = ip in peers
+                users.append({
+                    'ip': ip,
+                    'enabled': bool(r['enabled']),
+                    'note': r['note'] or '',
+                    'online': on,
+                    'conns': peers.get(ip, 0),
+                    'rxBps': h.get('rxBps', 0) if on else 0,
+                    'txBps': h.get('txBps', 0) if on else 0,
+                    'reported': bool(h) and on,
+                    'lastSeen': int(r['last_seen'] or 0),
+                })
+        except Exception:
+            pass
+        # 在线优先，其次按总速率降序，再按最后活动降序
+        users.sort(key=lambda u: (0 if u['online'] else 1,
+                                  -(u['rxBps'] + u['txBps']),
+                                  -u['lastSeen']))
+
+        # 全量账号（不只是在线的）——管理页要「在线置顶、离线靠下」
+        ulist = []
+        try:
+            for r in db.q('SELECT ip, enabled, note, last_seen FROM clients'):
+                ip = r['ip']
+                h = heartbeat_of(ip) or {}
+                on = ip in peers
+                ulist.append({
+                    'ip': ip,
+                    'enabled': bool(r['enabled']),
+                    'note': r['note'] or '',
+                    'online': on,
+                    'conns': peers.get(ip, 0),
+                    'rxBps': h.get('rxBps', 0) if on else 0,
+                    'txBps': h.get('txBps', 0) if on else 0,
+                    'reported': bool(h) and on,
+                    'lastSeen': int(r['last_seen'] or 0),
+                })
+        except Exception:
+            pass
+        ulist.sort(key=lambda u: (0 if u['online'] else 1,
+                                  -(u['rxBps'] + u['txBps']),
+                                  -u['lastSeen']))
+
+        data = {
+            'ok': True,
+            'at': int(t),
+            'online': online,
+            'list': ulist,
+            'onlineCount': len(peers),
+            'conns': sum(peers.values()),
+            'rxBps': rx_bps,
+            'txBps': tx_bps,
+            'peakRxBps': _live_peak['rx'],
+            'peakTxBps': _live_peak['tx'],
+            'users': {u['ip']: {'enabled': u['enabled'],
+                                'registered': True,
+                                'note': u['note']} for u in users},
+            'list': users,
+        }
+        _live_cache['data'] = data
+        _live_cache['at'] = t
+        return data
+
+
+
 def page(title, body, refresh=None, theme=None, cookie_header=None):
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ''
     cur = theme or _theme_from_cookie(cookie_header)
@@ -600,6 +831,115 @@ def page(title, body, refresh=None, theme=None, cookie_header=None):
 <meta name="color-scheme" content="dark light">
 {meta}<title>{html.escape(title)}</title><style>{BASE_CSS}</style></head>
 <body><div class="wrap">{top}{body}{footer()}</div>{THEME_JS}</body></html>"""
+
+
+def get_page(detected_ip=''):
+    """首页 = 获取软件。
+
+    为什么把登录表单撤掉：用户明确要求「网页只用来获取软件」。
+    密钥改成软件里的激活码，网页再收一遍只会让人以为要登录两次。
+
+    下载按钮指向 /download（匿名），文件名由服务端按来源 IP 拼成
+    Ferry-Setup-<你的IP>.exe —— 安装程序从文件名解析账号，用户不用输任何东西。
+    """
+    ip_txt = html.escape(detected_ip) if detected_ip else '你的IP'
+    return page('获取渡口 · Ferry', f"""
+<h1>渡口 · Ferry</h1>
+<div class="sub">本机网络受限时，借一台能上网的内网主机中转流量</div>
+
+<div class="card" style="text-align:center;padding:22px 18px">
+  <a class="dl" href="/download"
+     style="display:block;font-size:17px;padding:16px 20px;text-decoration:none">
+    下载 Windows 客户端
+  </a>
+  <div class="hint" style="margin-top:14px;font-size:12.5px">
+    Ferry-Setup.exe · <b>约 2.1 MB</b> · Windows 10 / 11 · 免安装运行库
+  </div>
+  <div class="hint" style="margin-top:10px;font-size:12px;line-height:1.7;
+       background:var(--warnbg);color:var(--warn);padding:10px 12px;border-radius:8px">
+    下载完成后请确认文件大小约 <b>2.1 MB</b>。<br>
+    如果只有 0 KB，说明下载被中断了 —— 删掉那个文件重新点一次。
+    双击 0 KB 的文件会提示「此应用无法在你的电脑上运行」。
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">三步用起来</h2>
+  <div class="step"><div class="n">1</div><div class="t">
+    <b>下载安装包</b><div class="hint">点上面的按钮。文件名里已经带了你的账号，
+      下载后不要改名（改了也能用，安装时会让你手填 IP）。</div>
+  </div></div>
+  <div class="step"><div class="n">2</div><div class="t">
+    <b>双击安装</b><div class="hint">向导会问要不要建桌面图标、要不要开机自启，
+      装完可以直接启动。</div>
+  </div></div>
+  <div class="step"><div class="n">3</div><div class="t">
+    <b>在软件里输入密钥</b><div class="hint">打开「渡口助手」，把管理员给你的
+      8 位密钥填进「输入密钥激活」，点激活。之后就不用再输了。</div>
+  </div></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">下载后提示「Windows 已保护你的电脑」？</h2>
+  <div style="font-size:13.5px;line-height:1.8">
+    这是 SmartScreen 对<strong>未经代码签名</strong>的 exe 的例行拦截，不是病毒。
+    三种处理方式，任选一种：
+  </div>
+  <div class="step"><div class="n">1</div><div class="t">
+    <b>用命令行下载（不触发拦截，推荐）</b>
+    <div class="hint">按 Win+R 输入 <code>powershell</code> 回车，粘贴下面这行：</div>
+    <div class="mono" style="background:#f4f6f8;padding:10px 12px;border-radius:8px;margin-top:8px;
+         font-size:12px;word-break:break-all;user-select:all">
+      Invoke-WebRequest 'http://10.13.24.1:8080/download' -OutFile "$env:USERPROFILE\\Downloads\\Ferry-Setup.exe"; Start-Process "$env:USERPROFILE\\Downloads\\Ferry-Setup.exe"
+    </div>
+    <div class="hint" style="margin-top:6px">
+      浏览器会给下载的文件打上「来自 Internet」的标记（MOTW），SmartScreen 只查带标记的 exe。
+      用 PowerShell 直接下载不带这个标记，所以不会弹窗。
+    </div>
+  </div></div>
+  <div class="step"><div class="n">2</div><div class="t">
+    <b>已经下载了：解除锁定</b>
+    <div class="hint">右键那个 exe → 属性 → 最下面勾选「解除锁定」→ 确定 → 再双击。</div>
+  </div></div>
+  <div class="step"><div class="n">3</div><div class="t">
+    <b>直接点「更多信息 → 仍要运行」</b>
+    <div class="hint">SmartScreen 弹窗左下角有「更多信息」，展开后出现「仍要运行」。
+      同一个文件点过一次就不再问。</div>
+  </div></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">密钥在软件里输入，不在网页</h2>
+  <div style="font-size:13.5px;line-height:1.8">
+    网页只负责发软件。密钥是软件里的<strong>激活码</strong> ——
+    填一次就绑定这台机器，以后打开软件直接能用。<br><br>
+    这样做的好处是：安装包本身<strong>不含任何凭据</strong>，
+    转发给别人也用不了；密钥丢了也不会连着账号一起泄露。
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">密钥规则</h2>
+  <div class="kv"><div class="k">一次性</div><div class="v">
+    激活成功即失效。换机器需要向管理员要新密钥。</div></div>
+  <div class="kv"><div class="k">有效期</div><div class="v">
+    密钥本身 12 小时内必须用掉；激活后的授权时长由管理员设定（默认 30 天）。</div></div>
+  <div class="kv"><div class="k">限速</div><div class="v">
+    连续输错会被临时锁定 15 分钟。</div></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">它怎么工作</h2>
+  <div style="font-size:13.5px;line-height:1.8">
+    校园网按<strong>账号</strong>限制上网能力时，局域网内部通常仍然是通的。
+    渡口利用这一点：通过 SSH 隧道把流量交给一台<b>能上网的局域网主机</b>中转，
+    出口在别人家。<br><br>
+    隧道是 <code>ssh -D</code> 动态转发（加密），本地是双协议代理
+    （HTTP + SOCKS5 同端口）—— 因为 Windows 系统代理不认 SOCKS5，
+    这是个很容易踩的坑，干脆做成同一端口两种协议。
+  </div>
+</div>
+""")
 
 
 def login_page(err='', csrf='', detected_ip='', show_ip_field=False):
@@ -749,6 +1089,209 @@ def portal_page(client, invite_note=''):
 </div>""")
 
 
+LIVE_UI = r'''
+<style>
+/* 实时监控区：四个指标卡 + 在线列表。
+   全部用主题变量，切深色/浅色/护眼都不用改这里。 */
+.livegrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:0 0 18px}
+@media(max-width:760px){.livegrid{grid-template-columns:repeat(2,1fr)}}
+.livecard{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:16px 18px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+.livecard .lbl{font-size:12px;color:var(--fg2);letter-spacing:.3px}
+.livecard .val{font-size:26px;font-weight:700;margin-top:6px;line-height:1.1;
+  font-family:Consolas,Monaco,monospace;transition:color .3s}
+.livecard .unit{font-size:13px;font-weight:400;color:var(--fg2);margin-left:3px}
+.livecard .sub{font-size:11px;color:var(--fg2);margin-top:6px}
+.livecard.hot .val{color:var(--accent)}
+.livecard .spark{position:absolute;left:0;right:0;bottom:0;height:3px;
+  background:linear-gradient(90deg,var(--accent),transparent);opacity:0;transition:opacity .4s}
+.livecard.hot .spark{opacity:.65}
+
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+  background:var(--accent);margin-right:7px;vertical-align:middle;
+  box-shadow:0 0 0 0 rgba(61,220,151,.7);animation:pulse 2s infinite}
+@keyframes pulse{
+  0%{box-shadow:0 0 0 0 rgba(61,220,151,.55)}
+  70%{box-shadow:0 0 0 7px rgba(61,220,151,0)}
+  100%{box-shadow:0 0 0 0 rgba(61,220,151,0)}
+}
+.idle{color:var(--fg2);text-align:center;padding:26px 0;font-size:13px}
+
+.livehead{display:flex;align-items:center;justify-content:space-between;
+  gap:12px;flex-wrap:wrap}
+.rates{display:inline-flex;gap:16px;font-size:12px;color:var(--fg2);
+  font-family:Consolas,Monaco,monospace}
+.rates b{color:var(--fg);font-weight:600}
+.livestamp{font-size:11.5px;color:var(--fg2);font-family:Consolas,Monaco,monospace}
+.livestamp.bad{color:var(--err)}
+.bar{height:4px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:8px}
+.bar>i{display:block;height:100%;background:var(--accent);width:0;
+  border-radius:2px;transition:width .45s ease}
+
+/* ── 用户列表（路由器风格）── */
+.listwrap{max-height:420px;overflow-y:auto;overflow-x:hidden;
+  border:1px solid var(--line);border-radius:10px;background:var(--card2)}
+.listwrap table{margin:0;width:100%}
+.listwrap thead th{position:sticky;top:0;z-index:2;background:var(--card2);
+  box-shadow:inset 0 -1px 0 var(--line)}
+.listwrap tbody tr{transition:background .18s}
+.listwrap tbody tr:hover{background:var(--card)}
+.listwrap::-webkit-scrollbar{width:9px}
+.listwrap::-webkit-scrollbar-thumb{background:var(--line2);border-radius:5px}
+.listwrap::-webkit-scrollbar-thumb:hover{background:var(--fg2)}
+.listwrap::-webkit-scrollbar-track{background:transparent}
+
+.dot.off{background:var(--fg2);animation:none;box-shadow:none;opacity:.5}
+.st{white-space:nowrap;font-size:12.5px}
+.st .stx{margin-left:2px;color:var(--fg2)}
+tr[data-on="1"] .st .stx{color:var(--accent)}
+tr[data-on="1"]{background:color-mix(in srgb, var(--accent) 5%, transparent)}
+.num,.numh{font-family:Consolas,Monaco,monospace;text-align:right;
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+.numh{font-size:12px}
+.num{font-size:12.5px}
+.num.zero{color:var(--fg2)}
+.nowrap{white-space:nowrap}
+</style>
+
+<div class="livehead" style="margin:2px 0 12px">
+  <div class="rates">
+    下行峰值 <b id="lvRxPeak">—</b> · 上行峰值 <b id="lvTxPeak">—</b>
+  </div>
+  <div class="livestamp" id="lvStamp">正在连接…</div>
+</div>
+
+<div class="livegrid">
+  <div class="livecard" id="lcOnline">
+    <div class="lbl">正在借网</div>
+    <div class="val"><span id="lvOnline">—</span><span class="unit">台</span></div>
+    <div class="sub" id="lvOnlineSub">—</div>
+    <div class="spark"></div>
+  </div>
+  <div class="livecard" id="lcConns">
+    <div class="lbl">活跃连接</div>
+    <div class="val"><span id="lvConns">—</span><span class="unit">条</span></div>
+    <div class="sub">到本机 22 端口</div>
+    <div class="spark"></div>
+  </div>
+  <div class="livecard" id="lcRx">
+    <div class="lbl">下行速率</div>
+    <div class="val"><span id="lvRx">—</span></div>
+    <div class="bar"><i id="lvRxBar"></i></div>
+    <div class="spark"></div>
+  </div>
+  <div class="livecard" id="lcTx">
+    <div class="lbl">上行速率</div>
+    <div class="val"><span id="lvTx">—</span></div>
+    <div class="bar"><i id="lvTxBar"></i></div>
+    <div class="spark"></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var peak = {rx:0, tx:0};
+  function esc(s){
+    return String(s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+  function setHot(id, on){
+    var el = document.getElementById(id);
+    if (el) el.className = 'livecard' + (on ? ' hot' : '');
+  }
+  function fmtBps(n){
+    if (!n || n < 1) return '—';
+    var u = ['B/s','KB/s','MB/s','GB/s'], i = 0, v = n;
+    while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
+    return (v >= 100 ? v.toFixed(0) : v.toFixed(v >= 10 ? 1 : 2)) + ' ' + u[i];
+  }
+  function render(d){
+    document.getElementById('lvOnline').textContent = d.onlineCount;
+    document.getElementById('lvOnlineSub').textContent =
+      d.onlineCount === 0 ? '当前没人借网' : (d.conns + ' 条隧道连接');
+    document.getElementById('lvConns').textContent = d.conns;
+
+    document.getElementById('lvRx').innerHTML = fmtBps(d.rxBps);
+    document.getElementById('lvTx').innerHTML = fmtBps(d.txBps);
+    if (d.rxBps > peak.rx) peak.rx = d.rxBps;
+    if (d.txBps > peak.tx) peak.tx = d.txBps;
+    document.getElementById('lvRxPeak').innerHTML = fmtBps(peak.rx);
+    document.getElementById('lvTxPeak').innerHTML = fmtBps(peak.tx);
+
+    var rb = document.getElementById('lvRxBar');
+    var tb = document.getElementById('lvTxBar');
+    if (rb) rb.style.width = (peak.rx > 0 ? Math.max(2, d.rxBps/peak.rx*100) : 0) + '%';
+    if (tb) tb.style.width = (peak.tx > 0 ? Math.max(2, d.txBps/peak.tx*100) : 0) + '%';
+
+    setHot('lcOnline', d.onlineCount > 0);
+    setHot('lcConns', d.conns > 0);
+    setHot('lcRx', d.rxBps > 4096);
+    setHot('lcTx', d.txBps > 4096);
+
+    // ── 用户列表：只更新已有行，然后按 rank 重排 ──
+    // 不能重建行：行里有 form 和 CSRF token，重建会丢。
+    var map = {};
+    (d.list || []).forEach(function(u){ map[u.ip] = u; });
+    var body = document.querySelector('#userTable tbody');
+    if (body) {
+      Array.prototype.forEach.call(body.children, function(tr){
+        var ip = tr.getAttribute('data-ip');
+        var u = map[ip];
+        if (!u) return;
+        var on = u.online;
+        tr.setAttribute('data-on', on ? '1' : '0');
+        // rank：在线按总速率降序在前，离线按最后活动降序在后
+        tr.setAttribute('data-rank', on
+          ? String(1e9 - (u.rxBps + u.txBps))
+          : String(-(u.lastSeen || 0)));
+
+        var st = tr.querySelector('.st');
+        if (st) st.innerHTML = '<span class="dot' + (on ? '' : ' off') + '"></span>' +
+                               '<span class="stx">' + (on ? '在线' : '离线') + '</span>';
+
+        var rx = tr.querySelector('.rx');
+        var tx = tr.querySelector('.tx');
+        var cs = tr.querySelector('.cs');
+        if (rx) { rx.textContent = on ? fmtBps(u.rxBps) : '—'; rx.className = 'num rx' + (u.rxBps ? '' : ' zero'); }
+        if (tx) { tx.textContent = on ? fmtBps(u.txBps) : '—'; tx.className = 'num tx' + (u.txBps ? '' : ' zero'); }
+        if (cs) { cs.textContent = on ? u.conns : '—'; cs.className = 'num cs' + (on ? '' : ' zero'); }
+
+        // 没有心跳上报的在线用户，速率列加个提示
+        if (on && !u.reported) { if (rx) rx.title = '该客户端未上报心跳（老版本）'; }
+      });
+
+      // 重排
+      var rows = Array.prototype.slice.call(body.children);
+      rows.sort(function(a, b){
+        return (parseFloat(b.getAttribute('data-rank')) || 0) -
+               (parseFloat(a.getAttribute('data-rank')) || 0);
+      });
+      rows.forEach(function(r){ body.appendChild(r); });
+    }
+
+    var ts = document.getElementById('lvStamp');
+    ts.className = 'livestamp';
+    ts.textContent = '实时 · ' + new Date().toLocaleTimeString('zh-CN', {hour12:false});
+  }
+  function fail(msg){
+    var ts = document.getElementById('lvStamp');
+    ts.className = 'livestamp bad';
+    ts.textContent = '连接中断 · ' + msg;
+  }
+  function tick(){
+    fetch('/api/admin/live', {credentials:'same-origin', cache:'no-store'})
+      .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(render)
+      .catch(function(e){ fail(e.message || '网络错误'); })
+      .then(function(){ setTimeout(tick, 3000); });
+  }
+  tick();
+})();
+</script>
+'''
+
+
 def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
     csrf_in = f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">' if csrf else ''
     inv = db.q('SELECT * FROM invites ORDER BY id DESC LIMIT 40')
@@ -783,17 +1326,21 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   <td>{'' if r['revoked'] else f'<form method="post" action="/admin/revoke" style="display:inline">{csrf_in}<input type="hidden" name="id" value="{r["id"]}"><button class="sm ghost" type="submit">撤销</button></form>'}</td>
 </tr>""" for r in inv)
 
-    cli_rows = ''.join(f"""<tr>
+    # 行里带 data-ip / data-rank，前端按 rank 重排 DOM（不重建行，保住 CSRF）
+    cli_rows = ''.join(f"""<tr data-ip="{html.escape(r['ip'])}" data-rank="{1000000 - i}">
+  <td class="st"><span class="dot off"></span><span class="stx">离线</span></td>
   <td class="mono">{html.escape(r['ip'])}</td>
+  <td class="muted">{html.escape(r['note']) or '<span class="muted">—</span>'}</td>
+  <td class="num rx">—</td>
+  <td class="num tx">—</td>
+  <td class="num cs">—</td>
   <td>{'<span class="ok">启用</span>' if r['enabled'] else '<span class="bad">停用</span>'}</td>
-  <td class="mono" style="font-size:12px">{html.escape(r['token'])}</td>
   <td class="muted">{fmt_ts(r['last_seen']) or '从未'}</td>
-  <td class="muted">{fmt_ts(r['created_at'])}</td>
-  <td>
+  <td class="nowrap">
     <form method="post" action="/admin/toggle" style="display:inline">{csrf_in}<input type="hidden" name="ip" value="{html.escape(r['ip'])}"><button class="sm ghost" type="submit">{'停用' if r['enabled'] else '启用'}</button></form>
     <form method="post" action="/admin/resettoken" style="display:inline">{csrf_in}<input type="hidden" name="ip" value="{html.escape(r['ip'])}"><button class="sm ghost" type="submit">重置令牌</button></form>
   </td>
-</tr>""" for r in cli)
+</tr>""" for i, r in enumerate(cli))
 
     ev_rows = ''.join(
         f'<tr><td class="muted">{fmt_ts(r["ts"])}</td><td>{html.escape(r["kind"])}</td>'
@@ -802,6 +1349,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
 
     return page('渡口门户管理', f"""
 <h1>管理面板</h1>
+{LIVE_UI}
 <div class="sub">创建临时密钥 · 管理已登录的机器 ·
   <a href="/admin/unlock">查看 / 解除登录锁定</a></div>
 {msgbox}{codebox}
@@ -832,8 +1380,20 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
 
 <div class="card">
   <h2 style="margin-top:0">已登录的机器</h2>
-  <table><thead><tr><th>局域网 IP</th><th>状态</th><th>代理令牌</th><th>最后活动</th><th>注册</th><th></th></tr></thead>
-  <tbody>{cli_rows or '<tr><td colspan="6" class="muted">还没有机器登录过</td></tr>'}</tbody></table>
+  <div class="hint" style="margin:-4px 0 10px">
+    在线置顶，离线靠下。速率来自客户端每 5 秒一次的心跳；
+    老版本客户端不上报心跳，速率列显示「—」，但在线状态仍准确。
+  </div>
+  <div class="listwrap">
+  <table id="userTable">
+    <thead><tr>
+      <th>状态</th><th>局域网 IP</th><th>备注</th>
+      <th class="numh">下行</th><th class="numh">上行</th><th class="numh">连接</th>
+      <th>账号</th><th>最后活动</th><th>操作</th>
+    </tr></thead>
+    <tbody>{cli_rows}</tbody>
+  </table>
+  </div>
 </div>
 
 <div class="card">
@@ -861,6 +1421,153 @@ def admin_login_page(err='', csrf=''):
 
 
 # ─────────────────────────── 部署包生成 ───────────────────────────
+
+def installer_path():
+    """找最新的安装程序。优先 <工程根>/dist，其次门户同级的 dist。
+
+    门户每次请求都重新扫一遍（只 listdir + stat，微秒级），
+    这样 ISCC 重新编译后不用重启门户就能出新包。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    best = None
+    for d in (os.path.join(here, '..', 'dist'), os.path.join(here, 'dist')):
+        d = os.path.normpath(d)
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for f in names:
+            low = f.lower()
+            if low.startswith('ferry-setup-') and low.endswith('.exe'):
+                p = os.path.join(d, f)
+                if best is None or os.path.getmtime(p) > os.path.getmtime(best):
+                    best = p
+    return best
+
+
+def read_version_manifest():
+    """更新推送的版本清单。优先读 dist/version.json，没有就从 exe 文件名推。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (os.path.join(here, '..', 'dist'), os.path.join(here, 'dist')):
+        p = os.path.normpath(os.path.join(d, 'version.json'))
+        if os.path.exists(p):
+            try:
+                with open(p, encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    ver = '0.0.0'
+    exe = installer_path()
+    if exe:
+        m = re.search(r'Ferry-Setup-([\d.]+)\.exe$', os.path.basename(exe), re.I)
+        if m:
+            ver = m.group(1)
+    return {'latest': ver, 'url': '/download-latest',
+            'notes': '', 'built': bool(exe)}
+
+
+def build_deploy_zip(client):
+    """
+    打一个 zip：安装向导 + 全部组件 + 预填好的 config.json。
+
+    为什么用 zip 而不是单文件 .cmd：
+      · 要带 GUI（安装向导和控制面板），GUI 是独立 .ps1 文件
+      · 单文件 .cmd 只能塞 base64 的纯文本脚本，塞多个文件会变成一行几万字符的
+        怪物，任何人想改都改不了
+      · zip 解开就是干净的文件树，用户能自己看、能自己改
+    """
+    import zipfile
+    ip = client['ip']
+    tok = client['token']
+    host = CFG['public_host'] or '10.13.24.1'
+    port = CFG['port']
+
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def read_component(*cands):
+        for c in cands:
+            p = os.path.normpath(os.path.join(here, c))
+            if os.path.exists(p):
+                return open(p, 'rb').read()
+        return None
+
+    files = {}
+
+    # 组件：安装向导 / 控制面板 / 隧道保活 / 本地代理
+    for name, cands in (
+        ('client-setup.ps1',      ('client-setup.ps1',)),
+        ('渡口助手.ps1',           ('client-assistant.ps1', '渡口助手.ps1',
+                                   os.path.join('..', 'tools', '渡口助手.ps1'))),
+        ('ssh-tunnel-keeper.ps1', ('ssh-tunnel-keeper.ps1',
+                                   os.path.join('..', 'tools', 'ssh-tunnel-keeper.ps1'))),
+        ('dual-proxy.mjs',        ('dual-proxy.mjs',
+                                   os.path.join('..', 'tools', 'dual-proxy.mjs'))),
+    ):
+        data = read_component(*cands)
+        if data is None:
+            raise RuntimeError(f'组件缺失：{name}（门户目录里找不到）')
+        files[name] = data
+
+    # config.json —— 安装向导读它
+    cfg = {
+        'remoteHost': host,
+        'sshPort': CFG['ssh_port'],
+        'httpPort': port + 1,
+        'accountIp': ip,
+        'token': tok,
+        'fallbackProxy': '',
+    }
+    files['config.json'] = json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8')
+
+    # 安装.cmd —— 双击入口
+    # 用 PowerShell 直接跑安装向导，不走执行策略拦截。
+    launch = (
+        '@echo off\r\n'
+        'chcp 65001 >nul 2>&1\r\n'
+        'setlocal\r\n'
+        'cd /d "%~dp0"\r\n'
+        'if not exist "client-setup.ps1" (\r\n'
+        '  echo 找不到 client-setup.ps1，请把整个压缩包解压后再运行。\r\n'
+        '  pause\r\n'
+        '  exit /b 1\r\n'
+        ')\r\n'
+        'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "client-setup.ps1"\r\n'
+        'if errorlevel 1 pause\r\n'
+        'endlocal\r\n'
+    )
+    files['安装.cmd'] = launch.encode('gbk', errors='replace')
+
+    # 说明.txt
+    readme = (
+        '渡口 · Ferry —— 安装说明\r\n'
+        '========================================\r\n'
+        '\r\n'
+        '1. 把整个压缩包解压到任意目录（不要在压缩包里直接双击）\r\n'
+        '2. 双击「安装.cmd」\r\n'
+        '3. 跟向导走完，装完会问你要不要立即启动\r\n'
+        '\r\n'
+        f'账号（局域网 IP）：{ip}\r\n'
+        f'远端主机：{host}:{CFG["ssh_port"]}\r\n'
+        f'本地代理端口：{port + 1}\r\n'
+        '\r\n'
+        '第一次使用需要把公钥发给管理员（安装过程中会显示），之后不用再配置。\r\n'
+        '\r\n'
+        '装好后：\r\n'
+        '  · 「渡口助手」用来在借网与直连之间切换\r\n'
+        '  · 同一个程序里有「卸载」，会切回直连并删掉自启\r\n'
+        '\r\n'
+        '本工具仅用于个人学习与内网连通性测试，请遵守所在网络的使用规定。\r\n'
+    )
+    files['说明.txt'] = readme.encode('utf-8-sig')
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+    return buf.getvalue()
+
 
 def build_deploy_cmd(client):
     """
@@ -1186,28 +1893,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         try:
             if path == '/':
-                ip, _ = self.current_session()
-                if ip:
-                    self.redirect('/portal')
-                    return
+                # 首页只发软件，不再收密钥（用户要求：网页只用来获取软件）
                 ip0 = self.client_ip()
-                self.send_html(login_page(
-                    csrf=csrf_set('login|' + ip0),
-                    detected_ip=ip0,
-                    # 自动识别到非私网地址（在反向代理后面）时才亮出 IP 输入框
-                    show_ip_field=not bool(PRIVATE_IP_RE.match(ip0))))
+                self.send_html(get_page(detected_ip=ip0 if PRIVATE_IP_RE.match(ip0) else ''))
+            elif path == '/login':
+                # 老的登录入口作废，直接回首页
+                self.redirect('/')
             elif path == '/portal':
-                self.handle_portal()
-            elif path.startswith('/download/'):
+                # 登录后的门户页作废：密钥已经改到软件里，网页不再有「登录」这件事。
+                # 老用户的书签直接带回首页，别让他们看到「下载 ferry-*.cmd」那种过时内容。
+                self.redirect('/')
+            elif path == '/download-cmd':
+                self.handle_download_cmd()
+            elif path == '/download' or path.startswith('/download/'):
                 self.handle_download(path)
             elif path == '/logout':
                 self.handle_logout()
+            elif path == '/api/admin/live':
+                self.handle_api_admin_live()
             elif path == '/admin':
                 self.handle_admin()
             elif path == '/proxy.mjs':
                 self.handle_proxy_mjs()
             elif path == '/api/status':
                 self.handle_api_status()
+            elif path == '/api/config':
+                self.handle_api_config(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
+            elif path == '/api/license':
+                self.handle_api_license(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
+            elif path == '/version.json':
+                self.handle_version()
+            elif path == '/download-latest':
+                self.handle_download_latest()
             elif path == '/about':
                 self.handle_about()
             elif path == '/setup-hosts':
@@ -1269,6 +1986,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         try:
+            # 软件内激活：JSON 接口，不是浏览器表单，没有 CSRF token 可言。
+            # 防爆破靠 rate_fail（和网页登录共用 user scope）。
+            if path == '/api/activate':
+                self.handle_api_activate()
+                return
+            if path == '/api/heartbeat':
+                # 客户端心跳：JSON 接口，不走 CSRF（非浏览器表单）
+                self.handle_api_heartbeat()
+                return
             form = self.read_form()
 
             # CSRF 校验：所有 POST 都要过。
@@ -1375,16 +2101,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         # 通过：绑定 IP
+        # 授权到期时间：license_days=0 表示永久
+        days = int(CFG.get('license_days') or 0)
+        exp = 0 if days <= 0 else now() + days * 86400
+
         existing = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
         if existing:
             token = existing['token']
-            self.db.x('UPDATE clients SET enabled = 1, last_seen = ? WHERE ip = ?', (now(), ip))
+            # 重新激活 = 续期（把 expires_at 推到新的到期时间）。
+            # 不这么做的话，密钥用完之后用户永远续不了。
+            self.db.x('UPDATE clients SET enabled = 1, last_seen = ?, expires_at = ? WHERE ip = ?',
+                      (now(), exp or existing['expires_at'] or 0, ip))
         else:
             token = new_token()
             self.db.x(
-                'INSERT INTO clients (ip, token, enabled, created_at, last_seen, invite_id) '
-                'VALUES (?,?,1,?,?,?)',
-                (ip, token, now(), now(), inv['id']))
+                'INSERT INTO clients (ip, token, enabled, created_at, last_seen, invite_id, expires_at) '
+                'VALUES (?,?,1,?,?,?,?)',
+                (ip, token, now(), now(), inv['id'], exp))
 
         self.db.x('UPDATE invites SET used_by_ip = ?, used_at = ? WHERE id = ?',
                   (ip, now(), inv['id']))
@@ -1417,30 +2150,398 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 note = inv['note'] or ''
         self.send_html(portal_page(cli, note))
 
-    def handle_download(self, path):
-        ip, _ = self.current_session()
-        want = urllib.parse.unquote(path[len('/download/'):])
-        if not ip:
-            self.redirect('/')
-            return
-        # 只能下载自己的部署包，防止拿到别人的令牌
-        if ip != want:
-            self.send_html(page('拒绝', '<h1>只能下载自己的部署包</h1>'), 403)
-            return
-        cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
-        if not cli or not cli['enabled']:
-            self.send_html(page('已停用', '<h1>账号已停用</h1>'), 403)
-            return
+    def handle_download_cmd(self):
+        """.cmd 一键安装：双击后自动下载 exe 并启动，全程不碰浏览器下载通道。
 
-        data = build_deploy_cmd(cli).encode('utf-8-sig')
-        fname = f'ferry-{ip.replace(".", "-")}.cmd'
+        为什么需要它：
+          浏览器直接下 exe 会被打上 MOTW 标记，触发 SmartScreen
+          「Windows 已保护你的电脑 / 发布者未知」。而 .cmd 不在 SmartScreen
+          的检查范围里，它内部用 WebClient 拉下来的 exe 也不带 MOTW ——
+          用户只需双击一次，比手动点「更多信息 → 仍要运行」还省一步。
+
+        安全上的取舍：
+          这个脚本只做三件事：从本门户下载、Unblock-File、启动。
+          没有别的内容，用户右键「编辑」就能一眼看全。
+        """
+        host = CFG['public_host'] or '10.13.24.1'
+        base = 'http://' + host + ':' + str(CFG['port'])
+
+        ps = (
+            "$ProgressPreference='SilentlyContinue'; "
+            "try { "
+            "(New-Object Net.WebClient).DownloadFile('%URL%','%OUT%'); "
+            "Unblock-File -Path '%OUT%' -ErrorAction SilentlyContinue; "
+            "Start-Process '%OUT%' "
+            "} catch { "
+            "Write-Host ''; Write-Host ('下载失败：' + $_.Exception.Message) -ForegroundColor Red; "
+            "exit 1 }"
+        )
+
+        lines = [
+            '@echo off',
+            'chcp 65001 >nul 2>&1',
+            'setlocal',
+            'title 渡口 · 安装',
+            'echo.',
+            'echo   渡口 Ferry —— 正在准备安装',
+            'echo.',
+            'set "URL=' + base + '/download"',
+            'set "OUT=%TEMP%\\Ferry-Setup.exe"',
+            'if exist "%OUT%" del /q "%OUT%" >nul 2>&1',
+            'echo   正在下载安装程序…',
+            'powershell -NoProfile -ExecutionPolicy Bypass -Command "' + ps + '"',
+            'if errorlevel 1 (',
+            '  echo.',
+            '  echo   下载失败。请确认这台机器能访问 ' + base,
+            '  echo   或者直接用浏览器打开上面的地址手动下载。',
+            '  echo.',
+            '  pause',
+            ')',
+            'endlocal',
+        ]
+
+        data = ('\r\n'.join(lines) + '\r\n').encode('gbk', errors='replace')
         self.send_response(200)
         self.send_header('Content-Type', 'application/octet-stream')
-        self.send_header('Content-Disposition', f'attachment; filename="{fname}"')
+        self.send_header('Content-Disposition',
+                         'attachment; filename="install-ferry.cmd"; '
+                         "filename*=UTF-8''" + urllib.parse.quote('安装渡口.cmd'))
         self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
         self.end_headers()
         self.wfile.write(data)
+        self.db.log('download_cmd', self.client_ip(), 'installer-script')
+
+    def handle_download(self, path):
+        """发 Windows 安装程序（.exe）。
+
+        两种入口：
+          /download/<ip>  已登录，下自己的包（旧行为，保留兼容）
+          /download       未登录，门户首页「获取软件」按钮 —— 用来源 IP 当账号 IP。
+                          未注册的 IP 也能下：装完在软件里输入密钥激活时才建号。
+                          这就是用户要的「网页只用来获取软件」。
+
+        为什么不再是 zip：一份 exe 服务所有人 —— 账号 IP 编进**文件名**，
+        安装程序自己解析后向 /api/config 换配置，所以二进制完全一样，
+        门户不用每次重新编译。更新推送也只要换 dist 里那个 exe。
+        """
+        sess_ip, _ = self.current_session()
+        src = self.client_ip()
+
+        if path == '/download':
+            # 匿名获取：文件名带来源 IP，激活时用它绑定
+            ip = src
+            need_registered = False
+        else:
+            want = urllib.parse.unquote(path[len('/download/'):])
+            if not sess_ip:
+                self.send_html(page('请先登录',
+                    '<h1>请先登录</h1>'
+                    '<p><a href="/" style="color:var(--accent)">去首页</a></p>'), 403)
+                return
+            if sess_ip != want:
+                self.send_html(page('拒绝', '<h1>只能下载自己的部署包</h1>'), 403)
+                return
+            ip = sess_ip
+            need_registered = True
+
+        if need_registered:
+            cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
+            if not cli or not cli['enabled']:
+                self.send_html(page('已停用', '<h1>账号已停用</h1>'), 403)
+                return
+
+        exe = installer_path()
+        if exe is None:
+            self.send_html(page('未构建', '<h1>服务端还没有安装程序</h1>'
+                '<div class="sub">管理员还没构建 Ferry-Setup.exe</div>'
+                '<div class="card"><div class="kv">'
+                '<div class="k">构建命令</div>'
+                '<div class="v mono">cd installer &amp;&amp; ISCC.exe ferry.iss</div>'
+                '</div></div>'
+                '<p><a href="/" style="color:var(--accent)">返回</a></p>'), 404)
+            return
+
+        with open(exe, 'rb') as f:
+            data = f.read()
+
+        # 文件名**不再**带 IP。安装程序会自己向 /api/config（无参）问
+        # 「我是哪台机器」，比靠文件名传可靠得多：浏览器会改名、人会手改、
+        # 拖到别的机器装就全错了。只在门户连不上时才会退回文件名解析兜底，
+        # 所以文件名里带 IP 仍然有用，但只是个加分项、不是必要条件。
+        fname = 'Ferry-Setup-' + str(read_version_manifest().get('latest', '0.0.0')) + '.exe'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/vnd.microsoft.portable-executable')
+        self.send_header('Content-Disposition',
+                         f"attachment; filename=\"{fname}\"; "
+                         f"filename*=UTF-8''{urllib.parse.quote(fname)}")
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Ferry-Account', ip)
+        # 让用户/我们能核对下载是否完整
+        self.send_header('X-Ferry-Bytes', str(len(data)))
+        self.end_headers()
+        # 分块写。一次 write 2 MB 时若中途被杀软或代理掐断，
+        # 浏览器会留下一个 0 KB 或半截的残片 —— 双击时报
+        # 「此应用无法在你的电脑上运行」，用户以为是程序坏了。
+        # 64 KB 一块既快又能尽早发现中断。
+        CHUNK = 65536
+        try:
+            for i in range(0, len(data), CHUNK):
+                self.wfile.write(data[i:i + CHUNK])
+        except (BrokenPipeError, ConnectionResetError):
+            return
         self.db.log('download', ip, fname)
+
+
+    def handle_download_latest(self):
+        """通用安装包，文件名不带账号 IP。用于更新推送。
+
+        客户端已经装过一次、知道自己的 IP，安装程序会从
+        安装目录下 config.json 里的 accountIp 继承，不弹输入页。
+        """
+        exe = installer_path()
+        if exe is None:
+            self.send_json({'error': 'no installer built'}, 404)
+            return
+        with open(exe, 'rb') as f:
+            data = f.read()
+        fname = os.path.basename(exe)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/vnd.microsoft.portable-executable')
+        self.send_header('Content-Disposition', f"attachment; filename=\"{fname}\"")
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Ferry-Bytes', str(len(data)))
+        self.end_headers()
+        CHUNK = 65536
+        try:
+            for i in range(0, len(data), CHUNK):
+                self.wfile.write(data[i:i + CHUNK])
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def handle_api_config(self, qs):
+        """给 .exe 安装程序取配置。
+
+        安全边界：**只允许同一台机器查自己的配置**（client_address 必须等于
+        请求的 ip）。即使有人知道别人的局域网 IP，也拿不到别人的令牌。
+        返回体就是 config.json 原文，安装程序直接落盘。
+        """
+        want = (qs.get('ip') or [''])[0].strip()
+        src = self.client_ip()
+
+        # 不带 ip 参数 = 让服务端自己判断「你是哪台机器」。
+        # 这是最可靠的方式：client_address 就是这台机器真实的局域网 IP，
+        # 不需要靠文件名传、也不用安装程序去枚举网卡（多网卡/虚拟网卡很容易选错）。
+        # 显式传 ip 仍然支持，但要和来源一致 —— 那是「装到别的机器上」的场景。
+        if want:
+            if want != src:
+                self.send_json({'error': 'ip mismatch', 'src': src}, 403)
+                return
+        else:
+            want = src
+            if not want:
+                self.send_json({'error': 'cannot determine client ip'}, 400)
+                return
+
+        cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (want,))
+        if not cli or not cli['enabled']:
+            # 未注册不算致命错误：安装照样可以进行，用户在软件里输入密钥时才建号。
+            # 所以这里回 200 + registered=false，让安装程序能写出一份可用的 config。
+            host0 = CFG['public_host'] or '10.13.24.1'
+            self.send_json({
+                'registered': False,
+                'remoteHost': host0,
+                'sshPort': CFG['ssh_port'],
+                'httpPort': CFG['port'] + 1,
+                'accountIp': want,
+                'token': '',
+                'fallbackProxy': '',
+                'portalUrl': 'http://' + host0 + ':' + str(CFG['port']),
+            })
+            return
+
+        host = CFG['public_host'] or '10.13.24.1'
+        cfg = {
+            'registered': True,
+            'remoteHost': host,
+            'sshPort': CFG['ssh_port'],
+            'httpPort': CFG['port'] + 1,
+            'accountIp': want,
+            # token 故意留空 —— 用户明确要求「密钥在软件里输入激活」。
+            # 从安装包直接下发 token 的话，新用户装完就是「已激活」状态，
+            # 既看不到剩余时长，也绕过了激活这一步；而且安装包一旦被转发，
+            # 凭据就跟着泄露了。token 只能由 POST /api/activate 签发。
+            'token': '',
+            'fallbackProxy': '',
+            # 客户端激活密钥要用。存进 config.json 后，下次换网段也不用重装。
+            'portalUrl': 'http://' + host + ':' + str(CFG['port']),
+        }
+        self.db.log('config', want, 'installer')
+        self.send_json(cfg)
+
+
+    def handle_api_heartbeat(self):
+        """客户端每 5 秒上报一次累计字节数。鉴权与 /api/license 一致（ip + token）。
+
+        为什么需要它：Windows 拿不到 per-connection 的网络字节，
+        而管理页要显示「每个用户当前多快」。客户端自己的代理进程本来就在
+        累计 BytesUp/BytesDown，直接报上来最准、最便宜。
+        """
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+            raw = self.rfile.read(n) if n > 0 else b'{}'
+            body = json.loads(raw.decode('utf-8') or '{}')
+        except Exception:
+            self.send_json({'ok': False, 'error': 'bad json'}, 400)
+            return
+
+        ip = str(body.get('ip') or '').strip()
+        token = str(body.get('token') or '').strip()
+        if not ip or not token:
+            self.send_json({'ok': False, 'error': 'missing fields'}, 400)
+            return
+
+        cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
+        if not cli or not hmac.compare_digest(str(cli['token']), token):
+            self.send_json({'ok': False, 'error': 'unauthorized'}, 401)
+            return
+
+        try:
+            rx = max(0, int(body.get('rxBytes') or 0))
+            tx = max(0, int(body.get('txBytes') or 0))
+            conns = max(0, int(body.get('conns') or 0))
+        except Exception:
+            rx = tx = conns = 0
+
+        h = note_heartbeat(ip, rx, tx, conns, body.get('running'))
+        # 把算出来的速率回给客户端 —— 方便排查「为什么面板没数字」
+        self.send_json({'ok': True, 'rxBps': h['rxBps'], 'txBps': h['txBps']})
+
+    def handle_api_license(self, qs):
+        """查询当前授权状态与剩余时长（客户端每次启动 / 每小时调一次）。
+
+        鉴权用 (ip, token) 组合 —— 只认本机 IP 的那种写法挡不住「同一局域网
+        里别人拿到你的 token」，所以 token 也必须对上。
+
+        到期处理：这里不改库，只如实报告 enabled=0/expired=1。
+        真正的落库在 activate 续期时做 —— 让「到期」是个可逆的软状态，
+        用户续费后不用等管理员手工改库。
+        """
+        ip = (qs.get('ip') or [''])[0].strip()
+        token = (qs.get('token') or [''])[0].strip()
+
+        if not ip or not token:
+            self.send_json({'ok': False, 'error': '缺少 ip 或 token'}, 400)
+            return
+
+        cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
+        if not cli or not hmac.compare_digest(str(cli['token']), token):
+            self.send_json({'ok': False, 'error': '授权信息无效'}, 401)
+            return
+
+        exp = int(cli['expires_at'] or 0)
+        left = 0 if exp <= 0 else max(0, exp - now())
+        expired = exp > 0 and left <= 0
+        enabled = bool(cli['enabled']) and not expired
+
+        self.send_json({
+            'ok': True,
+            'enabled': enabled,
+            'expiresAt': exp,          # 0 = 永久
+            'daysLeft': 0 if exp <= 0 else int(left // 86400),
+            'hoursLeft': int(left // 3600),
+            'expired': expired,
+            'suspended': not bool(cli['enabled']),
+            'remoteHost': CFG['public_host'] or '10.13.24.1',
+            'sshPort': CFG['ssh_port'],
+            'httpPort': CFG['port'] + 1,
+        })
+
+    def handle_version(self):
+        """更新推送用的版本清单。客户端助手启动时拉一次，5 秒超时静默失败。"""
+        self.send_json(read_version_manifest())
+
+    def handle_api_activate(self):
+        """软件内用密钥激活借网权限（JSON API，不是浏览器表单）。
+
+        和网页登录**共用同一套 invites 密钥**，区别只在返回 JSON 而不是跳转：
+        用户在「渡口助手」里填密钥 → 这里校验 → 建号 → 回长期 token。
+
+        规则和网页登录完全一致（一次性、绑定激活来源 IP、限流防爆破），
+        因为两边是同一条安全边界，不能有一边松。
+        """
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+            raw = self.rfile.read(n) if n > 0 else b'{}'
+            body = json.loads(raw.decode('utf-8') or '{}')
+        except Exception:
+            self.send_json({'ok': False, 'error': '请求格式不对'}, 400)
+            return
+
+        ip = self.client_ip()
+        code = str(body.get('code') or '').strip().upper()
+
+        if not code:
+            self.send_json({'ok': False, 'error': '请输入密钥'}, 400)
+            return
+        if not re.fullmatch(r'[A-Z0-9]{6,16}', code):
+            self.send_json({'ok': False, 'error': '密钥格式不对（应为 8 位字母数字）'}, 400)
+            return
+
+        # 限流：和网页登录共用 user scope，防止用它暴力试密钥
+        st = _ratelimit.get(_rl_key('user', ip))
+        if st and st.get('locked_until', 0) > now():
+            self.send_json({'ok': False, 'error': '尝试太频繁，请 15 分钟后再试'}, 429)
+            return
+
+        inv = self.db.q1('SELECT * FROM invites WHERE code_hash = ?', (hash_code(code),))
+        if not inv:
+            rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'unknown-code')
+            self.send_json({'ok': False, 'error': '密钥无效'}, 401)
+            return
+        if inv['revoked']:
+            rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'revoked')
+            self.send_json({'ok': False, 'error': '这个密钥已被撤销'}, 401)
+            return
+        if inv['used_by_ip']:
+            rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'already-used')
+            self.send_json({'ok': False, 'error': '这个密钥已经用过了（一次性）'}, 401)
+            return
+        if inv['expires_at'] < now():
+            rate_fail(ip, 'user'); self.db.log('activate_fail', ip, 'expired')
+            self.send_json({'ok': False, 'error': '密钥已过期，请向管理员索取新的'}, 401)
+            return
+
+        # 通过：绑定 IP，建号或复活
+        existing = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
+        if existing:
+            token = existing['token']
+            self.db.x('UPDATE clients SET enabled = 1, last_seen = ? WHERE ip = ?', (now(), ip))
+        else:
+            token = new_token()
+            self.db.x(
+                'INSERT INTO clients (ip, token, enabled, created_at, last_seen, invite_id) '
+                'VALUES (?,?,1,?,?,?)',
+                (ip, token, now(), now(), inv['id']))
+
+        self.db.x('UPDATE invites SET used_by_ip = ?, used_at = ? WHERE id = ?',
+                  (ip, now(), inv['id']))
+        rate_ok(ip, 'user')
+        self.db.log('activate_ok', ip, f'invite={inv["id"]}')
+
+        self.send_json({
+            'ok': True,
+            'token': token,
+            'ip': ip,
+            'remoteHost': CFG['public_host'] or '10.13.24.1',
+            'sshPort': CFG['ssh_port'],
+            'httpPort': CFG['port'] + 1,
+            'expiresAt': exp,
+            'daysLeft': days,
+            'portalUrl': 'http://' + (CFG['public_host'] or '10.13.24.1') + ':' + str(CFG['port']),
+        })
 
     def handle_proxy_mjs(self):
         """把 dual-proxy.mjs 提供给部署包下载。文件与本脚本同目录。"""
@@ -1467,6 +2568,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.redirect('/', cookie='bn_sess=; Path=/; Max-Age=0')
 
     # ── 管理 ──
+
+    def handle_api_admin_live(self):
+        """管理面版轮询用。只有管理员能看 —— 这里会暴露谁在用。"""
+        if not self.is_admin():
+            self.send_json({'ok': False, 'error': 'forbidden'}, 403)
+            return
+        self.send_json(sample_live(self.db))
 
     def handle_admin(self):
         if not self.is_admin():
