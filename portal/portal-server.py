@@ -926,10 +926,47 @@ def get_page(detected_ip=''):
     为什么把登录表单撤掉：用户明确要求「网页只用来获取软件」。
     密钥改成软件里的激活码，网页再收一遍只会让人以为要登录两次。
 
-    下载按钮指向 /download（匿名），文件名由服务端按来源 IP 拼成
-    Ferry-Setup-<你的IP>.exe —— 安装程序从文件名解析账号，用户不用输任何东西。
+    下载区显示**当前版本号和实际文件大小**（从 dist 里现读，不是写死的常量）——
+    踩过的坑：以前写死「约 2.1 MB」，后来包涨到 16.9 MB（内嵌 mihomo），
+    提示就成了误导，用户按 2.1 MB 去核对下载完整性会以为文件坏了。
+
+    下面两个 <details> 默认折叠：历史版本 + 更新日志。
+    为什么默认折叠：普通用户只关心「点这个按钮」；版本历史和更新日志是
+    出问题或想回退时才看的。铺开会让首屏变长，重点反而被埋掉。
     """
     ip_txt = html.escape(detected_ip) if detected_ip else '你的IP'
+
+    installers = list_installers()
+    manifest = read_version_manifest()
+    latest_ver = str(manifest.get('latest') or '0.0.0')
+    latest_size = 0
+    for it in installers:
+        if it['ver'] == latest_ver:
+            latest_size = it['size']
+            break
+    if not latest_size and installers:
+        latest_size = installers[0]['size']
+        latest_ver = installers[0]['ver']
+    size_txt = human_size(latest_size) if latest_size else '未知'
+
+    # 历史版本行（不含当前版本）
+    older = [x for x in installers if x['ver'] != latest_ver]
+    if older:
+        rows = []
+        for x in older:
+            rows.append(
+                '<div style="display:flex;align-items:center;justify-content:space-between;'
+                'padding:8px 0;border-top:1px solid var(--line)">'
+                f'<div><b>v{x["ver"]}</b>'
+                f'<span class="hint" style="margin-left:8px">{human_size(x["size"])}</span></div>'
+                f'<a href="/download/version/{x["ver"]}" style="color:var(--accent);'
+                f'font-size:13px;text-decoration:none">下载</a></div>')
+        older_html = '\n'.join(rows)
+    else:
+        older_html = '<div class="hint" style="padding:8px 0">还没有更早的版本</div>'
+
+    log_html = md_to_html_brief(read_changelog())
+
     return page('获取渡口 · Ferry', f"""
 <h1>渡口 · Ferry</h1>
 <div class="sub">本机网络受限时，借一台能上网的内网主机中转流量</div>
@@ -940,14 +977,42 @@ def get_page(detected_ip=''):
     下载 Windows 客户端
   </a>
   <div class="hint" style="margin-top:14px;font-size:12.5px">
-    Ferry-Setup.exe · <b>约 2.1 MB</b> · Windows 10 / 11 · 免安装运行库
+    <b>v{html.escape(latest_ver)}</b> · Ferry-Setup-{html.escape(latest_ver)}.exe ·
+    <b>{size_txt}</b> · Windows 10 / 11 · 免安装运行库
   </div>
   <div class="hint" style="margin-top:10px;font-size:12px;line-height:1.7;
        background:var(--warnbg);color:var(--warn);padding:10px 12px;border-radius:8px">
-    下载完成后请确认文件大小约 <b>2.1 MB</b>。<br>
+    下载完成后请确认文件大小约 <b>{size_txt}</b>。<br>
     如果只有 0 KB，说明下载被中断了 —— 删掉那个文件重新点一次。
     双击 0 KB 的文件会提示「此应用无法在你的电脑上运行」。
   </div>
+</div>
+
+<div class="card">
+  <details>
+    <summary style="cursor:pointer;font-size:14px;font-weight:600;outline:none">
+      历史版本（{len(older)} 个）
+      <span class="hint" style="font-weight:400;margin-left:6px">
+        新版本有问题时可以装回旧版</span>
+    </summary>
+    <div style="margin-top:6px">
+      {older_html}
+    </div>
+  </details>
+</div>
+
+<div class="card">
+  <details>
+    <summary style="cursor:pointer;font-size:14px;font-weight:600;outline:none">
+      更新日志
+      <span class="hint" style="font-weight:400;margin-left:6px">
+        每个版本改了什么</span>
+    </summary>
+    <div style="margin-top:8px;max-height:520px;overflow:auto;
+         font-size:13px;line-height:1.75">
+      {log_html}
+    </div>
+  </details>
 </div>
 
 <div class="card">
@@ -957,8 +1022,9 @@ def get_page(detected_ip=''):
       下载后不要改名（改了也能用，安装时会让你手填 IP）。</div>
   </div></div>
   <div class="step"><div class="n">2</div><div class="t">
-    <b>双击安装</b><div class="hint">向导会问要不要建桌面图标、要不要开机自启，
-      装完可以直接启动。</div>
+    <b>双击安装</b><div class="hint">安装时会弹一次「是否允许更改设备」——
+      这是必需的，TUN 全局接管要建虚拟网卡。向导会问要不要建桌面图标、
+      要不要开机自启，装完可以直接启动。</div>
   </div></div>
   <div class="step"><div class="n">3</div><div class="t">
     <b>在软件里输入密钥</b><div class="hint">打开「渡口助手」，把管理员给你的
@@ -1658,6 +1724,178 @@ def read_version_manifest():
             'notes': '', 'built': bool(exe)}
 
 
+def list_installers():
+    """列出 dist 里所有已构建的安装包，按版本号从新到旧。
+
+    为什么要有这个：用户换机器、或新版本在他那台机器上有问题时，
+    需要能装回旧版。只保留一个「最新」等于把退路砍掉了。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    found = {}
+
+    def vkey(v):
+        parts = []
+        for x in str(v).split('.'):
+            try:
+                parts.append(int(x))
+            except ValueError:
+                parts.append(0)
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts)
+
+    for d in (os.path.join(here, '..', 'dist'), os.path.join(here, 'dist')):
+        d = os.path.normpath(d)
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            m = re.match(r'^Ferry-Setup-([\d.]+)\.exe$', n, re.I)
+            if not m:
+                continue
+            p = os.path.join(d, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            ver = m.group(1)
+            if ver not in found or st.st_mtime > found[ver]['mtime']:
+                found[ver] = {'ver': ver, 'path': p, 'size': st.st_size,
+                              'mtime': st.st_mtime, '_k': vkey(ver)}
+
+    out = sorted(found.values(), key=lambda x: x['_k'], reverse=True)
+    for x in out:
+        del x['_k']
+    return out
+
+
+def read_changelog(max_bytes=400000):
+    """读 CHANGELOG.md，返回原始文本（给门户展示更新日志用）。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (here, os.path.join(here, '..')):
+        p = os.path.normpath(os.path.join(d, 'CHANGELOG.md'))
+        if os.path.exists(p):
+            try:
+                with open(p, encoding='utf-8') as f:
+                    return f.read(max_bytes)
+            except Exception:
+                pass
+    return ''
+
+
+def inline_md(s):
+    """行内 markdown：先转义 HTML，再处理 `code` 和 **bold**。"""
+    s = html.escape(s)
+    s = re.sub(r'`([^`]+)`',
+               r'<code style="background:var(--code);padding:1px 5px;border-radius:4px;'
+               r'font-size:12px">\1</code>', s)
+    s = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', s)
+    return s
+
+
+def md_to_html_brief(md):
+    """把 CHANGELOG 的 markdown 转成极简 HTML。
+
+    为什么不引 markdown 库：门户的卖点之一是「Python 标准库零依赖」，
+    为一个更新日志引进第三方库不值得。这里只处理该文件实际用到的语法：
+    标题、列表、加粗、行内代码、代码块、水平线、段落。
+    """
+    if not md:
+        return '<div class="hint">暂无更新日志</div>'
+
+    out = []
+    in_list = False
+    in_code = False
+
+    def close_list():
+        nonlocal in_list
+        if in_list:
+            out.append('</ul>')
+            in_list = False
+
+    for raw in md.splitlines():
+        line = raw.rstrip()
+
+        if line.strip().startswith('```'):
+            close_list()
+            if in_code:
+                out.append('</pre>')
+                in_code = False
+            else:
+                out.append('<pre class="mono" style="background:var(--code);color:var(--fg);'
+                           'padding:10px 12px;border-radius:8px;overflow:auto;font-size:12px;'
+                           'line-height:1.6;margin:8px 0">')
+                in_code = True
+            continue
+        if in_code:
+            out.append(html.escape(raw))
+            continue
+
+        s = line.strip()
+        if not s:
+            close_list()
+            continue
+        if s in ('---', '***', '___'):
+            close_list()
+            out.append('<hr style="border:0;border-top:1px solid var(--line);margin:14px 0">')
+            continue
+
+        # 引用块 `> xxx`：CHANGELOG 用它写「本版说明」，不处理的话那个 `>`
+        # 会原样显示成怪字符。
+        if s.startswith('>'):
+            close_list()
+            quote = re.sub(r'^>\s?', '', s)
+            out.append('<div style="border-left:3px solid var(--accent);padding:2px 0 2px 10px;'
+                       'margin:8px 0;color:var(--muted);font-size:12.5px">' +
+                       inline_md(quote) + '</div>')
+            continue
+
+        m = re.match(r'^(#{1,4})\s+(.*)$', s)
+        if m:
+            close_list()
+            level = len(m.group(1))
+            text = html.escape(m.group(2))
+            if level <= 2:
+                out.append(f'<h3 style="margin:16px 0 6px;font-size:15px">'
+                           f'<span style="color:var(--accent)">{text}</span></h3>')
+            else:
+                out.append(f'<h4 style="margin:12px 0 4px;font-size:13.5px;'
+                           f'color:var(--accent)">{text}</h4>')
+            continue
+
+        if re.match(r'^[-*]\s+', s):
+            if not in_list:
+                out.append('<ul style="margin:6px 0;padding-left:20px;line-height:1.85">')
+                in_list = True
+            body = re.sub(r'^[-*]\s+', '', s)
+            out.append('<li>' + inline_md(body) + '</li>')
+            continue
+
+        close_list()
+        out.append(f'<p style="margin:6px 0;line-height:1.8">{inline_md(s)}</p>')
+
+    close_list()
+    if in_code:
+        out.append('</pre>')
+    return '\n'.join(out)
+
+
+def human_size(n):
+    """字节数转人看得懂的大小。"""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return '?'
+    if n >= 1024 * 1024:
+        return f'{n / (1024 * 1024):.1f} MB'
+    if n >= 1024:
+        return f'{n / 1024:.0f} KB'
+    return f'{int(n)} B'
+
+
 def build_deploy_zip(client):
     """
     打一个 zip：安装向导 + 全部组件 + 预填好的 config.json。
@@ -2095,6 +2333,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.redirect('/')
             elif path == '/download-cmd':
                 self.handle_download_cmd()
+            elif path.startswith('/download/version/'):
+                self.handle_download_version(path)
             elif path == '/download' or path.startswith('/download/'):
                 self.handle_download(path)
             elif path == '/logout':
@@ -2482,6 +2722,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.db.log('download', ip, fname)
 
+
+    def handle_download_version(self, path):
+        """下载指定历史版本：/download/version/0.8.0
+
+        为什么需要：新版本在某些机器上出问题时，用户要能装回旧版。
+        只留「最新」等于把退路砍掉。
+        """
+        ver = urllib.parse.unquote(path[len('/download/version/'):]).strip()
+        # 严格校验版本号格式，避免路径穿越（../../ 之类）
+        if not re.match(r'^[\d.]+$', ver):
+            self.send_html(page('版本号无效',
+                '<h1>版本号无效</h1><p><a href="/" style="color:var(--accent)">返回首页</a></p>'), 400)
+            return
+
+        target = None
+        for it in list_installers():
+            if it['ver'] == ver:
+                target = it
+                break
+        if target is None:
+            avail = ', '.join(x['ver'] for x in list_installers()) or '（无）'
+            self.send_html(page('没有这个版本',
+                f'<h1>没有 v{html.escape(ver)}</h1>'
+                f'<div class="sub">现有版本：{html.escape(avail)}</div>'
+                '<p><a href="/" style="color:var(--accent)">返回首页</a></p>'), 404)
+            return
+
+        try:
+            with open(target['path'], 'rb') as f:
+                data = f.read()
+        except OSError:
+            self.send_html(page('读取失败', '<h1>安装包读取失败</h1>'), 500)
+            return
+
+        fname = 'Ferry-Setup-' + ver + '.exe'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/vnd.microsoft.portable-executable')
+        self.send_header('Content-Disposition',
+                         f"attachment; filename=\"{fname}\"; "
+                         f"filename*=UTF-8''{urllib.parse.quote(fname)}")
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Ferry-Version', ver)
+        self.send_header('X-Ferry-Bytes', str(len(data)))
+        self.end_headers()
+        CHUNK = 65536
+        try:
+            for i in range(0, len(data), CHUNK):
+                self.wfile.write(data[i:i + CHUNK])
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        try:
+            self.db.log('download', self.client_ip(), fname)
+        except Exception:
+            pass
 
     def handle_download_latest(self):
         """通用安装包，文件名不带账号 IP。用于更新推送。

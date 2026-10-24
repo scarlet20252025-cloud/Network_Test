@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  渡口 Ferry 客户端 manifest
+
+  为什么需要它：
+    TUN 模式要在网络层接管全局流量，必须创建虚拟网卡 + 改路由表，
+    这要求管理员权限。没有 manifest 的话，用户得手动「右键 → 以管理员身份运行」，
+    而且从桌面快捷方式启动时那个选项不生效 —— 用户体验很差。
+
+  为什么用 requireAdministrator 而不是 highestAvailable：
+    highestAvailable 在管理员账户下不提权（直接用当前 token），
+    而普通账户下提权。这个不一致会导致「同一个 exe，不同机器行为不同」。
+    渡口的核心功能（TUN）必须提权，所以干脆统一要求管理员 ——
+    行为可预测，比「有时能有时不能」好得多。
+
+  代价：
+    · 每次启动都会弹 UAC（除非用户把 UAC 关了，或做了计划任务白名单）
+    · 不能直接双击就静默运行
+
+  为什么接受这个代价：
+    用户明确要求「软件包也在属性里配置成默认使用管理员权限启动」。
+    而且借网这个动作本身就涉及改系统代理、建网卡，提权是合理的。
+
+  dpiAware / dpiAwareness：
+    WinForms 在高 DPI 下不声明就会模糊。PerMonitorV2 是 Win10 1703+ 的标准做法。
+-->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="Ferry.Client" type="win32" />
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" />
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}" />
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}" />
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2,permonitor</dpiAwareness>
+      <!-- 长路径支持：安装目录可能被放到很深的路径下 -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

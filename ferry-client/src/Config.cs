@@ -37,6 +37,21 @@ namespace Ferry
         /// <summary>断网检测间隔（秒）。</summary>
         public int NetCheckSec = 15;
 
+        // ── TUN 模式（让不认代理的程序也走渡口）──
+        /// <summary>
+        /// 借网时同时开启 TUN（全局接管）。需要管理员权限。
+        ///
+        /// 为什么做成可选而不是默认开：
+        ///   TUN 会接管**所有**流量并改路由表。对只想让浏览器借网的用户，
+        ///   这是多余的风险（比如 TUN 起不来会短暂断网）。
+        ///   默认关，用户明确需要（打游戏、用不认代理的软件）时再开。
+        /// </summary>
+        public bool UseTun = false;
+        /// <summary>远端 UDP 中继地址（TUN 模式下 UDP 走它）。</summary>
+        public string UdpRelayHost = "";
+        /// <summary>远端 UDP 中继端口。0 = 用默认 1080。</summary>
+        public int UdpRelayPort = 1080;
+
         public bool Activated { get { return !string.IsNullOrEmpty(Token); } }
 
         public int SocksPort { get { return HttpPort - 1; } }
@@ -68,6 +83,11 @@ namespace Ferry
                 c.StartMinimized = MiniJson.Bool(d, "startMinimized", false);
                 c.AutoReconnect = MiniJson.Bool(d, "autoReconnect", true);
                 c.NetCheckSec = MiniJson.Int(d, "netCheckSec", 15);
+                c.UseTun = MiniJson.Bool(d, "useTun", false);
+                c.UdpRelayHost = MiniJson.Str(d, "udpRelayHost", "");
+                c.UdpRelayPort = MiniJson.Int(d, "udpRelayPort", 1080);
+                // UDP 中继默认跟远端同一台机（pcs 上的 Python 中继）
+                if (string.IsNullOrEmpty(c.UdpRelayHost)) c.UdpRelayHost = c.RemoteHost;
             }
             catch (Exception)
             {
@@ -76,6 +96,8 @@ namespace Ferry
             if (c.HttpPort < 1024 || c.HttpPort > 65534) c.HttpPort = 10801;
             if (c.SshPort < 1 || c.SshPort > 65535) c.SshPort = 22;
             if (c.NetCheckSec < 10 || c.NetCheckSec > 300) c.NetCheckSec = 15;
+            if (string.IsNullOrEmpty(c.UdpRelayHost)) c.UdpRelayHost = c.RemoteHost;
+            if (c.UdpRelayPort < 1 || c.UdpRelayPort > 65535) c.UdpRelayPort = 1080;
             return c;
         }
 
@@ -95,7 +117,10 @@ namespace Ferry
             sb.Append("  \"autoBorrow\": ").Append(AutoBorrow ? "true" : "false").Append(",\n");
             sb.Append("  \"startMinimized\": ").Append(StartMinimized ? "true" : "false").Append(",\n");
             sb.Append("  \"autoReconnect\": ").Append(AutoReconnect ? "true" : "false").Append(",\n");
-            sb.Append("  \"netCheckSec\": ").Append(NetCheckSec).Append("\n");
+            sb.Append("  \"netCheckSec\": ").Append(NetCheckSec).Append(",\n");
+            sb.Append("  \"useTun\": ").Append(UseTun ? "true" : "false").Append(",\n");
+            sb.Append("  \"udpRelayHost\": ").Append(Quote(UdpRelayHost)).Append(",\n");
+            sb.Append("  \"udpRelayPort\": ").Append(UdpRelayPort).Append("\n");
             sb.Append("}\n");
             var tmp = path + ".tmp";
             File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));

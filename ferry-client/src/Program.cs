@@ -44,6 +44,19 @@ namespace Ferry
                 return;
             }
 
+            // 静默装自启：给 Inno Setup 的 [Run] 用（勾了「开机自动启动」时）。
+            // 用计划任务而不是启动文件夹快捷方式 —— 后者每次开机弹 UAC。
+            if (HasArg(args, "/install-autostart") || HasArg(args, "-install-autostart"))
+            {
+                SettingsDialog.SetAutoStart(true);
+                return;
+            }
+            if (HasArg(args, "/remove-autostart") || HasArg(args, "-remove-autostart"))
+            {
+                SettingsDialog.SetAutoStart(false);
+                return;
+            }
+
             bool created;
             _mutex = new Mutex(true, @"Local\FerryClient", out created);
 
@@ -72,7 +85,9 @@ namespace Ferry
 
             try
             {
-                Application.Run(new MainForm(cfgPath, appDir));
+                var form = new MainForm(cfgPath, appDir);
+                form.StartBorrowOnLoad = HasArg(args, "/start") || HasArg(args, "-start");
+                Application.Run(form);
             }
             finally
             {
@@ -99,6 +114,11 @@ namespace Ferry
                 var cfg = Cfg.Load(cfgPath);
                 FerryCore.RestoreDirect(cfg, appDir);
                 FerryCore.StopAll(cfg, appDir);
+
+                // 清自启。两种形式都要清：
+                //   ① 计划任务（新方式，免 UAC）
+                //   ② 启动文件夹快捷方式（旧版本留下的，或计划任务失败时的回退）
+                try { SettingsDialog.SetAutoStart(false); } catch (Exception) { }
                 try
                 {
                     var startup = Environment.GetFolderPath(Environment.SpecialFolder.Startup);

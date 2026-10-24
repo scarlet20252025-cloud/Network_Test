@@ -38,6 +38,78 @@ profile:
   store-selected: false
   store-fake-ip: false
 
+# ─────────────────────────── TUN（可选，需管理员）───────────────────────────
+#
+# 为什么需要 TUN：
+#   10810 只是个 SOCKS5/HTTP 端点，只有「认代理设置」的程序能走它。
+#   多数游戏客户端、部分桌面软件直接连服务器，根本不看系统代理 ——
+#   对它们来说渡口等于不存在。
+#   TUN 在网络层截获所有流量（包括 UDP），才能做到「像普通网络一样」。
+#
+# 为什么默认关闭（tun.enable: false）：
+#   TUN 要创建虚拟网卡 + 改路由表，**必须管理员权限**。普通权限下 mihomo
+#   会报 `configure tun interface: Access denied` 然后整个进程退出 ——
+#   连带把已经能用的 SOCKS 端点也搞没了。
+#   所以做成「默认关、提权时才开」，由 mihomo-keeper.ps1 的 -Action TunOn 打开。
+#
+# 为什么用 gvisor 而不是 system 栈：
+#   gvisor 是纯用户态 TCP/IP 实现，不需要额外驱动，兼容性最好。
+#   system 栈要内核转发，实测在 Win10 上更容易撞权限/兼容问题。
+#
+# 为什么 dns-hijack 拦 53：
+#   TUN 起来后应用发 DNS 查询会被内核路由进虚拟网卡，但 mihomo 不接管的话
+#   这些包就丢了，表现是「能 ping 通 IP、但域名全部解析失败」。
+#   拦下 53 端口让 mihomo 自己按 dns 段配置解析。
+#
+# stack 三选一（实测取舍）：
+#   gvisor  —— 用户态，最稳，CPU 略高。默认用它。
+#   system  —— 内核栈，性能好，但要求更多。
+#   mixed   —— 两者折中，部分场景更快。
+tun:
+  enable: __TUN_ENABLE__
+  stack: gvisor
+  device: FerryTun
+  # 1500 是常见值。太大在部分校园网/VPN 上会分片失败，太小影响吞吐。
+  mtu: 1500
+  # auto-route：自动把默认路由指到 TUN。这是「全局接管」的关键。
+  auto-route: true
+  # auto-detect-interface：自动识别物理出口网卡，避免路由回环
+  auto-detect-interface: true
+  # strict-route：严格模式，防止流量从物理网卡漏出去（Windows 上偶有问题，
+  # 所以默认 false；如果发现「部分流量还是直连」再打开）
+  strict-route: false
+  dns-hijack:
+    - any:53
+  # 排除回环和本机链路，避免把自己的代理端口也截进去造成死循环
+  route-exclude-address:
+    - 127.0.0.0/8
+    - 169.254.0.0/16
+
+# TUN 模式下的 DNS。
+# 为什么不用系统 DNS：TUN 截了 53 端口，系统 DNS 的响应回不来。
+# 让 mihomo 自己解析，再按 rules 决定走哪条线。
+# 223.5.5.5 / 119.29.29.29 是国内公共 DNS，走 DIRECT 解析最快；
+# 需要借网的域名由 mihomo 通过代理链路解析（proxy-server-nameserver）。
+dns:
+  enable: true
+  ipv6: false
+  # fake-ip 让域名解析立刻返回（不等真实 DNS），TUN 场景下体验明显更好。
+  # 但有些程序对 fake-ip 不友好（比如自己校验 IP 的），所以 range 用标准值。
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - '+.msftconnecttest.com'
+    - '+.msftncsi.com'
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  # 解析代理服务器自己的域名时用这个（避免 fake-ip 把上游地址也劫持了）
+  proxy-server-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
 proxies:
   # 上游一：SSH 动态转发（pcs，联通出口）
   # 只支持 TCP（OpenSSH 的 -D 不实现 SOCKS5 UDP ASSOCIATE）。

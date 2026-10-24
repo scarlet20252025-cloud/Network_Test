@@ -23,6 +23,7 @@ namespace Ferry
 
         Tunnel _tunnel;
         ProxyServer _proxy;
+        TunMode _tun;
         int _httpPort, _socksPort;
         volatile bool _running;
 
@@ -45,6 +46,12 @@ namespace Ferry
         /// <summary>上行累计字节（本机 → 远端）。</summary>
         public long BytesUp { get { return _proxy == null ? 0 : _proxy.BytesUp; } }
         public long ConnActive { get { return _proxy == null ? 0 : _proxy.ConnActive; } }
+
+        /// <summary>TUN 是否在跑（全局接管模式）。</summary>
+        public bool TunRunning { get { return _tun != null && _tun.Running; } }
+        /// <summary>TUN 启动失败的原因。空字符串 = 没失败或没开。</summary>
+        public string TunError { get { return _tunError; } }
+        string _tunError = "";
 
         /// <summary>系统代理该指向的地址。</summary>
         public string BorrowServer { get { return "http://127.0.0.1:" + _httpPort; } }
@@ -101,7 +108,34 @@ namespace Ferry
 
             _running = true;
 
-            // ④ 写一份 ports.json，让管理员版 PS 工具和诊断脚本也能读到
+            // ⑤ TUN（可选）：在 SOCKS 已经跑通之后再加一层。
+            //
+            // 为什么放在最后而不是最前：
+            //   TUN 的上游就是这个 SOCKS 端口。SOCKS 没起来就开 TUN，
+            //   等于把所有流量导进一个死端口 —— 那几秒会彻底断网。
+            //   放在最后，失败了也只是「TUN 不可用」，原有 SOCKS 照常工作。
+            //
+            // 为什么失败不算整体失败：
+            //   TUN 需要管理员 + wintun.dll。缺一个就开不了，但用户借网
+            //   本身（浏览器/下载）不依赖它。所以只记 TunError，不 return。
+            if (_cfg.UseTun)
+            {
+                _tunError = "";
+                _tun = new TunMode(_cfg, _appDir, _log);
+                var terr = _tun.Start(_socksPort, _cfg.UdpRelayHost, _cfg.UdpRelayPort);
+                if (terr.Length > 0)
+                {
+                    _tunError = terr;
+                    _log("TUN 未启用：" + terr);
+                    _tun = null;
+                }
+                else
+                {
+                    _log("TUN 已启用（网卡 " + _tun.DeviceName + "）—— 全局接管生效，UDP 走低延迟链路");
+                }
+            }
+
+            // ⑥ 写一份 ports.json，让管理员版 PS 工具和诊断脚本也能读到
             WritePortState();
             return "";
         }
@@ -109,8 +143,12 @@ namespace Ferry
         public void Stop()
         {
             _running = false;
-            // 顺序：先停代理（不再接新连接），再停隧道。
-            // 反过来的话，代理会在短暂窗口里把请求发给一个已死的 SOCKS 端口。
+            // 顺序很关键，每一层都要在「它依赖的东西」之前停：
+            //   TUN（截流量）→ 代理（接连接）→ 隧道（出口）
+            // 反过来的话，会出现「TUN 还在截流量、但下面的代理已经停了」的窗口，
+            // 那几秒整机断网。
+            try { if (_tun != null) _tun.Stop(); } catch (Exception) { }
+            _tun = null;
             try { if (_proxy != null) _proxy.Stop(); } catch (Exception) { }
             _proxy = null;
             try { if (_tunnel != null) _tunnel.Stop(); } catch (Exception) { }

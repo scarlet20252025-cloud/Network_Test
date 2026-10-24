@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
   mihomo-keeper.ps1 — 渡口统一入口（常驻）
 
@@ -44,7 +44,7 @@
 #>
 [CmdletBinding()]
 param(
-  [ValidateSet('Status', 'Start', 'Stop', 'On', 'Off', 'Switch', 'Install', 'Uninstall', 'Test', 'Restart', 'Watch')]
+  [ValidateSet('Status', 'Start', 'Stop', 'On', 'Off', 'Switch', 'Install', 'Uninstall', 'Test', 'Restart', 'Watch', 'TunOn', 'TunOff', 'Elevate')]
   [string]$Action = 'Status',
   [string]$Target = 'DIRECT'
 )
@@ -83,6 +83,46 @@ $SshPort   = 22
 
 # 记录上一次用过的 SSH 端口，避免看护循环每次都重复渲染配置
 $script:LastSshPort = -1
+
+# ── TUN 状态 ──
+#
+# TUN 要管理员权限（创建虚拟网卡 + 改路由表）。所以：
+#   · 默认 false，普通权限下完全不碰 TUN，SOCKS 端点照常可用
+#   · 只有显式 -Action TunOn 且确实已提权时才开
+#   · 提权判断用 WindowsPrincipal.IsInRole，不要靠 try/catch 试探 ——
+#     试探会真的去创建网卡，失败后可能留下半成品状态
+$script:TunEnabled = $false
+$TunStatePath = Join-Path $Here 'mihomo-tun.txt'
+
+# 是否已经提权
+function Test-Admin {
+  try {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p = New-Object Security.Principal.WindowsPrincipal($id)
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  } catch { return $false }
+}
+
+# 读上次的 TUN 选择。开机自启时据此决定要不要开 TUN ——
+# 用户上次开着 TUN，重启后应该还是开着的（他提权过就有权继续开）。
+function Restore-TunState {
+  if (-not (Test-Path $TunStatePath)) { return }
+  $want = ("$(Get-Content $TunStatePath -Raw -ErrorAction SilentlyContinue)").Trim()
+  if ($want -eq '1' -and (Test-Admin)) { $script:TunEnabled = $true }
+}
+
+function Save-TunState {
+  param([bool]$On)
+  [IO.File]::WriteAllText($TunStatePath, $(if ($On) { '1' } else { '0' }), (New-Object Text.UTF8Encoding $false))
+}
+
+# TUN 虚拟网卡是否真的存在（用来判断「说开了但没生效」）
+function Test-TunAdapter {
+  try {
+    $n = Get-NetAdapter -Name 'FerryTun' -ErrorAction SilentlyContinue
+    return [bool]$n
+  } catch { return $false }
+}
 
 $StartupDir = [Environment]::GetFolderPath('Startup')
 $StartupCmd = Join-Path $StartupDir 'FerryMihomo.cmd'
@@ -213,10 +253,11 @@ function Build-Config {
     Replace('__API_PORT__', [string]$ApiPort).
     Replace('__SSH_PORT__', [string]$sshPort).
     Replace('__UDP_HOST__', $UdpHost).
-    Replace('__UDP_PORT__', [string]$UdpPort)
+    Replace('__UDP_PORT__', [string]$UdpPort).
+    Replace('__TUN_ENABLE__', $(if ($script:TunEnabled) { 'true' } else { 'false' }))
   # mihomo 要求 UTF-8 无 BOM（带 BOM 会报 yaml 解析错）
   [IO.File]::WriteAllText($ConfigPath, $out, (New-Object Text.UTF8Encoding $false))
-  Write-KLog "配置已渲染: SSH=$sshPort mixed=$MixedPort api=$ApiPort UDP=$UdpHost`:$UdpPort"
+  Write-KLog "配置已渲染: SSH=$sshPort mixed=$MixedPort api=$ApiPort UDP=$UdpHost`:$UdpPort TUN=$($script:TunEnabled)"
   return $sshPort
 }
 
@@ -440,6 +481,11 @@ function Test-WatchAlive {
 
 # ---------------- 动作 ----------------
 
+# 开机自启时先恢复上次的 TUN 选择。
+# 放在 switch 之前，这样 Start/Watch/Status 看到的都是正确状态。
+# 注意：只有当前确实提权了才会真的启用（见 Restore-TunState）。
+Restore-TunState
+
 switch ($Action) {
 
   'Status' {
@@ -459,6 +505,19 @@ switch ($Action) {
     else                        { Bad "上游 ferry-ssh: $sshPort 没在听（隧道断了）" }
 
     if (Test-PortOpen 1080) { }  # WG 的 SOCKS 在远端，本地不监听，不能这样测
+
+    Write-Host ''
+    Write-Host '--- TUN（全局接管）---'
+    $isAdmin = Test-Admin
+    if ($script:TunEnabled) {
+      if (Test-TunAdapter) { Ok "已开启（网卡 FerryTun 存在）—— 全局接管生效，UDP 走低延迟链路" }
+      elseif ($isAdmin) { Warn '配置里开了但网卡没建起来 —— 看日志，可能 mihomo 启动失败' }
+      else { Warn '配置里开了但当前不是管理员 —— mihomo 会因建网卡失败而退出' }
+    } else {
+      if ($isAdmin) { Say "未开启（当前是管理员，可直接开：.\mihomo-keeper.ps1 TunOn）" }
+      else { Say '未开启（需要管理员权限：.\mihomo-keeper.ps1 Elevate -Target TunOn）' }
+      Say '不开也能用，但只有「认代理设置」的程序生效；要有 UDP 低延迟就开 TUN'
+    }
 
     Write-Host ''
     Write-Host '--- 线路状态 ---'
@@ -736,6 +795,86 @@ start "" /min powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Byp
     finally {
       Write-KLog "watch stop pid=$PID"
       Remove-Item $WatchLock -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  # ── TUN 开关 ──
+  #
+  # TUN 让 mihomo 建虚拟网卡、接管全局路由，这样连不认代理的程序
+  # （多数游戏客户端、部分桌面软件）也走渡口。
+  #
+  # 代价是**必须管理员**。普通权限下 mihomo 会报
+  #   Start TUN listening error: configure tun interface: Access is denied.
+  # 然后整个进程退出 —— 连带把本来能用的 SOCKS 端点也搞没了。
+  # 所以这里先判权限，没权限就明确报错并给提权命令，绝不半途而废。
+  'TunOn' {
+    if (-not (Test-Admin)) {
+      Bad 'TUN 需要管理员权限'
+      Say '用这个命令提权（会弹 UAC）：'
+      Say "  .\mihomo-keeper.ps1 Elevate -Target TunOn"
+      exit 1
+    }
+    # 检查 wintun.dll —— mihomo 靠它建网卡，缺了会报一个很难懂的错
+    $wintun = Join-Path $Here 'wintun.dll'
+    if (-not (Test-Path $wintun)) {
+      Bad "缺少 wintun.dll: $wintun"
+      Say '从 Clash Verge 或 easytier 目录拷一个过来：'
+      Say '  copy "C:\Users\<你>\AppData\Local\easytier-gui\wintun.dll" mihomo\'
+      exit 1
+    }
+    $script:TunEnabled = $true
+    Save-TunState $true
+    Ok 'TUN 已启用，重启 mihomo 生效'
+    $null = Stop-Mi
+    Start-Sleep -Milliseconds 500
+    if (Start-Mi) {
+      Start-Sleep -Seconds 2
+      if (Test-TunAdapter) {
+        Ok '网卡 FerryTun 已创建 —— 所有程序现在都走渡口'
+      } else {
+        Bad 'mihomo 起来了但网卡没建出来'
+        Say "看日志: $LogPath"
+        Say '常见原因：wintun.dll 版本不匹配，或被杀软拦了'
+      }
+    } else {
+      Bad '重启失败 —— 看日志，可能要 TunOff 回到 SOCKS 模式'
+      $script:TunEnabled = $false
+      Save-TunState $false
+    }
+  }
+
+  'TunOff' {
+    $script:TunEnabled = $false
+    Save-TunState $false
+    Ok 'TUN 已关闭，回到 SOCKS/HTTP 端点模式（127.0.0.1:10810）'
+    $null = Stop-Mi
+    Start-Sleep -Milliseconds 500
+    $null = Start-Mi
+  }
+
+  # 提权自己再跑一次指定动作。
+  #
+  # 为什么用 RunAs 而不是让用户自己开管理员 PowerShell：
+  # 用户的目标是「便捷」。让他去找「以管理员身份运行」、再 cd 到目录、
+  # 再敲命令，就已经不算便捷了。这里一次 UAC 点击搞定。
+  'Elevate' {
+    # PS 5.1 不允许 `$var = if (...) {...} else {...}` 这种把 if 当表达式用，
+    # 必须先用默认值再覆盖。这个坑在项目里已经踩过一次（docs/踩坑记录.md 第 2 条）。
+    $t = 'TunOn'
+    if ($Target -and $Target -ne 'DIRECT') { $t = $Target }
+
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    # PS 5.1 也不支持 `$Here'\xxx'` 这种相邻拼接，用 Join-Path。
+    $selfPath = Join-Path $Here 'mihomo-keeper.ps1'
+    $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Action {1}' -f $selfPath, $t
+    $psi.Verb = 'runas'          # 触发 UAC
+    $psi.UseShellExecute = $true
+    try {
+      $null = [Diagnostics.Process]::Start($psi)
+      Ok "已请求提权（动作 $t）—— 在弹出的 UAC 窗口点「是」"
+    } catch {
+      Warn "提权被取消或失败: $($_.Exception.Message)"
     }
   }
 }

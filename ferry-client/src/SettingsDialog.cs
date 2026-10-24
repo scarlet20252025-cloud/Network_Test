@@ -29,6 +29,7 @@ namespace Ferry
         CheckBox _chkAutoBorrow;
         CheckBox _chkMinimized;
         CheckBox _chkReconnect;
+        CheckBox _chkTun;
         NumericUpDown _numInterval;
         Label _lblHint, _lblVer;
 
@@ -54,10 +55,45 @@ namespace Ferry
             return Path.Combine(StartupDir(), "渡口自动启动.lnk");
         }
 
-        /// <summary>开机自启是不是已经开着 —— 以 Startup 目录里有没有那个快捷方式为准。</summary>
+        // 计划任务名。为什么用计划任务而不是启动文件夹快捷方式：
+        //
+        // 客户端的 app.manifest 声明了 requireAdministrator（TUN 要建网卡）。
+        // 如果自启还是往启动文件夹放 .lnk，每次开机都会弹一个 UAC 窗口 ——
+        // 用户必须点「是」才能用，这跟「便捷」完全相反，而且离开电脑就借不了网。
+        //
+        // 计划任务勾「以最高权限运行」后，由 Task Scheduler 直接以提权令牌启动，
+        // **不弹 UAC**。前提是这个任务本身是由管理员创建的 —— 安装/首次保存设置
+        // 时客户端已经是管理员（manifest 保证），所以能建。
+        const string TaskName = "FerryAutoStart";
+
+        /// <summary>开机自启是不是已经开着 —— 计划任务或旧的启动文件夹快捷方式，任一存在即算。</summary>
         public static bool AutoStartOn()
         {
-            try { return File.Exists(StartupLnk()); }
+            try
+            {
+                if (File.Exists(StartupLnk())) return true;
+                return TaskExists();
+            }
+            catch (Exception) { return false; }
+        }
+
+        static bool TaskExists()
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("schtasks.exe", "/Query /TN \"" + TaskName + "\"");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (var p = Process.Start(psi))
+                {
+                    p.StandardOutput.ReadToEnd();
+                    p.StandardError.ReadToEnd();
+                    p.WaitForExit(8000);
+                    return p.ExitCode == 0;
+                }
+            }
             catch (Exception) { return false; }
         }
 
@@ -65,27 +101,74 @@ namespace Ferry
         {
             try
             {
+                // 无论开还是关，先把旧的启动文件夹快捷方式清掉 ——
+                // 那是弹 UAC 的元凶，留着就会和计划任务打架。
                 var lnk = StartupLnk();
+                if (File.Exists(lnk)) { try { File.Delete(lnk); } catch (Exception) { } }
+
                 if (!on)
                 {
-                    if (File.Exists(lnk)) File.Delete(lnk);
+                    RunHidden("schtasks.exe", "/Delete /TN \"" + TaskName + "\" /F");
                     return;
                 }
+
                 var exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "渡口助手.exe");
                 if (!File.Exists(exe)) return;
 
-                // 用 WScript.Shell 建快捷方式 —— 这是 .NET Framework 里唯一不引第三方库的写法
-                var t = Type.GetTypeFromProgID("WScript.Shell");
-                if (t == null) return;
-                dynamic sh = Activator.CreateInstance(t);
-                dynamic sc = sh.CreateShortcut(lnk);
-                sc.TargetPath = exe;
-                sc.WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory;
-                sc.Description = "渡口 · 开机自动就绪";
-                sc.WindowStyle = 7;   // 7 = 最小化启动
-                sc.Save();
+                // /RL HIGHEST = 以最高权限运行（这就是免 UAC 的关键）
+                // /SC ONLOGON = 登录时触发
+                // /F = 已存在就覆盖，保证重复保存设置不会失败
+                var args = "/Create /TN \"" + TaskName + "\" /TR \"\\\"" + exe + "\\\"\" " +
+                           "/SC ONLOGON /RL HIGHEST /F";
+                var code = RunHidden("schtasks.exe", args);
+
+                if (code != 0)
+                {
+                    // 计划任务建失败（极少见：组策略禁用了任务计划）。
+                    // 退回到启动文件夹 —— 会弹 UAC，但至少能用。
+                    // 这种情况必须告诉用户，不能静默降级。
+                    var t = Type.GetTypeFromProgID("WScript.Shell");
+                    if (t != null)
+                    {
+                        dynamic sh = Activator.CreateInstance(t);
+                        dynamic sc = sh.CreateShortcut(lnk);
+                        sc.TargetPath = exe;
+                        sc.WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory;
+                        sc.Description = "渡口 · 开机自动就绪";
+                        sc.WindowStyle = 7;
+                        sc.Save();
+                    }
+                    MessageBox.Show(
+                        "无法创建计划任务（可能被组策略禁用），已退回启动文件夹方式。\r\n\r\n" +
+                        "区别：启动文件夹方式每次开机都会弹一次「是否允许此应用更改你的设备」，" +
+                        "需要你点「是」才能就绪。\r\n\r\n" +
+                        "如果不想每次点，可以在「设置 → 是否开启全局接管」里关掉 TUN，\r\n" +
+                        "改用普通权限运行本程序（此时不需要管理员，也不会弹窗）。",
+                        "渡口", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
             }
             catch (Exception) { }
+        }
+
+        /// <summary>跑一个不显示窗口的命令，返回退出码。失败返回 -1。</summary>
+        static int RunHidden(string file, string args)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo(file, args);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (var p = Process.Start(psi))
+                {
+                    p.StandardOutput.ReadToEnd();
+                    p.StandardError.ReadToEnd();
+                    p.WaitForExit(15000);
+                    return p.HasExited ? p.ExitCode : -1;
+                }
+            }
+            catch (Exception) { return -1; }
         }
 
         void BuildUi()
@@ -112,7 +195,7 @@ namespace Ferry
             Controls.Add(card);
 
             _chkAutoStart = MakeCheck("开机自动启动",
-                "登录 Windows 后自动就绪（收在托盘，不弹窗）", 16);
+                "登录 Windows 后自动就绪（收在托盘，不弹窗）。用计划任务实现，不会弹 UAC", 16);
             _chkAutoStart.Checked = AutoStartOn();
             card.Controls.Add(_chkAutoStart);
 
@@ -130,6 +213,15 @@ namespace Ferry
                 "远端重启、网络中抖时自动恢复（退避 5 秒起，最长 60 秒）", 172);
             _chkReconnect.Checked = _cfg.AutoReconnect;
             card.Controls.Add(_chkReconnect);
+
+            // TUN：让不认系统代理的程序也走渡口，并且让 UDP 走低延迟链路。
+            // 需要管理员权限 —— 客户端的 manifest 已声明 requireAdministrator，
+            // 但用户可能是从旧快捷方式/命令行起的，所以运行时还要再判一次。
+            _chkTun = MakeCheck("UDP低延迟模式（全局接管）",
+                "在网络层截获全部流量，不认代理的程序也走渡口，UDP 走低延迟链路。" +
+                "需要管理员权限；开启后短暂断网属正常（路由表重建）", 224);
+            _chkTun.Checked = _cfg.UseTun;
+            card.Controls.Add(_chkTun);
 
             var lblIv = Theme.Text2("断网检测间隔", Theme.FSmall, Theme.Text);
             lblIv.SetBounds(24, 368, 130, 20);
@@ -226,7 +318,7 @@ namespace Ferry
         {
             base.OnLoad(e);
             // 把每条 checkbox 的说明文字挂到同一个父容器
-            foreach (var c in new[] { _chkAutoStart, _chkAutoBorrow, _chkMinimized, _chkReconnect })
+            foreach (var c in new[] { _chkAutoStart, _chkAutoBorrow, _chkMinimized, _chkReconnect, _chkTun })
             {
                 var h = c.Tag as Label;
                 if (h != null && c.Parent != null && h.Parent == null)
@@ -308,6 +400,22 @@ namespace Ferry
             _cfg.StartMinimized = _chkMinimized.Checked;
             _cfg.AutoReconnect = _chkReconnect.Checked;
             _cfg.NetCheckSec = (int)_numInterval.Value;
+
+            // TUN 勾了但没管理员权限：明确告诉用户会怎样，不要静默保存。
+            // 静默保存的结果是「用户以为开了，实际每次借网都失败」。
+            if (_chkTun.Checked && !TunMode.IsAdmin())
+            {
+                var r = MessageBox.Show(this,
+                    "「UDP低延迟模式（全局接管）」需要管理员权限。\r\n\r\n" +
+                    "当前不是管理员，开启后借网时 TUN 会启动失败（浏览器等认代理的程序仍能正常借网，" +
+                    "但不认代理的程序和 UDP 走不了渡口）。\r\n\r\n" +
+                    "建议：关闭本程序，右键「以管理员身份运行」后重新勾选。\r\n\r\n" +
+                    "要现在就保存这个设置吗？",
+                    "需要管理员权限", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                if (r != DialogResult.Yes) { return; }
+            }
+            _cfg.UseTun = _chkTun.Checked;
+
             try { _cfg.Save(_cfgPath); }
             catch (Exception e)
             {
