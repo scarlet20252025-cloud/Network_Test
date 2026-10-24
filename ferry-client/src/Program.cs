@@ -85,6 +85,21 @@ namespace Ferry
 
             try
             {
+                // 初始化 Job Object：之后启动的所有子进程（ssh、mihomo）都放进去，
+                // 本进程一退出（包括被强杀）Windows 自动回收它们。
+                // 失败不致命 —— 只是失去自动清理，记一行日志继续。
+                if (!JobKeeper.Ensure(System.Diagnostics.Process.GetCurrentProcess()))
+                {
+                    try
+                    {
+                        File.AppendAllText(Path.Combine(appDir, "assistant.log"),
+                            DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
+                            " [警告] Job Object 创建失败，客户端被强杀时可能残留子进程" +
+                            Environment.NewLine);
+                    }
+                    catch (Exception) { }
+                }
+
                 var form = new MainForm(cfgPath, appDir);
                 form.StartBorrowOnLoad = HasArg(args, "/start") || HasArg(args, "-start");
                 Application.Run(form);
