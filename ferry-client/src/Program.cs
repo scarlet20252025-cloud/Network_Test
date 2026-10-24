@@ -100,6 +100,29 @@ namespace Ferry
                     catch (Exception) { }
                 }
 
+                // 安装器留的「想要开机自启」标记。
+                //
+                // 为什么用标记文件而不是 /install-autostart 传参：
+                //   安装器调 exe 时它自己已经提权，而本 exe 的 manifest 也是
+                //   requireAdministrator —— 从高完整性进程用 CreateProcess 启动
+                //   同样要求提权的 exe 会失败，报
+                //     CreateProcess 失败；错误代码 740。请求的操作需要提升。
+                //   用户装的时候会看到一个报错框（但程序还能启动，因为另一条
+                //   [Run] 走 ShellExecute）。改成标记文件就彻底避开了这个坑。
+                //
+                // 本进程此刻已经是管理员，建 RunLevel=HighestAvailable 的计划任务
+                // 不会有任何问题。
+                try
+                {
+                    var mark = Path.Combine(appDir, ".want-autostart");
+                    if (File.Exists(mark))
+                    {
+                        File.Delete(mark);
+                        SettingsDialog.SetAutoStart(true);
+                    }
+                }
+                catch (Exception) { }
+
                 var form = new MainForm(cfgPath, appDir);
                 form.StartBorrowOnLoad = HasArg(args, "/start") || HasArg(args, "-start");
                 Application.Run(form);
