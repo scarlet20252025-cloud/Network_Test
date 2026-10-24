@@ -1,3 +1,66 @@
+## v0.10.0 — 2026-10-24
+
+> 工具层新增，客户端 exe / 安装包仍是 0.8.0。**不需要重新打包**。
+
+### UDP 打通：整条链路第一次能承载游戏和 QUIC
+
+之前两条上游都只实现 SOCKS5 `CONNECT`（`ssh -D` 在协议层面不支持
+`UDP ASSOCIATE`；`ferry-socks5-server.py` v1 第 90 行 `if cmd != 1: 拒绝`），
+所以游戏、QUIC、部分视频通话全部不能用。这不是配置问题，是能力缺失。
+
+三条路里选了对成本最低的一条：
+
+| 方案 | 结论 |
+|---|---|
+| 远端加 NAT（WinNAT） | ❌ 两台 Windows 都缺 WMI 提供程序 `0x80041010 WBEM_E_INVALID_CLASS` |
+| pcs 装 mihomo 开 socks inbound | ⚠️ 可行（已验证支持 UDP ASSOCIATE），但二进制 61 MB |
+| **升级现有 Python 服务端** | ✅ 16 KB → 17 KB，pcs 已有 Python 3.14，零新增依赖 |
+
+`wireguard/ferry-socks5-server.py` v2 新增 `UDP ASSOCIATE`（RFC 1928 CMD=0x03）：
+- 每个关联两个独立 UDP socket（client_sock / target_sock），结构上不会混淆
+- 回包用**实际收到包的源地址**，不是 TCP 控制连接的源地址
+  （踩过的坑：日志显示上下行都正常、客户端全超时，因为 UDP socket 是
+  独立创建的，源端口和 TCP 端口不是一个）
+- 关联生命周期绑定控制连接，客户端断开就回收
+
+**关键前提（已实测）**：校园网没有只放行 TCP。本机 `10.141.59.235` 到
+pcs `10.13.24.1` 的 UDP 直通，5/5 通、平均 6.8ms。这个前提不成立则方案作废，
+所以它被写成第一个要验证的事（`probe-udp.py`）。
+
+### 一键部署（`mihomo/install-all.ps1`）
+
+用户的目标是「便捷好用」，所以一个脚本做完六件事，每步都有 `[OK]`/`[X]`：
+环境检查 → 远端可达性 → 部署 UDP 中继 → 配本机统一入口 → 端到端验证 → 建快捷方式。
+
+跑完桌面多两个图标：**渡口借网** / **渡口恢复直连**。
+之后双击即可，不需要看任何命令。**不需要管理员权限**。
+
+### 单一自启入口（架构修正）
+
+之前启动文件夹有**两个**自启项（`BorrowNetKeeper.cmd` 拉 ssh-tunnel-keeper，
+`FerryMihomo.cmd` 拉 mihomo），各自探测端口、各自拉进程。实测出现：
+① 两个抢端口，后起的绑不上，隧道时通时断；② `ssh-tunnel-keeper` 根本没在跑
+（某次开机后 10801 是**手动**起的），mihomo 连着一条没人保活的隧道。
+
+现在只留 `FerryMihomo.cmd`，跑 `-Action Watch`，由它统一负责整条链：
+SSH 隧道不在就自己拉、mihomo 不在就拉起、上游端口变了就重渲染配置。
+`Install` 会自动清掉旧的 `BorrowNetKeeper.cmd`（只删渡口自己的）。
+
+### 其它
+
+- `mihomo/config.template.yaml`：新增 `ferry-udp` 节点与 `ferry-udp-group` 组，
+  规则加 `NETWORK,udp,ferry-udp-group`。UDP 必须独立成组 —— `ferry` 组里的
+  `ferry-ssh`/`ferry-wg` 都是 `udp: false`，选到它们时 UDP 包被静默丢弃。
+- 两个上游的 `udp: true` 改成 `false`：写 true 会让 mihomo 真的去试，
+  每个 UDP 包先失败再回落，反而更慢。明确关掉更诚实。
+- 新增验证工具：`verify-udp-path.py`（完整链路）、`socks5-udp-test.py`
+  （直连测服务端）、`probe-udp.py`（出站 UDP）、`udp-echo.py`/`udp-probe.py`。
+- 删除无用的 `geoip.dat` / `geosite.dat`（20 MB，规则里一条 GEOIP 都没有）。
+
+详见 [docs/一键部署与UDP.md](docs/一键部署与UDP.md)。
+
+---
+
 ## v0.9.0 — 2026-10-24
 
 > 本版是**工具层**新增（`mihomo/` 目录），客户端 exe 与安装包仍是 0.8.0，

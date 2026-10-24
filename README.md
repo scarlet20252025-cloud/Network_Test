@@ -68,20 +68,28 @@ powershell -ExecutionPolicy Bypass -File tools\渡口助手.ps1
 
 托盘常驻，状态卡 + 链路明细 + 日志窗。
 
-### 方式 D：统一入口（推荐自用，一条命令切换线路）
-
-把「直连 / SSH→pcs / WG→xt」合成**一个固定端点** `127.0.0.1:10810`
-（HTTP + SOCKS5 同端口），自动选活的线路、自动切换、崩溃自动恢复。
+### 方式 D：一键部署（**推荐**，装一次之后只看两个图标）
 
 ```powershell
 cd mihomo
-.\mihomo-keeper.ps1 On        # 借网（自动选活线路）
-.\mihomo-keeper.ps1 Status    # 看三态出口、当前线路、看护状态
-.\mihomo-keeper.ps1 Off       # 恢复直连
-.\mihomo-keeper.ps1 Install   # 装登录自启
+powershell -NoProfile -ExecutionPolicy Bypass -File install-all.ps1
 ```
 
-**不动系统代理**，只提供端点。详见 [docs/统一入口.md](docs/统一入口.md)。
+一个脚本做完：环境检查 → 部署远端 UDP 中继 → 配本机统一入口 → 端到端验证
+→ 建桌面快捷方式。**不需要管理员权限**。
+
+跑完桌面多两个图标，之后双击即可：
+
+| 图标 | 作用 |
+|---|---|
+| **渡口借网** | 开启借网。TCP 走 SSH→pcs（联通出口），UDP 走 pcs 中继，自动分流 |
+| **渡口恢复直连** | 关闭借网 |
+
+需要代理的程序填 **`127.0.0.1:10810`**（HTTP + SOCKS5 同端口）。
+**系统代理不会被改动**，你原来的 Clash Verge 照常工作。
+
+支持 UDP（游戏 / QUIC）—— 这是整条链路第一次具备这个能力。
+详见 [docs/一键部署与UDP.md](docs/一键部署与UDP.md)。
 
 ---
 
@@ -184,10 +192,14 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 
 | 文件 | 作用 |
 |---|---|
-| `mihomo/mihomo-keeper.ps1` | 主控：启停、借网开关、看护循环、自启安装 |
+| `mihomo/install-all.ps1` | **一键部署**（环境检查→远端中继→本机配置→验证→快捷方式） |
+| `mihomo/mihomo-keeper.ps1` | 主控：启停、借网开关、看护循环（含 SSH 隧道自管理）、自启安装 |
 | `mihomo/config.template.yaml` | mihomo 配置模板（端口占位符启动时渲染） |
 | `mihomo/mihomo-state.txt` | 记住上次选择，崩溃恢复后保持借网状态 |
-| `mihomo/wintun.dll` | TUN 备用（现阶段用不上，需要管理员） |
+| `mihomo/verify-udp-path.py` | 完整 UDP 链路验证（10810 → 中继 → 互联网） |
+| `mihomo/socks5-udp-test.py` | 直连测某 SOCKS5 服务端的 UDP ASSOCIATE |
+| `mihomo/probe-udp.py` | 测出站 UDP 是否可用 |
+| `wireguard/deploy-udp-relay.ps1` | 远端 UDP 中继部署（在 pcs 上跑） |
 
 ### 多用户
 
@@ -235,7 +247,8 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 | 文档 | 内容 |
 |---|---|
 | [docs/实测数据.md](docs/实测数据.md) | **全部实测数据**：可达性 / 抖动 / 带宽多源对比 / DNS / 稳定性 / 断网验证 |
-| [docs/踩坑记录.md](docs/踩坑记录.md) | 27 条实测踩坑，每条都有「为什么」和「怎么做」 |
+| [docs/踩坑记录.md](docs/踩坑记录.md) | 33 条实测踩坑，每条都有「为什么」和「怎么做」 |
+| [docs/一键部署与UDP.md](docs/一键部署与UDP.md) | **一键部署 + UDP 打通**：方案对比、实测数据、6 个新坑 |
 | [docs/统一入口.md](docs/统一入口.md) | mihomo 常驻方案：端点、看护、状态持久化、自启编码三条硬要求 |
 | [docs/多人使用管理.md](docs/多人使用管理.md) | 接入架构、管理命令、面板字段、认证与配额 |
 | [docs/断网验证方法.md](docs/断网验证方法.md) | 三种验证方式、四类断网类型判定表 |
@@ -265,16 +278,19 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 5. **令牌是明文存在 `users.json` 里**
    这台机器本身要管好，不要把该文件同步到公开仓库。
 
-6. **统一入口只有 TCP，不是「普通网络」**
-   两个上游（OpenSSH `-D`、`ferry-socks5-server.py`）都只实现 SOCKS5 CONNECT，
-   UDP 走不通 —— 游戏、QUIC、部分视频通话不能用。它只是一个 SOCKS5/HTTP
-   端点，只覆盖「认代理设置」的程序。要全局透明代理必须 TUN，而 TUN 需要
-   管理员（实测 `Access is denied`）。
+6. **统一入口的 TCP 和 UDP 走不同线路**
+   TCP 走 SSH→pcs（实测 5.2–9.3 MB/s 最稳），UDP 走 pcs 上的 Python 中继。
+   两条各管一段，规则里用 `NETWORK,udp` 分流。
 
 7. **WG 线路的出口与直连相同**
-   实测两路出口都是 116.23.159.136（电信）。`ferry-wg` 节点保留是为了将来
-   接 UDP，不是因为它能换运营商。**换出口靠 SSH→pcs 的联通线路**
-   （218.107.0.47）。
+   实测两路出口都是 116.23.159.136（电信）。`ferry-wg` 节点保留是为了 TCP 冗余，
+   不是因为它能换运营商。**换出口靠 SSH→pcs 的联通线路**（218.107.0.47）。
+
+8. **仍然不是「全局透明代理」**
+   10810 是个 SOCKS5/HTTP 端点，只覆盖「认代理设置」的程序。要让不认代理的
+   程序（多数游戏客户端）也走，需要 TUN，而 TUN 需要管理员
+   （实测 `configure tun interface: Access denied`）。
+   **UDP 能力已经打通**（中继层），但要走 TUN 还得提权。
 
 ---
 

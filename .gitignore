@@ -47,8 +47,7 @@ mihomo/config.yaml
 mihomo/cache.db
 mihomo/mihomo-state.txt
 mihomo/*.lock
-# wintun.dll 是第三方二进制（427 KB），现阶段 TUN 用不上（需管理员）。
-# 真要用时从 C:\Users\<你>\AppData\Local\easytier-gui\wintun.dll 拷过来。
+mihomo/*.pid
 mihomo/wintun.dll
 
 versions/
