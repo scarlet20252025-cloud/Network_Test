@@ -1004,6 +1004,10 @@ def sample_live(db):
             # 还有多少台机器在走 SSH 隧道（老客户端），用来判断升级情况
             'tunnelConns': sum(peers.values()),
         }
+        # 载荷信息：当前速率 vs 出口带宽 vs 每人配额
+        _rc = read_rate_conf()
+        data['net'] = load_state(data['rxBps'], data['txBps'],
+                                 data['onlineCount'], _rc['perIp'], _rc['total'])
         _live_cache['data'] = data
         _live_cache['at'] = t
         return data
@@ -1446,6 +1450,110 @@ html[data-theme="light"] .arw.up{color:#d97706}
 .notecell .notein.saving{opacity:.6}
 .notecell .notein.bad{border-color:var(--err)}
 
+/* ── 载荷仪表 ──
+   三段配色跟「在线/拥挤/饱和」对应，条上的两个刻度线就是边界，
+   用户不用记阈值，看指针落在哪一段就知道。 */
+.gauge{flex:1 1 460px;min-width:280px;max-width:620px}
+.gauge-top{display:flex;align-items:baseline;gap:8px;margin-bottom:7px;flex-wrap:wrap}
+.gauge-lab{font-size:12px;color:var(--fg2);letter-spacing:.3px}
+.gauge-val{font-size:22px;font-weight:700;font-family:Consolas,Monaco,monospace;
+  line-height:1;transition:color .3s}
+.gauge-cap{font-size:12px;color:var(--fg2);font-family:Consolas,Monaco,monospace}
+.gauge-tag{font-size:11.5px;padding:2px 8px;border-radius:99px;
+  background:var(--line);color:var(--fg2);margin-left:auto;white-space:nowrap}
+.gauge-tag.ok{background:var(--okbg);color:var(--ok)}
+.gauge-tag.warn{background:var(--warnbg);color:var(--warn)}
+.gauge-tag.hot{background:var(--errbg);color:var(--err)}
+
+.gauge-bar{position:relative;height:10px;border-radius:6px;overflow:hidden;
+  background:var(--line)}
+.gauge-fill{height:100%;width:0;border-radius:6px;
+  background:linear-gradient(90deg,var(--ok),var(--ok));
+  transition:width .45s ease,background .35s}
+.gauge-fill.ok{background:linear-gradient(90deg,#2ecc8f,#3ddc97)}
+.gauge-fill.warn{background:linear-gradient(90deg,#e0a33a,#ffb547)}
+.gauge-fill.hot{background:linear-gradient(90deg,#e05555,#ff6b6b)}
+/* 两条边界刻度：60% 和 85% */
+.gauge-mark{position:absolute;top:0;bottom:0;width:1px;background:var(--bg);
+  opacity:.75;z-index:2}
+.gauge-mark.hot{background:var(--bg);opacity:.9}
+
+.gauge-foot{display:flex;gap:16px;margin-top:7px;font-size:11.5px;
+  color:var(--fg2);flex-wrap:wrap;font-family:Consolas,Monaco,monospace}
+
+/* ── 右侧带宽控制台 ──
+   ⚠ 用 overlay，不给 body 加 padding。
+      踩过的坑：一开始写 `body.has-netctl .wrap{padding-right:330px}`，
+      结果整个页面内容被压窄、居中位置也偏了 —— 侧边栏是加上了，
+      但把主体挤变形，得不偿失。
+      改成浮层之后主体**位置和宽度完全不变**，盖住的只是页面右边
+      本来就不放内容的留白区。
+   · 宽屏（>=1280）：浮在右侧
+   · 窄屏：变成普通卡片落到内容上方（这时浮层会真的压住内容）
+   · 任何时候都能点标题右侧的箭头收起 */
+.netctl{position:fixed;top:0;right:0;bottom:0;width:320px;z-index:80;
+  background:var(--card);border-left:1px solid var(--line);
+  padding:16px 15px 22px;overflow-y:auto;
+  box-shadow:-8px 0 28px rgba(0,0,0,.22);
+  transition:transform .25s ease}
+.netctl.collapsed{transform:translateX(320px)}
+
+.netctl *{box-sizing:border-box}
+.netctl-head{display:flex;align-items:center;gap:8px;margin:0 0 4px}
+.netctl-head h3{margin:0;font-size:14px;flex:1 1 auto}
+.netctl-toggle{flex:0 0 auto;width:24px;height:24px;padding:0;
+  background:var(--card2);border:1px solid var(--line2);border-radius:6px;
+  color:var(--fg2);cursor:pointer;font-size:12px;line-height:1;
+  display:inline-flex;align-items:center;justify-content:center}
+.netctl-toggle:hover{color:var(--accent);border-color:var(--accent)}
+
+/* 收起后留一个贴边的小把手，方便再点开 */
+.netctl-handle{position:fixed;right:0;top:50%;transform:translateY(-50%);
+  z-index:81;width:22px;height:60px;border-radius:8px 0 0 8px;
+  background:var(--accent);color:#06120f;border:0;cursor:pointer;
+  font-size:12px;font-weight:700;display:none;align-items:center;
+  justify-content:center;box-shadow:-3px 0 12px rgba(0,0,0,.25)}
+.netctl-handle.show{display:flex}
+
+@media(max-width:1279px){
+  /* 窄屏：浮层会真的压到内容，改成静态块放在最上面 */
+  .netctl{position:static;width:auto;border:1px solid var(--line);
+    border-radius:14px;margin:0 0 16px;box-shadow:none;
+    transform:none;max-width:640px}
+  .netctl.collapsed{transform:none}
+  .netctl-handle{display:none !important}
+  .netctl .netctl-fold{display:none}   /* 窄屏时收起没意义，内容直接展开 */
+}
+
+.netctl h3{margin:0 0 4px;font-size:14px}
+.netctl .sub2{font-size:11.5px;color:var(--fg2);line-height:1.6;margin-bottom:14px}
+.netctl .field{margin-bottom:12px}
+.netctl .field label{display:block;font-size:12px;color:var(--fg2);margin-bottom:5px}
+.netctl .field .rowline{display:flex;align-items:center;gap:6px;
+  width:100%;box-sizing:border-box;min-width:0}
+/* input 必须 min-width:0 + width:100%，否则 flex 项不会收缩到内容宽度以下，
+   单位「MB/s」会被挤出侧边栏外（实测就是这样）。 */
+.netctl input[type=number]{flex:1 1 auto;min-width:0;width:100%;
+  box-sizing:border-box;padding:7px 9px;font-size:13px;
+  background:var(--card2);border:1px solid var(--line2);border-radius:8px;
+  color:var(--fg);font-family:Consolas,Monaco,monospace}
+.netctl input[type=number]:focus{outline:none;border-color:var(--accent)}
+.netctl .unit{flex:0 0 auto;font-size:11.5px;color:var(--fg2);
+  white-space:nowrap;min-width:34px}
+.netctl .presets{display:flex;gap:6px;flex-wrap:wrap;margin:-4px 0 12px}
+.netctl .presets button{flex:0 0 auto;padding:5px 10px;font-size:11.5px;
+  background:var(--card2);border:1px solid var(--line2);border-radius:7px;
+  color:var(--fg2);cursor:pointer;transition:all .15s}
+.netctl .presets button:hover{border-color:var(--accent);color:var(--accent)}
+.netctl .apply{width:100%;padding:9px;font-size:13px;font-weight:600;
+  background:var(--accent);color:#06120f;border:0;border-radius:9px;cursor:pointer}
+.netctl .apply:disabled{opacity:.55;cursor:default}
+.netctl .hintbox{font-size:11.5px;color:var(--fg2);line-height:1.7;
+  background:var(--card2);border:1px solid var(--line);border-radius:9px;
+  padding:10px 11px;margin-top:14px}
+.netctl .hintbox b{color:var(--fg)}
+.netctl .saved{font-size:11.5px;color:var(--ok);margin-top:8px;min-height:16px}
+
 /* ── IP 与模式列 ──
    IP 在线时用正常文字色（白/黑，跟主题走）、离线时压暗。
    为什么不一律用 accent 绿：一整列绿色 IP 太抢眼，把「在线」这个信息
@@ -1503,9 +1611,27 @@ html[data-theme="light"] .arw.up{color:#d97706}
 .tier:has(input:checked) span{color:var(--accent);font-weight:600}
 </style>
 
-<div class="livehead" style="margin:2px 0 12px">
-  <div class="rates">
-    下行峰值 <b id="lvRxPeak">—</b> · 上行峰值 <b id="lvTxPeak">—</b>
+<div class="livehead" style="margin:2px 0 14px">
+  <!-- 载荷仪表：替掉原来那行「下行峰值 / 上行峰值」。
+       原因：峰值是个没有参照物的数字 —— 7 MB/s 到底算快还是慢？
+       换成「当前速率 ÷ 出口带宽」的百分比，才知道离卡顿还有多远。 -->
+  <div class="gauge" id="gaugeBox">
+    <div class="gauge-top">
+      <span class="gauge-lab">出口载荷</span>
+      <span class="gauge-val" id="gVal">—</span>
+      <span class="gauge-cap" id="gCap">/ —</span>
+      <span class="gauge-tag" id="gTag">—</span>
+    </div>
+    <div class="gauge-bar">
+      <div class="gauge-fill" id="gFill" style="width:0%"></div>
+      <i class="gauge-mark" style="left:60%" title="60% 起进入拥挤区"></i>
+      <i class="gauge-mark hot" style="left:85%" title="85% 起会明显卡顿"></i>
+    </div>
+    <div class="gauge-foot">
+      <span id="gHead">余量 —</span>
+      <span id="gPerIp">单机最快 —</span>
+      <span id="gPeak">峰值 —</span>
+    </div>
   </div>
   <div class="livestamp" id="lvStamp">正在连接…</div>
 </div>
@@ -1555,6 +1681,169 @@ html[data-theme="light"] .arw.up{color:#d97706}
     while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
     return (v >= 100 ? v.toFixed(0) : v.toFixed(v >= 10 ? 1 : 2)) + ' ' + u[i];
   }
+  // ── 载荷仪表 ──
+  //
+  // 为什么不再显示「峰值 KB/s」：那个数字没有参照物。
+  // 有了出口带宽，才能回答「现在吃满了吗、离卡顿还有多远」。
+  function renderGauge(d){
+    var n = d.net || {};
+    var pct = Math.max(0, Math.min(100, n.loadPct || 0));
+    var fill = document.getElementById('gFill');
+    var val = document.getElementById('gVal');
+    var cap = document.getElementById('gCap');
+    var tag = document.getElementById('gTag');
+    if (!fill || !val) return;
+
+    val.innerHTML = fmtBps(n.curBps || 0);
+    cap.innerHTML = '/ ' + (n.uplinkMbps ? n.uplinkMbps.toFixed(0) + ' Mbps' : '—');
+
+    var lv = n.level || 'ok';
+    fill.style.width = pct + '%';
+    fill.className = 'gauge-fill ' + lv;
+    val.style.color = lv === 'hot' ? 'var(--err)' : (lv === 'warn' ? 'var(--warn)' : 'var(--ok)');
+
+    var label = {ok: '畅通', warn: '偏挤', hot: '饱和'}[lv] || '—';
+    tag.textContent = label + ' · ' + pct.toFixed(0) + '%';
+    tag.className = 'gauge-tag ' + lv;
+
+    var head = document.getElementById('gHead');
+    if (head) head.textContent = '余量 ' + fmtBps(n.headroomBps || 0) +
+      (n.online ? ' · ' + n.online + ' 台在线' : '');
+
+    // 单机最快 / 自己的配额 —— 用来回答「是不是有人撞到限速了」
+    var fastest = 0;
+    (d.list || []).forEach(function(u){ if (u.online) fastest = Math.max(fastest, (u.rxBps||0) + (u.txBps||0)); });
+    var perIp = document.getElementById('gPerIp');
+    if (perIp) {
+      var capBps = (n.perIpMb || 0) * 1024 * 1024;
+      var s = '单机最快 ' + fmtBps(fastest);
+      if (capBps > 0) {
+        s += ' / 配额 ' + n.perIpMb.toFixed(0) + ' MB/s';
+        if (fastest >= capBps * 0.92) s += ' ⚠已贴限速';
+      } else {
+        s += '（未设单机限速）';
+      }
+      // 瓶颈判断：明确告诉管理员「现在卡在哪一层」。
+      // 千兆出口下 10 MB/s 单机限速其实很难打满总量，
+      // 所以「有人撞到自己的配额」比「出口饱和」更常见 ——
+      // 只给一个载荷百分比会让人误以为「才 16%，没问题」。
+      if (capBps > 0 && fastest >= capBps * 0.92) {
+        s += '  ← 瓶颈在单机限速';
+      } else if (n.overload || pct >= 85) {
+        s += '  ← 瓶颈在出口带宽';
+      }
+      perIp.textContent = s;
+    }
+    var pk = document.getElementById('gPeak');
+    if (pk) pk.textContent = '本次最高 ' + fmtBps(Math.max(peak.rx, peak.tx));
+  }
+
+  // ── 右侧带宽控制台 ──
+  //
+  // 改完写文件，中继 5 秒内热生效 —— 不重启，不断连接。
+  var netCtl = {perIp: null, total: null, uplink: null, loaded: false};
+
+  function fmtCap(v){
+    return (v == null) ? '—' : (v % 1 === 0 ? v.toFixed(0) : v.toFixed(1));
+  }
+
+  function loadNetCtl(){
+    fetch('/api/admin/net', {credentials:'same-origin', cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d.ok) return;
+        netCtl.perIp = d.perIp;
+        netCtl.total = d.total;
+        netCtl.uplink = d.uplinkMbps;
+        netCtl.loaded = true;
+        setVal('ncPerIp', d.perIp);
+        setVal('ncTotal', d.total);
+        setVal('ncUplink', d.uplinkMbps);
+      })
+      .catch(function(){});
+  }
+
+  function setVal(id, v){
+    var el = document.getElementById(id);
+    if (el) el.value = fmtCap(v);
+  }
+
+  function getNum(id){
+    var el = document.getElementById(id);
+    if (!el) return null;
+    var v = parseFloat(el.value);
+    return isNaN(v) ? null : Math.max(0, v);
+  }
+
+  function applyNetCtl(){
+    var btn = document.getElementById('ncApply');
+    var msg = document.getElementById('ncMsg');
+    var csrfEl = document.querySelector('input[name="csrf"]');
+    var body = new URLSearchParams();
+    body.append('csrf', csrfEl ? csrfEl.value : '');
+    body.append('perIp', getNum('ncPerIp') == null ? '' : getNum('ncPerIp'));
+    body.append('total', getNum('ncTotal') == null ? '' : getNum('ncTotal'));
+    body.append('uplinkMbps', getNum('ncUplink') == null ? '' : getNum('ncUplink'));
+
+    if (btn) { btn.disabled = true; btn.textContent = '应用中…'; }
+    if (msg) { msg.textContent = ''; msg.style.color = 'var(--fg2)'; }
+
+    fetch('/api/admin/net', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded',
+                'X-Requested-With': 'fetch'},
+      body: body.toString()
+    }).then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d.ok) throw new Error(d.error || '保存失败');
+        netCtl.perIp = d.perIp;
+        netCtl.total = d.total;
+        netCtl.uplink = d.uplinkMbps;
+        if (msg) {
+          msg.style.color = 'var(--ok)';
+          msg.textContent = '已生效：每 IP ' +
+            (d.perIp > 0 ? d.perIp.toFixed(1) + ' MB/s' : '不限') +
+            '，全站 ' + (d.total > 0 ? d.total.toFixed(1) + ' MB/s' : '不限');
+        }
+      })
+      .catch(function(e){
+        if (msg) { msg.style.color = 'var(--err)'; msg.textContent = '失败：' + e.message; }
+      })
+      .then(function(){
+        if (btn) { btn.disabled = false; btn.textContent = '应用'; }
+      });
+  }
+
+  function bindNetCtl(){
+    var btn = document.getElementById('ncApply');
+    if (!btn || btn.getAttribute('data-bound') === '1') return;
+    // 有控制台时才给 body 加类：让主体 padding-right，别被盖住。
+    // 用 JS 加而不是服务端写死，是因为 page() 是所有页面共用的模板。
+    // 折叠 / 展开
+    var aside = document.getElementById('netCtl');
+    var handle = document.getElementById('ncHandle');
+    var collapse = document.getElementById('ncCollapse');
+    function setCollapsed(on){
+      if (!aside) return;
+      aside.classList.toggle('collapsed', on);
+      if (handle) handle.classList.toggle('show', on);
+    }
+    if (collapse) collapse.addEventListener('click', function(){ setCollapsed(true); });
+    if (handle) handle.addEventListener('click', function(){ setCollapsed(false); });
+    btn.setAttribute('data-bound', '1');
+    btn.addEventListener('click', applyNetCtl);
+
+    Array.prototype.forEach.call(document.querySelectorAll('.presets [data-rate]'), function(b){
+      b.addEventListener('click', function(){
+        var v = b.getAttribute('data-rate');
+        setVal('ncPerIp', parseFloat(v));
+        applyNetCtl();
+      });
+    });
+    loadNetCtl();
+  }
+
   function render(d){
     document.getElementById('lvOnline').textContent = d.onlineCount;
     document.getElementById('lvOnlineSub').textContent =
@@ -1565,8 +1854,7 @@ html[data-theme="light"] .arw.up{color:#d97706}
     document.getElementById('lvTx').innerHTML = fmtBps(d.txBps);
     if (d.rxBps > peak.rx) peak.rx = d.rxBps;
     if (d.txBps > peak.tx) peak.tx = d.txBps;
-    document.getElementById('lvRxPeak').innerHTML = fmtBps(peak.rx);
-    document.getElementById('lvTxPeak').innerHTML = fmtBps(peak.tx);
+    renderGauge(d);
 
     var rb = document.getElementById('lvRxBar');
     var tb = document.getElementById('lvTxBar');
@@ -1918,6 +2206,12 @@ html[data-theme="light"] .arw.up{color:#d97706}
     bindIpCells();
   }
 
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bindNetCtl);
+  } else {
+    bindNetCtl();
+  }
+
   function tick(){
     fetch('/api/admin/live', {credentials:'same-origin', cache:'no-store'})
       .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
@@ -1928,6 +2222,67 @@ html[data-theme="light"] .arw.up{color:#d97706}
   tick();
 })();
 </script>
+
+<!-- 右侧带宽控制台 -->
+<button type="button" class="netctl-handle" id="ncHandle" title="展开带宽控制">◀</button>
+<aside class="netctl" id="netCtl">
+  <div class="netctl-head">
+    <h3>带宽控制</h3>
+    <button type="button" class="netctl-toggle" id="ncCollapse" title="收起">▶</button>
+  </div>
+  <div class="sub2 netctl-fold">
+    改动写入限速配置，中继 5 秒内热生效 —— 不会断开正在传的连接。
+  </div>
+
+  <div class="field">
+    <label>每台机器上限</label>
+    <div class="rowline">
+      <input type="number" id="ncPerIp" min="0" max="1000" step="1" placeholder="10">
+      <span class="unit">MB/s</span>
+    </div>
+  </div>
+  <div class="presets">
+    <button type="button" data-rate="3">3</button>
+    <button type="button" data-rate="5">5</button>
+    <button type="button" data-rate="10">10</button>
+    <button type="button" data-rate="20">20</button>
+    <button type="button" data-rate="0">不限</button>
+  </div>
+
+  <div class="field">
+    <label>全站总上限</label>
+    <div class="rowline">
+      <input type="number" id="ncTotal" min="0" max="10000" step="1" placeholder="0">
+      <span class="unit">MB/s</span>
+    </div>
+  </div>
+
+  <div class="field">
+    <label>远端出口带宽</label>
+    <div class="rowline">
+      <input type="number" id="ncUplink" min="1" max="100000" step="10" placeholder="1000">
+      <span class="unit">Mbps</span>
+    </div>
+  </div>
+
+  <button type="button" class="apply" id="ncApply">应用</button>
+  <div class="saved" id="ncMsg"></div>
+
+  <div class="hintbox">
+    <b>三个数字怎么填</b><br>
+    · 每台上限：一个人最多跑多快。填 0 = 不限。<br>
+    · 全站上限：所有人加起来的天花板。校园网出口有限，
+      每人都 10 MB/s 时三个人就能把百兆线吃满。<br>
+    · 出口带宽：只用于算上面的载荷百分比，不参与限速。
+      默认 1000（pcs 是千兆线路）。
+  </div>
+  <div class="hintbox">
+    <b>载荷到多少会卡</b><br>
+    60% 起进入拥挤区（开始有排队的体感），
+    85% 以上基本饱和 —— 这时候谁再多跑一点，所有人都会觉得卡。
+    仪表上那两条竖线就是这两个边界。
+  </div>
+</aside>
 
 <!-- 机器详情弹窗的骨架。放在这里（跟着 LIVE_UI 一起）而不是页面最底部，
      是为了让「弹窗样式 + 弹窗 JS + 弹窗 DOM」三件东西待在同一个位置，
@@ -2339,6 +2694,175 @@ def md_to_html_brief(md):
     if in_code:
         out.append('</pre>')
     return '\n'.join(out)
+
+
+# ─────────── 带宽/限速控制 ───────────
+#
+# 中继（ferry-socks5-server.py）和门户跑在同一台机器上。
+# 限速通过一个纯文本文件传递：门户写、中继每 5 秒读一次热更新。
+# 这样改限速不用重启中继（重启会掐断所有正在传的连接）。
+
+def relay_dir():
+    """中继脚本所在目录（rate-mb.txt 在这里）。"""
+    d = os.environ.get('FERRY_RELAY_DIR')
+    if d and os.path.isdir(d):
+        return d
+    # 默认位置：pcs 上部署脚本把中继放在 %LOCALAPPDATA%\Ferry
+    cand = [
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Ferry'),
+        os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'Ferry'),
+        os.path.dirname(os.path.abspath(__file__)),
+    ]
+    for c in cand:
+        if c and os.path.isfile(os.path.join(c, 'ferry-socks5-server.py')):
+            return c
+    return cand[0] if cand[0] else os.path.dirname(os.path.abspath(__file__))
+
+
+def rate_conf_path():
+    return os.path.join(relay_dir(), 'rate-mb.txt')
+
+
+def read_rate_conf():
+    """读当前限速配置。返回 {'perIp': MB/s, 'total': MB/s}。"""
+    out = {'perIp': 10.0, 'total': 0.0}
+    p = rate_conf_path()
+    if not os.path.exists(p):
+        return out
+    try:
+        lines = [x.strip() for x in open(p, encoding='utf-8').read().splitlines()]
+
+        def num(i, d):
+            if len(lines) <= i or not lines[i]:
+                return d
+            try:
+                return max(0.0, float(lines[i].split()[0]))
+            except (ValueError, IndexError):
+                return d
+
+        out['perIp'] = num(0, 10.0)
+        out['total'] = num(1, 0.0)
+    except Exception:
+        pass
+    return out
+
+
+def write_rate_conf(per_ip, total):
+    """写限速配置。中继 5 秒内自动生效（热更新，不重启）。
+
+    为什么先写临时文件再改名：中继那侧可能正好在读到一半，
+    原子替换能保证它读到的要么是旧值、要么是新值，不会是半截。
+    """
+    p = rate_conf_path()
+    d = os.path.dirname(p)
+    try:
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        body = '%.2f\n%.2f\n' % (max(0.0, float(per_ip)), max(0.0, float(total)))
+        tmp = p + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(body)
+        os.replace(tmp, p)
+        return True
+    except Exception as e:
+        sys.stderr.write('[net] write rate conf failed: %s\n' % e)
+        return False
+
+
+def uplink_setting_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'net-setting.json')
+
+
+_uplink_cache = {'v': None, 'at': 0.0}
+UPLINK_CACHE_SEC = 5.0
+
+
+def read_uplink_mbps():
+    """远端物理出口带宽（Mbps），用于算「载荷百分比」。
+
+    为什么让管理员手填而不是自动测：自动测速本身要跑满带宽、
+    还会因为测速源不同差几十倍（项目里实测过 89 MB/s 到 0.4 MB/s）。
+    管理员知道自己那条线是多少，填一个数最省事也最准。
+    默认 1000 Mbps —— pcs 那条是千兆联通线路。
+    """
+    # live 每 3 秒调一次，5 秒缓存足够，也不会让面板一直打磁盘
+    t = time.time()
+    if _uplink_cache['v'] is not None and t - _uplink_cache['at'] < UPLINK_CACHE_SEC:
+        return _uplink_cache['v']
+
+    val = 1000.0
+    p = uplink_setting_path()
+    try:
+        if os.path.exists(p):
+            d = json.load(open(p, encoding='utf-8'))
+            v = float(d.get('uplinkMbps') or 0)
+            if v > 0:
+                val = v
+    except Exception:
+        pass
+    _uplink_cache['v'] = val
+    _uplink_cache['at'] = t
+    return val
+
+
+def write_uplink_mbps(mbps):
+    try:
+        d = {'uplinkMbps': max(1.0, float(mbps))}
+        with open(uplink_setting_path(), 'w', encoding='utf-8') as f:
+            json.dump(d, f)
+        # 必须让缓存失效 —— 否则刚写完立刻读还是旧值，
+        # 表现是「面板上填了 1000，保存后还显示 100」，实测踩过。
+        _uplink_cache['v'] = None
+        _uplink_cache['at'] = 0.0
+        return True
+    except Exception:
+        return False
+
+
+def load_state(rx_bps, tx_bps, online, per_ip_conf, total_conf):
+    """算「载荷」——当前总速率占远端出口的比例，以及各级边界。
+
+    为什么要单独算这个：面板原来只显示「下行 X KB/s」，
+    这个数字**没有参照物** —— 7 MB/s 是好是坏？不知道。
+    有了出口带宽和每人配额，才能回答三个实际问题：
+      · 现在这条线吃满了吗（会不会卡）
+      · 离饱和还有多少余量
+      · 是不是已经有人撞到自己的配额了
+
+    返回：
+      loadPct   当前总速率 / 出口带宽
+      perIpPct  最快那台 / 单 IP 配额（>100% 说明被限速咬住了）
+      level     ok / warn / hot（阈值 60% / 85%）
+    """
+    uplink_mbps = read_uplink_mbps()
+    up_bps = uplink_mbps * 1024 * 1024 / 8.0     # Mbps -> byte/s
+    cur = max(0, rx_bps) + max(0, tx_bps)
+    load_pct = (cur / up_bps * 100.0) if up_bps > 0 else 0.0
+
+    # 超 100% 不是不可能：出口带宽是管理员手填的估计值，
+    # 实际在线人数多、瞬时突发时会短暂超过。保留真实数字（比夹到 100 诚实），
+    # 但标成 hot —— 那一定在卡。
+    overload = load_pct > 100.0
+    level = 'ok'
+    if load_pct >= 85:
+        level = 'hot'
+    elif load_pct >= 60:
+        level = 'warn'
+
+    return {
+        'uplinkMbps': uplink_mbps,
+        'curBps': cur,
+        'loadPct': round(load_pct, 1),
+        'level': level,
+        'overload': overload,
+        'perIpMb': per_ip_conf,
+        'totalMb': total_conf,
+        'online': online,
+        # 距离各级边界还剩多少（直接回答「离卡顿还有多远」）
+        'toWarnPct': round(max(0.0, 60 - load_pct), 1),
+        'toHotPct': round(max(0.0, 85 - load_pct), 1),
+        'headroomBps': max(0, int(up_bps - cur)),
+    }
 
 
 def human_size(n):
@@ -2799,6 +3323,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_logout()
             elif path == '/api/admin/live':
                 self.handle_api_admin_live()
+            elif path == '/api/admin/net':
+                self.handle_api_admin_net()
             elif path == '/api/admin/client':
                 self.handle_api_admin_client(
                     urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
@@ -2915,6 +3441,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_admin_toggle(form)
             elif path == '/admin/setnote':
                 self.handle_admin_setnote(form)
+            elif path == '/api/admin/net':
+                self.handle_api_admin_net(form)
             elif path == '/admin/unlock':
                 self.handle_unlock(form)
             else:
@@ -3608,6 +4136,62 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        for r in ev],
         })
 
+    def handle_api_admin_net(self, form=None):
+        """读写限速配置。
+
+        GET  -> 当前配置（form=None）
+        POST -> 改配置（form 由 do_POST 预先读好并已过 CSRF）
+
+        为什么改限速不做成「重载中继进程」：
+        重启会掐断所有正在传输的连接 —— 用户正在下载的文件直接断。
+        写文件 + 中继热读是唯一无感的做法。
+        """
+        if not self._require_admin():
+            return
+
+        if form is not None:
+            cur = read_rate_conf()
+
+            def pick(name, dflt):
+                v = form.get(name)
+                if v is None or v == '':
+                    return dflt
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return dflt
+
+            per_ip = pick('perIp', cur['perIp'])
+            total = pick('total', cur['total'])
+            # 夹紧到合理区间：99999 是笔误不是需求
+            per_ip = max(0.0, min(1000.0, per_ip))
+            total = max(0.0, min(10000.0, total))
+
+            ok = write_rate_conf(per_ip, total)
+            if form.get('uplinkMbps') not in (None, ''):
+                try:
+                    write_uplink_mbps(float(form.get('uplinkMbps')))
+                except (TypeError, ValueError):
+                    pass
+
+            self.db.log('rate_change', self.client_ip(),
+                        'perIp=%.2f total=%.2f' % (per_ip, total))
+            if ok:
+                self.send_json({'ok': True, 'perIp': per_ip, 'total': total,
+                                'uplinkMbps': read_uplink_mbps()})
+            else:
+                self.send_json({'ok': False,
+                                'error': '写入失败（检查中继目录权限）'}, 500)
+            return
+
+        cur = read_rate_conf()
+        self.send_json({
+            'ok': True,
+            'perIp': cur['perIp'],
+            'total': cur['total'],
+            'uplinkMbps': read_uplink_mbps(),
+            'range': {'minMb': 0, 'maxMb': 5000},
+        })
     def handle_api_admin_live(self):
         """管理面版轮询用。只有管理员能看 —— 这里会暴露谁在用。"""
         if not self.is_admin():
