@@ -283,6 +283,11 @@ namespace Ferry
             _slow.Tick += delegate { ProbeNet(); };
             _slow.Start();
 
+            // 把日志出口接给 FerryCore —— 它还原系统代理时要能说清楚做了什么
+            // （尤其「原代理不可达所以关了代理」这条，用户必须看到，否则
+            //  他会以为"恢复直连"就是能上网，实际直连上不了外网却不知道为什么）
+            FerryCore.Logger = Log;
+
             // 事件驱动：系统网络状态一变就立刻探一次。
             // 有了它，定时器只是兜底（Wi-Fi 断了但系统没发通知这种边缘情况），
             // 正常情况下 15 秒一次的定时器几乎不产生真实 DNS 流量。
@@ -554,8 +559,57 @@ namespace Ferry
                     Log("已恢复直连");
                     _exitVia = "";
                     RefreshUi();
+                    StartProxyHeal();
                 }));
             });
+        }
+
+        // ── 停止借网后的「原代理看护」──
+        //
+        // 解决什么：用户原本靠 Clash 上外网。停止借网那一刻 Clash 可能还没起来
+        // （或者刚好在重启），系统代理就被关掉了。等用户自己打开 Clash，
+        // 系统代理却还是关的 —— 表现是「恢复直连之后 GitHub 打不开了」。
+        //
+        // 只在停止借网后 5 分钟内、每 10 秒看一眼，且判据很严：
+        //   · 系统代理必须是关着的（用户手动开了就不动）
+        //   · 备份里必须有过原代理
+        //   · 那个原代理现在必须真的可达
+        // 三条都满足才接回去。任何一条不满足就继续等或直接放弃。
+        System.Windows.Forms.Timer _healTimer;
+        DateTime _healDeadline;
+
+        void StartProxyHeal()
+        {
+            var st = FerryCore.LoadState(_appDir);
+            if (st == null || !st.PrevEnabled || string.IsNullOrEmpty(st.PrevServer)) return;
+            if (FerryCore.ProxyEnabled()) return;   // 代理已经开着，不用管
+
+            _healDeadline = DateTime.Now.AddMinutes(5);
+            if (_healTimer == null)
+            {
+                _healTimer = new System.Windows.Forms.Timer();
+                _healTimer.Interval = 10000;
+                _healTimer.Tick += delegate { TryHealProxy(); };
+            }
+            _healTimer.Start();
+        }
+
+        void TryHealProxy()
+        {
+            if (DateTime.Now > _healDeadline) { _healTimer.Stop(); return; }
+            if (FerryCore.ProxyEnabled()) { _healTimer.Stop(); return; }
+
+            var st = FerryCore.LoadState(_appDir);
+            if (st == null || !st.PrevEnabled || string.IsNullOrEmpty(st.PrevServer))
+            {
+                _healTimer.Stop();
+                return;
+            }
+            if (!FerryCore.IsProxyAlive(st.PrevServer)) return;   // 还没起来，继续等
+
+            FerryCore.SetProxy(true, st.PrevServer);
+            Log("检测到原代理 " + st.PrevServer + " 已就绪，已自动接回系统代理");
+            _healTimer.Stop();
         }
 
         void Toggle()

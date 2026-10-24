@@ -714,12 +714,30 @@ def _sh(cmd, timeout=8):
         return ''
 
 
+_ssh_peers_cache = {'at': 0.0, 'data': {}}
+SSH_PEERS_TTL = 30.0
+
+
 def _ssh_peers():
     """正在连本机 22 端口的外网地址 → 连接数。
 
     只看 ESTABLISHED 且本地端口是 22 的。回环和空地址跳过
     （管理员自己 ssh 上来运维不该算用户）。
+
+    ⚠ 带 30 秒缓存。
+
+    为什么：这个函数的唯一用途是 `tunnelConns`（「还有多少台走 SSH 隧道」），
+    纯诊断值。而它每次都要跑 `netstat -ano` —— 本机实测 81ms（系统 921 个连接时），
+    并且在 HTTP 请求线程里同步执行。sample_live 有 2 秒缓存，等于每 2 秒
+    就有一个请求被它拖住 4% 的时间。
+
+    直连模式普及之后这个数字基本恒为 0，却要为它付出这个代价，不值。
+    30 秒的延迟对「看趋势」完全够用。
     """
+    now_t = time.time()
+    if now_t - _ssh_peers_cache['at'] < SSH_PEERS_TTL:
+        return dict(_ssh_peers_cache['data'])
+
     out = _sh(['netstat', '-ano'])
     peers = {}
     for line in out.splitlines():
@@ -737,8 +755,10 @@ def _ssh_peers():
         if not ip or ip.startswith('127.') or ip == '::1':
             continue
         peers[ip] = peers.get(ip, 0) + 1
-    return peers
 
+    _ssh_peers_cache['data'] = peers
+    _ssh_peers_cache['at'] = now_t
+    return dict(peers)
 
 def _net_bytes():
     """全部网卡的累计收/发字节。取不到就返回 None。"""
@@ -4696,6 +4716,27 @@ def main():
                      '(SELECT id FROM events ORDER BY id DESC LIMIT 2000)')
                 if n:
                     sys.stderr.write(f'[janitor] 清理过期会话 {n} 条\n')
+
+                # 内存里的心跳/累计表也要清。
+                #
+                # _hb：每 IP 一条。heartbeat_of 过期只返回 None、不删条目 ——
+                #      设备长期不上线、或者 DHCP 频繁换 IP，条目会一直堆着。
+                #      单条几十字节不算大，但这是纯粹的垃圾，留着没意义。
+                # _totals：同上，但**不能删** —— 里面是还没 flush 到 DB 的增量，
+                #      删了就丢流量统计。只清已经 flush 干净（增量归零）且超过
+                #      24 小时没动静的。
+                try:
+                    cutoff = time.time() - 3600
+                    with _hb_lock:
+                        for _ip in [k for k, v in _hb.items() if v.get('at', 0) < cutoff]:
+                            _hb.pop(_ip, None)
+                    tcut = time.time() - 86400
+                    for _ip in [k for k, v in list(_totals.items())
+                                if v.get('rx', 0) == 0 and v.get('tx', 0) == 0
+                                and v.get('first', 0) < tcut]:
+                        _totals.pop(_ip, None)
+                except Exception as e:
+                    sys.stderr.write(f'[janitor] 清理内存表出错: {e}\n')
             except Exception as e:
                 sys.stderr.write(f'[janitor] 出错: {e}\n')
 

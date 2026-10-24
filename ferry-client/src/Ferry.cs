@@ -82,11 +82,42 @@ namespace Ferry
         }
 
         /// <summary>
+        /// 日志出口。由 MainForm 在启动时接上界面日志。
+        /// 为什么用静态委托：RestoreDirect 被 5 处调用（停止借网、定时检测、
+        /// 卸载、启动清理…），每处都传一个 log 回调太啰嗦。
+        /// </summary>
+        public static Action<string> Logger;
+
+        static void LogLine(string s)
+        {
+            var l = Logger;
+            if (l != null) { try { l(s); } catch (Exception) { } }
+        }
+
+        /// <summary>
         /// 还原系统代理。卸载和「停止借网」都必须走这里。
         ///
         /// 关键：不是简单置 0，而是**还原用户原来的设置**。
-        /// 很多人本来配着公司代理或 Clash，直接置 0 等于把人家的配置弄丢，
-        /// 下次开会上网全公司找 IT。所以开启前先备份到 state.json。
+        /// 很多人本来配着公司代理或 Clash，直接置 0 等于把人家的配置弄丢。
+        ///
+        /// ⚠ 这里踩过一个大坑，改过一次：
+        ///
+        ///   原来的写法是「原代理探不通就 SetProxy(false, "")」——
+        ///   只置 ProxyEnable=0，**不更新 ProxyServer**，于是注册表里
+        ///   留着渡口自己的 `http://127.0.0.1:10801`。
+        ///   两个后果：
+        ///     ① 用户之后手动打开「使用代理服务器」开关，指向的是一个
+        ///        早就没了的渡口端口，直接全网上不去，而且没人知道为什么
+        ///     ② 更常见的：用户本来靠 Clash 上外网（学校直连 GitHub 是
+        ///        通的但很慢/经常超时）。停止借网那一刻 Clash 恰好没起来，
+        ///        系统代理被关掉；之后用户自己打开 Clash，系统代理却还是关的
+        ///        —— 表现就是「恢复直连后 GitHub 打不开了」。
+        ///
+        ///   现在的做法：
+        ///     · 多探几次（Clash 可能正在启动）
+        ///     · 探不通也把**原地址写回去**，只是把开关关掉 —— 用户之后
+        ///       自己打开开关就是对的地址
+        ///     · 明确记一行日志，告诉用户"原代理不可达，已关代理"，别让他猜
         /// </summary>
         public static void RestoreDirect(Cfg cfg, string appDir)
         {
@@ -94,18 +125,29 @@ namespace Ferry
 
             if (st != null && st.PrevEnabled && !string.IsNullOrEmpty(st.PrevServer))
             {
-                // 关键：还原之前先确认用户原来那个代理**现在还活着**。
-                //
-                // 踩过的坑：用户原本用 Clash（127.0.0.1:7897），借网期间把 Clash 关了。
-                // 停止借网时把系统代理还原成 Clash 的地址，但那个端口已经没人监听 ——
-                // 结果就是「恢复直连之后彻底上不了网」，比借网失败还糟。
-                // 所以这里探一下；探不通就直接关掉系统代理，至少保证能上网。
-                if (IsProxyAlive(st.PrevServer))
+                // 多给几次机会：Clash / 公司代理可能正在启动过程中。
+                // 单次 400ms 探测太急，三次约 1 秒能覆盖绝大多数情况。
+                bool alive = false;
+                for (int i = 0; i < 3; i++)
+                {
+                    if (IsProxyAlive(st.PrevServer)) { alive = true; break; }
+                    if (i < 2) System.Threading.Thread.Sleep(350);
+                }
+
+                if (alive)
                 {
                     SetProxy(true, st.PrevServer);
+                    LogLine("已还原原代理 " + st.PrevServer);
                     return;
                 }
-                SetProxy(false, "");
+
+                // 不可达：关掉开关，但**保留原地址**。
+                // 这样用户之后手动打开开关时指向的是他原来的代理，
+                // 而不是渡口那个已经关掉的端口。
+                SetProxy(false, st.PrevServer);
+                LogLine("原代理 " + st.PrevServer +
+                        " 当前不可达，已关闭系统代理（地址已保留，" +
+                        "之后启动它并打开系统代理开关即可）");
                 return;
             }
 
@@ -115,6 +157,8 @@ namespace Ferry
                 return;
             }
 
+            // 最后兜底：本来就没有原代理。只关开关，地址原样留着
+            // （此时 ProxyServer 大概率是渡口自己，反正没开开关，不影响使用）。
             SetProxy(false, "");
         }
 

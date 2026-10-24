@@ -57,6 +57,27 @@ namespace Ferry
                 return;
             }
 
+            // 静默停止借网：`渡口助手.exe /stop`
+            //
+            // 顺序很重要：
+            //   ① 先还原系统代理 —— 否则杀掉客户端后代理还指着 10801，
+            //      那个端口已经没了，用户会「整个网都上不去」
+            //   ② 再杀正在跑的客户端 —— 它退出时 Job Object 会连带回收
+            //      mihomo 和 FerryTun 网卡
+            //
+            // 这个参数对自动化测试和快捷方式都有用（不然只能用鼠标点）。
+            if (HasArg(args, "/stop") || HasArg(args, "-stop"))
+            {
+                var cfgS = Cfg.Load(cfgPath);
+                FerryCore.RestoreDirect(cfgS, appDir);
+                foreach (var pr in System.Diagnostics.Process.GetProcessesByName("渡口助手"))
+                {
+                    if (pr.Id == System.Diagnostics.Process.GetCurrentProcess().Id) continue;
+                    try { pr.Kill(); pr.WaitForExit(4000); } catch (Exception) { }
+                }
+                return;
+            }
+
             bool created;
             _mutex = new Mutex(true, @"Local\FerryClient", out created);
 
