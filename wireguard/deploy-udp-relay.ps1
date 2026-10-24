@@ -17,7 +17,9 @@ param(
   # 每个源 IP 的带宽上限（MB/s）。0 = 不限速。
   # 为什么默认 10：这是「一个人别把共享出口占满」的经验值 ——
   # 千兆校园网里 10 MB/s 单人已经很快，又不至于让第二个人卡死。
-  [double]$RateMb = 10
+  [double]$RateMb = 10,
+  # 不建桌面快捷方式（默认建）
+  [switch]$SkipShortcut
 )
 
 $ErrorActionPreference = 'Stop'
@@ -254,24 +256,224 @@ Ok "服务端脚本: $Target ($((Get-Item $Target).Length) B)"
 # 5) 启动
 if (-not (Start-Relay -Python $py)) { exit 1 }
 
-# 6) 自启
+# 6) 自启：注册**计划任务**，不用启动文件夹
+#
+# 为什么必须用计划任务：
+#   启动文件夹里的 .cmd 只在该用户**登录后**才执行。服务器重启后没人登录，
+#   中继就不在 —— 所有人借网立刻全断，而且没有任何提示。
+#   这比门户挂了更严重（门户至少页面还能看到）。
+#
+# 为什么用 XML 而不是 New-ScheduledTaskPrincipal：
+#   实测这台机器的 PS 5.1 对 -UserId 格式要求很怪，传裸用户名和 SID
+#   都报 `(18,8):UserId:`。XML 是任务计划的原生格式，宽松得多。
+#
+# 为什么 S4U 而不是 Interactive：
+#   S4U（Service For User）不需要密码、不需要交互登录，开机就能跑。
 if (-not $NoAutostart) {
-  if (-not (Test-Path $StartupCmd)) {
-    $content = @"
-@echo off
-chcp 936 >nul
-rem 渡口 UDP 中继 - 登录时拉起（TCP CONNECT + UDP ASSOCIATE）
-start "" /min "$py" -u "$Target" --port $Port --udp --rate-mb $RateMb
-"@
-    # .cmd 必须 GBK + 无 BOM + CRLF，三条都踩过：
-    # 带 BOM → cmd.exe 把 BOM 当命令一部分，首行 @echo off 失效
-    # 纯 LF  → 解析器吃掉每行第一个字符（rem 变 em）
-    # UTF-8  → chcp 936 下中文注释乱码
+  $taskName = 'FerryUdpRelay'
+  $runnerPath = Join-Path $InstallDir 'run-relay.cmd'
+  # 用 COMPUTERNAME 而不是 USERDOMAIN：
+  # ssh 会话不是交互登录，$env:USERDOMAIN 会是 WORKGROUP，
+  # 拼出来的 WORKGROUP\pcserver 任务计划不认（账户名与安全标识无映射）。
+  $user = "$env:COMPUTERNAME\$env:USERNAME"
+
+  $xml = @'
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>渡口 Ferry UDP/TCP 中继（SOCKS5，按 IP 限速）</Description>
+    <URI>\@@TASK@@</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger><Enabled>true</Enabled><Delay>PT20S</Delay></BootTrigger>
+    <LogonTrigger><Enabled>true</Enabled><UserId>@@USER@@</UserId><Delay>PT5S</Delay></LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>@@USER@@</UserId>
+      <LogonType>S4U</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>5</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>@@RUNNER@@</Command>
+      <WorkingDirectory>@@DIR@@</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+'@
+  $xml = $xml.Replace('@@TASK@@', $taskName).
+    Replace('@@USER@@', $user).
+    Replace('@@RUNNER@@', $runnerPath).
+    Replace('@@DIR@@', $InstallDir)
+
+  # schtasks 对带 BOM 的 UTF-16 最稳
+  $xmlPath = Join-Path $InstallDir '_relay-task.xml'
+  [IO.File]::WriteAllBytes($xmlPath,
+    ([byte[]](0xFF, 0xFE) + [Text.Encoding]::Unicode.GetBytes($xml)))
+
+  $out = cmd.exe /c ('schtasks /Create /TN "' + $taskName + '" /XML "' + $xmlPath + '" /F 2>&1')
+  $taskOk = ($LASTEXITCODE -eq 0)
+  if ($taskOk) {
+    Ok "已注册计划任务 $taskName（开机即跑，无需登录）"
+  } else {
+    Bad "注册计划任务失败: $($out -join ' ')"
+    Say '退回启动文件夹自启（缺点：需要登录才跑）'
+    $content = "@echo off`r`nchcp 936 >nul`r`nstart `"`" /min `"$runnerPath`"`r`n"
     $content = ($content -replace "`r`n", "`n") -replace "`n", "`r`n"
     [IO.File]::WriteAllText($StartupCmd, $content, [Text.Encoding]::GetEncoding(936))
-    Ok "已装自启: $StartupCmd"
+    Ok "已写启动文件夹自启（退路）"
+  }
+  Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+
+  # 只有任务注册成功才清启动文件夹。
+  # 踩过的坑：无条件清，结果注册失败时退路刚写完就被删，
+  # 变成「既没任务也没自启」，下次重启中继直接不启动。
+  if ($taskOk -and (Test-Path $StartupCmd)) {
+    Remove-Item $StartupCmd -Force -ErrorAction SilentlyContinue
+    Say '已移除启动文件夹自启（计划任务接管）'
+  }
+}
+
+# 6.5) 清理调试残留 + 日志轮转
+#
+# 为什么清理：Ferry 目录里曾经堆了十几个 _chk*.py / _diag*.py，
+# 都是排查时临时传上来的。留着会让人误以为是项目文件。
+$junk = Get-ChildItem $InstallDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^_(chk|diag|hot|rl|tw|cp|run|slow|inspect|restart)' }
+if ($junk) {
+  $n = @($junk).Count
+  $junk | Remove-Item -Force -ErrorAction SilentlyContinue
+  Ok ("清理调试残留 " + $n + " 个")
+}
+
+# 日志轮转：超过 8 MB 就截断到最后一万行。
+# 中继每建一个连接写一行，正常用一天能到几十 MB，不轮转会一直涨。
+try {
+  if ((Test-Path $LogFile) -and (Get-Item $LogFile).Length -gt 8MB) {
+    $keep = Get-Content $LogFile -Tail 10000
+    [IO.File]::WriteAllLines($LogFile, $keep, [Text.Encoding]::GetEncoding(936))
+    Ok '日志已轮转（保留最后 1 万行）'
+  }
+} catch { Warn "日志轮转失败: $($_.Exception.Message)" }
+
+# 6.6) 桌面快捷方式
+#
+# 建两个：
+#   渡口中继状态 —— 看一眼在不在跑、当前限速、最近日志
+#   渡口中继重启 —— 挂了/改了限速之后一键重来
+#
+# 用 .cmd 而不是 .lnk：lnk 要用 WScript.Shell 建，路径含中文时容易出问题；
+# .cmd 就是纯文本，双击直接执行，用户也能右键编辑。
+# 编码仍然必须是 GBK + 无 BOM + CRLF（这个坑踩过三次了）。
+if (-not $SkipShortcut) {
+  $desk = [Environment]::GetFolderPath('Desktop')
+  if ($desk -and (Test-Path $desk)) {
+    $selfPath = $MyInvocation.MyCommand.Path
+    if (-not $selfPath) { $selfPath = Join-Path $InstallDir 'deploy-udp-relay.ps1' }
+
+    # ── 状态卡 ──
+    # 用单引号 here-string 原样保留，只把占位符换成实际值。
+    # 这样里面的 $ 和引号都不会被 PowerShell 提前展开。
+    $tplStatus = @'
+@echo off
+chcp 936 >nul
+title 渡口中继状态
+echo === 渡口中继 ===
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "@@DIR@@\relay-status.ps1"
+echo.
+pause
+'@
+    $tplStatus = $tplStatus.Replace('@@DIR@@', $InstallDir)
+
+    $statusPs = @'
+$ErrorActionPreference = 'Continue'
+$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$log = Join-Path $dir 'logs\udp-relay.log'
+$rate = Join-Path $dir 'rate-mb.txt'
+
+$p = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+     Where-Object { $_.CommandLine -and $_.CommandLine -like '*ferry-socks5-server*' }
+if ($p) {
+  Write-Host ('  运行中  PID ' + (($p | ForEach-Object { $_.ProcessId }) -join ',')) -ForegroundColor Green
+} else {
+  Write-Host '  未运行' -ForegroundColor Red
+}
+
+$listening = $false
+try {
+  $c = New-Object Net.Sockets.TcpClient
+  $iar = $c.BeginConnect('127.0.0.1', @@PORT@@, $null, $null)
+  $listening = $iar.AsyncWaitHandle.WaitOne(600, $false)
+  $c.Close()
+} catch { }
+if ($listening) { Write-Host '  端口 @@PORT@@ 可连' -ForegroundColor Green }
+else { Write-Host '  端口 @@PORT@@ 连不上' -ForegroundColor Red }
+
+if (Test-Path $rate) {
+  $lines = Get-Content $rate -ErrorAction SilentlyContinue
+  Write-Host ''
+  Write-Host ('  限速：每 IP ' + $lines[0] + ' MB/s')
+  if ($lines.Count -gt 1) { Write-Host ('        全站 ' + $lines[1] + ' MB/s') }
+}
+
+if (Test-Path $log) {
+  $sz = [math]::Round((Get-Item $log).Length / 1KB, 1)
+  Write-Host ''
+  Write-Host ('--- 最近 12 行日志（共 ' + $sz + ' KB）---')
+  Get-Content $log -Tail 12 -Encoding UTF8 -ErrorAction SilentlyContinue
+} else {
+  Write-Host ''
+  Write-Host '  （还没有日志）'
+}
+
+Write-Host ''
+Write-Host ('  安装目录：' + $dir)
+'@
+    $statusPs = $statusPs.Replace('@@PORT@@', [string]$Port)
+    [IO.File]::WriteAllText((Join-Path $InstallDir 'relay-status.ps1'),
+      $statusPs, (New-Object Text.UTF8Encoding $true))
+
+    # ── 重启卡 ──
+    $tplRestart = @'
+@echo off
+chcp 936 >nul
+title 渡口中继重启
+echo 正在重启渡口中继（每 IP @@RATE@@ MB/s）...
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "@@SELF@@" -Port @@PORT@@ -RateMb @@RATE@@
+echo.
+pause
+'@
+    $tplRestart = $tplRestart.Replace('@@SELF@@', $selfPath).
+      Replace('@@PORT@@', [string]$Port).Replace('@@RATE@@', [string]$RateMb)
+
+    $gbk = [Text.Encoding]::GetEncoding(936)
+    [IO.File]::WriteAllText((Join-Path $desk '渡口中继状态.cmd'),
+      ($tplStatus -replace "`r`n", "`n" -replace "`n", "`r`n"), $gbk)
+    [IO.File]::WriteAllText((Join-Path $desk '渡口中继重启.cmd'),
+      ($tplRestart -replace "`r`n", "`n" -replace "`n", "`r`n"), $gbk)
+
+    Ok "已建桌面快捷方式：渡口中继状态.cmd / 渡口中继重启.cmd"
   } else {
-    Warn "自启已存在: $StartupCmd"
+    Warn '找不到桌面目录，跳过快捷方式'
   }
 }
 
