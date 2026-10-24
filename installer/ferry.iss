@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "0.9.0"
+#define AppVersion "0.9.1"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -122,10 +122,8 @@ Name: "{autodesktop}\渡口助手";  Filename: "{app}\{#AppExeName}"; WorkingDir
 ; RunLevel=HighestAvailable 的计划任务（不弹 UAC）。见 [Code] 段。
 
 [Run]
-; 装完先设自启（如果需要），再启动程序。
-; /install-autostart 是客户端支持的一个静默参数。
-Filename: "{app}\{#AppExeName}"; Parameters: "/install-autostart"; \
-  Flags: runhidden waituntilterminated; Tasks: autostart
+; 只启动程序。开机自启不在这里设 —— 原因见 [Code] 里 ssPostInstall 的注释：
+; 从已提权的安装器用 CreateProcess 启动 requireAdministrator 的 exe 会报 740。
 Filename: "{app}\{#AppExeName}"; Description: "立即启动渡口助手"; \
   Flags: postinstall nowait skipifsilent
 
@@ -335,6 +333,25 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
+    { 开机自启：写一个标记文件，让客户端启动后自己去建计划任务。
+
+      为什么不在 [Run] 里直接调 `渡口助手.exe /install-autostart`：
+        那个 exe 的 manifest 是 requireAdministrator，而安装器**已经提权**。
+        从高完整性进程用 CreateProcess 启动一个同样要求提权的 exe 会失败：
+          CreateProcess 失败；错误代码 740。请求的操作需要提升。
+        （实测弹的就是这个框，但程序本身还能正常启动 —— 因为另一条 [Run]
+         走的是 ShellExecute，能提权，所以我们容易只看到"能用"而忽略这个报错）
+        CreateProcess 不触发 UAC，所以这条路走不通。
+
+      改成写标记 + 客户端自己处理：客户端启动时本来就是管理员，
+      它调 schtasks 建 RunLevel=HighestAvailable 的任务毫无问题。
+      见 Program.cs 里读 .want-autostart 的那段。
+
+      放在 config.json 逻辑之前：那段有 `exit`（保留已有激活时直接返回），
+      放后面会被跳过。 }
+    if WizardIsTaskSelected('autostart') then
+      SaveStringToFile(ExpandConstant('{app}\.want-autostart'), '1', False);
+
     CfgPath := ExpandConstant('{app}\config.json');
     Fetched := False;
 
