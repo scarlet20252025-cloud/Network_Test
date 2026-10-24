@@ -200,10 +200,30 @@ namespace Ferry
         /// 的网络字节数 —— 只有客户端自己知道。5 秒一次，失败静默忽略
         /// （断网时本来就连不上门户，不该刷错误）。
         /// </summary>
-        public static void Heartbeat(Cfg cfg, long rxBytes, long txBytes, int conns, bool running,
-                                     string mode)
+        /// <summary>心跳结果。除了速率，还带回授权状态 —— 见下方说明。</summary>
+        public class HbResult
         {
-            if (!cfg.Activated || string.IsNullOrEmpty(cfg.PortalUrl)) return;
+            public bool Ok;
+            public bool Enabled = true;     // 账号是否还有效
+            public bool Expired;            // 是否到期
+            /// <summary>服务端明确说「不能再借网了」。老服务端不返回这两个字段时为 false。</summary>
+            public bool Revoked { get { return Ok && !Enabled; } }
+        }
+
+        /// <summary>
+        /// 上报心跳。
+        ///
+        /// 为什么顺带取回授权状态：管理员在后台停用一台机器时，
+        /// 原来客户端要等下一次 CheckLicense（最长 6 小时）才会断 ——
+        /// 那段时间用户完全无感，还在正常借网。
+        /// 心跳本来每 5 秒就发一次，让它捎带 enabled/expired，
+        /// 封禁就能在 5 秒内生效，且不增加任何额外请求。
+        /// </summary>
+        public static HbResult Heartbeat(Cfg cfg, long rxBytes, long txBytes, int conns, bool running,
+                                         string mode)
+        {
+            var res = new HbResult();
+            if (!cfg.Activated || string.IsNullOrEmpty(cfg.PortalUrl)) return res;
             try
             {
                 var url = cfg.PortalUrl.TrimEnd('/') + "/api/heartbeat";
@@ -219,9 +239,20 @@ namespace Ferry
                 var bytes = Encoding.UTF8.GetBytes(payload);
                 req.ContentLength = bytes.Length;
                 using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
-                using (req.GetResponse()) { }
+                using (var resp = req.GetResponse())
+                {
+                    var body = ReadBody(resp);
+                    if (body.Length > 0)
+                    {
+                        var d = MiniJson.ParseObject(body);
+                        res.Ok = MiniJson.Bool(d, "ok", false);
+                        res.Enabled = MiniJson.Bool(d, "enabled", true);
+                        res.Expired = MiniJson.Bool(d, "expired", false);
+                    }
+                }
             }
             catch (Exception) { }
+            return res;
         }
 
         public static VersionInfo Version(string portalUrl)

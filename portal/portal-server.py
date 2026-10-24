@@ -908,6 +908,33 @@ def traffic_of(db, ip):
             'firstSeen': first_seen}
 
 
+def license_state_of(cli):
+    """从一个 clients 行算出授权状态。
+
+    为什么抽出来：/api/license 和 /api/heartbeat 都要判这套逻辑。
+    抄两遍迟早会不一致 —— 那时候「心跳说能用、授权接口说不能用」，
+    客户端行为会变得完全不可预测。
+
+    到期是**软状态**（不落库）：用户续费后不用管理员手工改库，
+    下次查询自然就恢复了。
+    """
+    if not cli:
+        return {'enabled': False, 'expired': False, 'suspended': True,
+                'expiresAt': 0, 'daysLeft': 0, 'hoursLeft': 0}
+    exp = int(cli['expires_at'] or 0)
+    left = 0 if exp <= 0 else max(0, exp - now())
+    expired = exp > 0 and left <= 0
+    suspended = not bool(cli['enabled'])
+    return {
+        'enabled': (not suspended) and (not expired),
+        'expired': expired,
+        'suspended': suspended,
+        'expiresAt': exp,
+        'daysLeft': 0 if exp <= 0 else int(left // 86400),
+        'hoursLeft': int(left // 3600),
+    }
+
+
 def heartbeat_of(ip):
     """拿某 IP 的心跳快照；过期返回 None。"""
     with _hb_lock:
@@ -2702,22 +2729,82 @@ def md_to_html_brief(md):
 # 限速通过一个纯文本文件传递：门户写、中继每 5 秒读一次热更新。
 # 这样改限速不用重启中继（重启会掐断所有正在传的连接）。
 
-def relay_dir():
-    """中继脚本所在目录（rate-mb.txt 在这里）。"""
-    d = os.environ.get('FERRY_RELAY_DIR')
-    if d and os.path.isdir(d):
-        return d
-    # 默认位置：pcs 上部署脚本把中继放在 %LOCALAPPDATA%\Ferry
-    cand = [
-        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Ferry'),
-        os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'Ferry'),
-        os.path.dirname(os.path.abspath(__file__)),
-    ]
-    for c in cand:
-        if c and os.path.isfile(os.path.join(c, 'ferry-socks5-server.py')):
-            return c
-    return cand[0] if cand[0] else os.path.dirname(os.path.abspath(__file__))
+def _relay_dir_score(d):
+    """给候选目录打分。分高的是「真在用的中继目录」。
 
+    为什么需要打分：pcs 上存在多个 C:\\Users\\<某用户>\\AppData\\Local\\Ferry
+    （历史部署留下的）。glob 按字母序返回，会先命中 63526 而不是 PCserver，
+    而中继其实跑在 PCserver 下面 —— 于是门户把配置写进了没人读的目录。
+
+    判据：
+      · 有 rate-mb.txt      → 强烈说明这是活跃的中继目录（中继启动后一定会写/读它）
+      · 有 ferry-socks5-server.py → 基本要求
+      · 脚本 mtime 越新     → 越是刚部署的那个
+    """
+    score = 0
+    try:
+        if os.path.isfile(os.path.join(d, 'rate-mb.txt')):
+            score += 100
+        sp = os.path.join(d, 'ferry-socks5-server.py')
+        if os.path.isfile(sp):
+            score += 10
+            # 只取「小时」级别的差异，避免毫秒噪声
+            score += min(9, int(os.path.getmtime(sp)) % 10)
+    except Exception:
+        pass
+    return score
+
+
+def relay_dir():
+    """中继脚本所在目录（rate-mb.txt 在这里）。
+
+    ⚠ 不能只靠 %LOCALAPPDATA% 探测：门户是计划任务起的，
+    owner 可能是 NT AUTHORITY\\SYSTEM，那时 %LOCALAPPDATA% 指向
+    C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local。
+
+    ⚠ 也不能无脑取 glob 第一个：这台机器上有两个用户目录都带 Ferry，
+    glob 会先命中错的那个（见 _relay_dir_score 的说明）。
+    """
+    # ① 显式配置（部署脚本写的，最可靠）
+    conf = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'relay-dir.txt')
+    try:
+        if os.path.isfile(conf):
+            d = open(conf, encoding='utf-8').read().strip()
+            if d and os.path.isfile(os.path.join(d, 'ferry-socks5-server.py')):
+                return d
+    except Exception:
+        pass
+
+    # ② 环境变量
+    d = os.environ.get('FERRY_RELAY_DIR')
+    if d and os.path.isdir(d) and os.path.isfile(
+            os.path.join(d, 'ferry-socks5-server.py')):
+        return d
+
+    # ③ / ④ 候选 + glob，按分数挑最高
+    cands = [
+        os.path.join(os.environ.get('LOCALAPPDATA') or '', 'Ferry'),
+        os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'Ferry'),
+    ]
+    try:
+        import glob as _glob
+        cands += _glob.glob(os.path.join('C:\\Users', '*', 'AppData', 'Local', 'Ferry'))
+    except Exception:
+        pass
+
+    best, best_score = None, 0
+    for c in cands:
+        if not c or not os.path.isdir(c):
+            continue
+        sc = _relay_dir_score(c)
+        if sc > best_score:
+            best, best_score = c, sc
+
+    if best:
+        return best
+
+    # 全都没命中：回落到门户同目录（至少不会把配置写到 systemprofile 里去）
+    return os.path.dirname(os.path.abspath(__file__))
 
 def rate_conf_path():
     return os.path.join(relay_dir(), 'rate-mb.txt')
@@ -3898,7 +3985,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         note_totals(ip, h.get('dRx', 0), h.get('dTx', 0), h['rxBps'], h['txBps'])
         flush_totals(self.db)
         # 把算出来的速率回给客户端 —— 方便排查「为什么面板没数字」
-        self.send_json({'ok': True, 'rxBps': h['rxBps'], 'txBps': h['txBps']})
+        # 顺带把授权状态带回去。
+        # 为什么放在心跳里：管理员在后台停用一台机器时，客户端原来要等下一次
+        # CheckLicense（最长 6 小时）才断，那段时间用户完全无感还在借网。
+        # 心跳 5 秒一次，捎带这两个字段等于零成本快速生效。
+        try:
+            _lic = license_state_of(cli)
+        except Exception:
+            _lic = {'enabled': True, 'expired': False}
+        self.send_json({'ok': True, 'rxBps': h['rxBps'], 'txBps': h['txBps'],
+                        'enabled': bool(_lic.get('enabled')),
+                        'expired': bool(_lic.get('expired'))})
 
     def handle_api_license(self, qs):
         """查询当前授权状态与剩余时长（客户端每次启动 / 每小时调一次）。
@@ -3922,19 +4019,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({'ok': False, 'error': '授权信息无效'}, 401)
             return
 
-        exp = int(cli['expires_at'] or 0)
-        left = 0 if exp <= 0 else max(0, exp - now())
-        expired = exp > 0 and left <= 0
-        enabled = bool(cli['enabled']) and not expired
+        st = license_state_of(cli)
 
         self.send_json({
             'ok': True,
-            'enabled': enabled,
-            'expiresAt': exp,          # 0 = 永久
-            'daysLeft': 0 if exp <= 0 else int(left // 86400),
-            'hoursLeft': int(left // 3600),
-            'expired': expired,
-            'suspended': not bool(cli['enabled']),
+            'enabled': st['enabled'],
+            'expiresAt': st['expiresAt'],      # 0 = 永久
+            'daysLeft': st['daysLeft'],
+            'hoursLeft': st['hoursLeft'],
+            'expired': st['expired'],
+            'suspended': st['suspended'],
             'remoteHost': CFG['public_host'] or '10.13.24.1',
             'sshPort': CFG['ssh_port'],
             'httpPort': CFG['port'] + 1,
@@ -4185,12 +4279,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         cur = read_rate_conf()
+        _rd = relay_dir()
+        _rp = rate_conf_path()
+        try:
+            _exists = os.path.exists(_rp)
+            _mtime = int(os.stat(_rp).st_mtime) if _exists else 0
+        except Exception:
+            _exists, _mtime = False, 0
         self.send_json({
             'ok': True,
             'perIp': cur['perIp'],
             'total': cur['total'],
             'uplinkMbps': read_uplink_mbps(),
             'range': {'minMb': 0, 'maxMb': 5000},
+            # 诊断用：面板上「改了不生效」时，第一件要看的就是这两个。
+            # 门户以 SYSTEM 跑时 %LOCALAPPDATA% 会指向 systemprofile，
+            # 曾经因此把配置写进了另一个目录，而中继永远读不到。
+            'relayDir': _rd,
+            'rateFile': _rp,
+            'rateFileExists': _exists,
+            'rateFileMtime': _mtime,
+            'isSystem': (os.environ.get('USERNAME') or '').upper() == 'SYSTEM',
         })
     def handle_api_admin_live(self):
         """管理面版轮询用。只有管理员能看 —— 这里会暴露谁在用。"""
