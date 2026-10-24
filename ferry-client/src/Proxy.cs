@@ -30,6 +30,7 @@ namespace Ferry
     {
         readonly int _listenPort;
         readonly int _socksPort;
+        readonly string _socksHost;
         readonly Action<string> _log;
 
         TcpListener _listener;
@@ -37,9 +38,16 @@ namespace Ferry
         long _connTotal, _connActive, _bytesUp, _bytesDown;
 
         public ProxyServer(int listenPort, int socksPort, Action<string> log)
+            : this(listenPort, socksPort, "127.0.0.1", log)
+        {
+        }
+
+        /// <param name="socksHost">上游 SOCKS 所在主机。直连模式填远端 IP。</param>
+        public ProxyServer(int listenPort, int socksPort, string socksHost, Action<string> log)
         {
             _listenPort = listenPort;
             _socksPort = socksPort;
+            _socksHost = string.IsNullOrEmpty(socksHost) ? "127.0.0.1" : socksHost;
             _log = log ?? delegate { };
         }
 
@@ -81,7 +89,8 @@ namespace Ferry
                 t.IsBackground = true;
                 t.Name = "ferry-accept";
                 t.Start();
-                _log("代理已监听 127.0.0.1:" + _listenPort + "（上游 SOCKS " + _socksPort + "）");
+                _log("代理已监听 127.0.0.1:" + _listenPort + "（上游 SOCKS " +
+                     _socksHost + ":" + _socksPort + "）");
                 return true;
             }
             catch (Exception e)
@@ -196,7 +205,7 @@ namespace Ferry
             Socket upstream = null;
             try
             {
-                upstream = ConnectSocks(_socksPort, host, port, 8000);
+                upstream = ConnectSocks(_socksPort, host, port, 8000, _socksHost);
                 if (upstream == null) { ReplySocks5(ns, 0x05); return; }
                 ReplySocks5(ns, 0x00);
                 Pump(ns, new NetworkStream(upstream, true));
@@ -259,7 +268,7 @@ namespace Ferry
             Socket upstream = null;
             try
             {
-                upstream = ConnectSocks(_socksPort, host, port, 8000);
+                upstream = ConnectSocks(_socksPort, host, port, 8000, _socksHost);
                 if (upstream == null)
                 {
                     var err = Encoding.ASCII.GetBytes(
@@ -338,15 +347,25 @@ namespace Ferry
         /// <summary>
         /// 连本地 ssh -D 的 SOCKS5 端口并 CONNECT 到目标。
         /// 返回已建立的 Socket，失败返回 null。
+        ///
+        /// socksHost 默认 127.0.0.1（SSH 隧道的本地端口）。
+        /// 直连模式传远端 IP —— 这时上游是 pcs 上的 ferry-socks5-server.py。
+        ///
+        /// 为什么直连模式要单独一路：SSH 隧道转发时远端看到的源 IP 全是
+        /// 127.0.0.1，服务端没法按机器限速。直连才能让服务端识别是谁。
         /// </summary>
-        public static Socket ConnectSocks(int socksPort, string host, int port, int timeoutMs)
+        public static Socket ConnectSocks(int socksPort, string host, int port, int timeoutMs,
+                                          string socksHost = "127.0.0.1")
         {
             Socket s = null;
             try
             {
                 s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 s.NoDelay = true;
-                var ar = s.BeginConnect(IPAddress.Loopback, socksPort, null, null);
+                IPAddress up;
+                if (!IPAddress.TryParse(socksHost ?? "127.0.0.1", out up))
+                    up = IPAddress.Loopback;
+                var ar = s.BeginConnect(up, socksPort, null, null);
                 if (!ar.AsyncWaitHandle.WaitOne(timeoutMs)) { s.Close(); return null; }
                 s.EndConnect(ar);
 

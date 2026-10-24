@@ -52,6 +52,22 @@ namespace Ferry
         /// <summary>远端 UDP 中继端口。0 = 用默认 1080。</summary>
         public int UdpRelayPort = 1080;
 
+        // ── 直连模式（A 方案）──
+        /// <summary>
+        /// TCP 也直连远端 SOCKS5，不再走 SSH 隧道。
+        ///
+        /// 为什么默认开：
+        ///   SSH 隧道转发时远端看到的源 IP 全是 127.0.0.1，服务端没法按机器限速。
+        ///   直连之后服务端能识别来源 IP，限速才真正生效。
+        ///   而且一个上游同时提供 TCP + UDP，架构比「SSH 管 TCP、另开一路管 UDP」简单。
+        ///
+        /// 代价：链路上是明文 SOCKS5（校园网内可嗅探）。
+        /// 想加密就把这项关掉，退回 SSH 隧道模式（那时限速不生效）。
+        /// </summary>
+        public bool DirectSocks = true;
+        /// <summary>远端 SOCKS5 端口（直连模式用）。</summary>
+        public int RelayPort = 1080;
+
         public bool Activated { get { return !string.IsNullOrEmpty(Token); } }
 
         public int SocksPort { get { return HttpPort - 1; } }
@@ -86,6 +102,8 @@ namespace Ferry
                 c.UseTun = MiniJson.Bool(d, "useTun", false);
                 c.UdpRelayHost = MiniJson.Str(d, "udpRelayHost", "");
                 c.UdpRelayPort = MiniJson.Int(d, "udpRelayPort", 1080);
+                c.DirectSocks = MiniJson.Bool(d, "directSocks", true);
+                c.RelayPort = MiniJson.Int(d, "relayPort", 1080);
                 // UDP 中继默认跟远端同一台机（pcs 上的 Python 中继）
                 if (string.IsNullOrEmpty(c.UdpRelayHost)) c.UdpRelayHost = c.RemoteHost;
             }
@@ -120,7 +138,9 @@ namespace Ferry
             sb.Append("  \"netCheckSec\": ").Append(NetCheckSec).Append(",\n");
             sb.Append("  \"useTun\": ").Append(UseTun ? "true" : "false").Append(",\n");
             sb.Append("  \"udpRelayHost\": ").Append(Quote(UdpRelayHost)).Append(",\n");
-            sb.Append("  \"udpRelayPort\": ").Append(UdpRelayPort).Append("\n");
+            sb.Append("  \"udpRelayPort\": ").Append(UdpRelayPort).Append(",\n");
+            sb.Append("  \"directSocks\": ").Append(DirectSocks ? "true" : "false").Append(",\n");
+            sb.Append("  \"relayPort\": ").Append(RelayPort).Append("\n");
             sb.Append("}\n");
             var tmp = path + ".tmp";
             File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));

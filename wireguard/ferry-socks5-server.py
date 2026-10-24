@@ -49,6 +49,73 @@ import time
 # 回收太快会导致「刚才还通，现在要重新握手」。60 秒是经验值。
 UDP_IDLE_TIMEOUT = 60.0
 
+# ── 每 IP 限速 ──
+#
+# 为什么限速必须放在服务端：
+#   客户端是用户自己的机器，改个 config 就能绕过去。
+#   只有所有流量都必须经过的这个点才真正有效 —— 也就是这里。
+#   （TCP 以前走 ssh -D，sshd 转发时源 IP 全变成 127.0.0.1，根本没法按机器区分，
+#     所以那时候限速其实无处可放。现在 TCP 也走这个 SOCKS5，才有了统一的限速点。）
+#
+# 为什么用 GCRA 而不是令牌桶：
+#   令牌桶初始给满一桶，实测会瞬间超速 2.4 倍（项目里 old dual-proxy.mjs 踩过）。
+#   GCRA 只维护「下一个包最早可发时间」，天然没有初始突发。
+GCRA_TOLERANCE = 0.05   # 允许 50ms 突发，避免 TCP 窗口塌陷
+
+
+class RateLimiter:
+    """对某个源 IP 的带宽限制。rate_bps<=0 表示不限速。
+
+    用法：每发一块数据前 `await limiter.throttle(nbytes)`。
+    """
+
+    __slots__ = ('rate', 'tat')
+
+    def __init__(self, rate_bps):
+        self.rate = float(rate_bps or 0)
+        self.tat = 0.0          # theoretical arrival time（单调时钟）
+
+    def cost(self, nbytes):
+        """返回为了不超速，发这么多字节需要等多久（秒）。"""
+        if self.rate <= 0:
+            return 0.0
+        now = time.monotonic()
+        cost = nbytes / self.rate
+        earliest = max(now - GCRA_TOLERANCE, self.tat)
+        self.tat = earliest + cost
+        return max(0.0, self.tat - now)
+
+    async def throttle(self, nbytes):
+        delay = self.cost(nbytes)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+class RateTable:
+    """ip -> RateLimiter。按源 IP 共享，不是按连接。
+
+    为什么按 IP 而不是按连接：一个人能开 40 条连接（maxConnsPerUser），
+    按连接限速等于把总配额乘 40，限了跟没限一样。
+    """
+
+    def __init__(self, rate_bps):
+        self.rate_bps = rate_bps
+        self.lock = asyncio.Lock()
+        self.map = {}
+
+    async def get(self, ip):
+        if self.rate_bps <= 0:
+            return None
+        async with self.lock:
+            lim = self.map.get(ip)
+            if lim is None:
+                lim = self.map[ip] = RateLimiter(self.rate_bps)
+            return lim
+
+
+# 全局的限速表。main() 里按 --rate-mb 初始化。
+RATES = RateTable(0)
+
 
 def log(msg):
     print('[%s] %s' % (time.strftime('%H:%M:%S'), msg), flush=True)
@@ -62,12 +129,16 @@ def allowed_peer(ip, nets):
     return any(addr in n for n in nets)
 
 
-async def pipe(reader, writer, label, counter):
+async def pipe(reader, writer, label, counter, limiter=None):
     try:
         while True:
             data = await reader.read(65536)
             if not data:
                 break
+            # 先限速再写：反过来的话数据已经进内核缓冲区了，
+            # 那一段等于没限（实测双方向都这样会明显超速）。
+            if limiter is not None:
+                await limiter.throttle(len(data))
             writer.write(data)
             await writer.drain()
             counter[0] += len(data)
@@ -372,9 +443,12 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
         client_writer.write(b'\x05\x00\x00\x01' + b'\x00' * 6)
         await client_writer.drain()
 
+        # 按源 IP 限速。上行下行**共用同一个 limiter** —— 它们是一个用户的
+        # 总带宽，分别算等于把配额翻倍。
+        limiter = await RATES.get(peer_ip)
         await asyncio.gather(
-            pipe(client_reader, up_writer, 'up', counter),
-            pipe(up_reader, client_writer, 'down', counter),
+            pipe(client_reader, up_writer, 'up', counter, limiter),
+            pipe(up_reader, client_writer, 'down', counter, limiter),
         )
         log('%s → %s:%d 结束，%d 字节' % (peer_ip, host, port, counter[0]))
     except (asyncio.IncompleteReadError, ConnectionResetError):
@@ -391,6 +465,7 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
 
 
 async def main():
+    global RATES
     ap = argparse.ArgumentParser()
     ap.add_argument('--bind', default='0.0.0.0')
     ap.add_argument('--port', type=int, default=1080)
@@ -398,6 +473,8 @@ async def main():
                     help='允许的来源网段，逗号分隔。默认全部私网')
     ap.add_argument('--udp', action='store_true',
                     help='启用 UDP ASSOCIATE（默认关闭，因为它是可选的暴露面）')
+    ap.add_argument('--rate-mb', type=float, default=10.0,
+                    help='每个源 IP 的带宽上限（MB/s）。0 = 不限速。默认 10')
     args = ap.parse_args()
 
     nets = []
@@ -406,12 +483,16 @@ async def main():
         if part:
             nets.append(ipaddress.ip_network(part, strict=False))
 
+    rate_bps = int(max(0.0, args.rate_mb) * 1024 * 1024)
+    RATES = RateTable(rate_bps)
+
     server = await asyncio.start_server(
         lambda r, w: handle(r, w, nets, args.udp), args.bind, args.port)
     addrs = ', '.join(str(s.getsockname()) for s in server.sockets)
-    log('SOCKS5 监听 %s，允许来源 %s，UDP %s'
+    log('SOCKS5 监听 %s，允许来源 %s，UDP %s，限速 %s'
         % (addrs, ', '.join(str(n) for n in nets),
-           '已启用' if args.udp else '未启用'))
+           '已启用' if args.udp else '未启用',
+           ('%.1f MB/s / IP' % args.rate_mb) if rate_bps > 0 else '不限'))
     async with server:
         await server.serve_forever()
 
