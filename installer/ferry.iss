@@ -1,4 +1,4 @@
-﻿; ═══════════════════════════════════════════════════════════════════════
+; ═══════════════════════════════════════════════════════════════════════
 ;  渡口 Ferry · Windows 安装程序（Inno Setup 6）
 ;
 ;  架构（v0.8 起）：
@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "0.8.0"
+#define AppVersion "0.9.0"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -42,10 +42,35 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=Ferry
+; 装到 %LOCALAPPDATA%\Ferry，而不是 Program Files。
+;
+; 为什么用 per-user 目录 + admin 安装这个组合：
+;   · 配置文件（config.json / state.json）要和 exe 放一起，而且程序运行时要
+;     频繁改写它。放 Program Files 的话每次写都要提权（虽然 exe 已是管理员，
+;     但 Win11 的虚拟化重定向会让写入跑到 VirtualStore，排查起来很痛苦）。
+;   · UAC 提权是**同一个用户**的令牌提升，{localappdata} 仍然解析成
+;     提权前那个用户的路径（C:\Users\<你>\AppData\Local），不会装到
+;     Administrator 账户下。只有「右键 → 以其他用户身份运行」才会跑偏。
+;
+; ISCC 会为此报 UsedUserAreasWarning。这里显式关掉并说明理由 ——
+; 不是忽略问题，是确认过「单人单机、自己是管理员」这个场景下它是安全的。
+UsedUserAreasWarning=no
 DefaultDirName={localappdata}\Ferry
 DisableProgramGroupPage=yes
 DisableDirPage=yes
-PrivilegesRequired=lowest
+; PrivilegesRequired=admin：安装需要管理员。
+;
+; 为什么必须提权（实测过才定的，不是想当然）：
+;   ① 客户端 exe 的 manifest 是 requireAdministrator（TUN 要建虚拟网卡
+;      + 改路由表）。安装器如果用 lowest，[Run] 段调用它时会弹 UAC，
+;      **静默安装（/VERYSILENT）直接卡在那里** —— 装完等于没装。
+;   ② 免 UAC 的开机自启靠计划任务（RunLevel=HighestAvailable）。
+;      实测普通权限创建这种任务报 `ERROR: Access is denied.`（exit code 1），
+;      只有提权的安装器才能建成功。
+;
+; 代价：安装时弹一次 UAC。可以接受 —— 装一次而已，
+;       换来的是一劳永逸的免 UAC 自启。
+PrivilegesRequired=admin
 OutputDir=..\dist
 OutputBaseFilename=Ferry-Setup-{#AppVersion}
 Compression=lzma2/max
@@ -68,21 +93,44 @@ Name: "startmenuicon"; Description: "创建开始菜单快捷方式";           
 Name: "autostart";     Description: "开机自动启动（断网时自动接管）";   GroupDescription: "启动选项："; Flags: unchecked
 
 [Files]
-; 只有一个文件：SOCKS5+HTTP 双协议代理和隧道保活都已用 C# 写进 exe，
-; 目标机器只需要 Windows 自带的 ssh.exe，不再需要 Node.js / PowerShell 脚本。
+; 主程序：SOCKS5+HTTP 双协议代理和隧道保活都在 exe 里，
+; 目标机器只需要 Windows 自带的 ssh.exe，不需要 Node.js / PowerShell 脚本。
 Source: "..\dist\渡口助手.exe";              DestDir: "{app}"; Flags: ignoreversion
+
+; TUN 运行时（可选功能，但既然要做「游戏也能用」就必须带上）
+;
+; mihomo.exe 是 58 MB —— 安装包从 2 MB 变成 60 MB 左右，这是 TUN 的硬成本。
+; 不带的话 TUN 只能在装了 Clash Verge 的机器上用，那就不算「一键」了。
+; 用 lzma2/max 压缩后实际增量约 20 MB，可接受。
+;
+; ⚠ wintun.dll 必须和 mihomo.exe **放在同一目录**：
+;   mihomo 用 Windows 默认 DLL 搜索顺序找 wintun.dll（先找 exe 所在目录），
+;   放到别处会找不到，报的错还很含糊（"Cannot create a file when that file
+;   already exists" 或直接没反应）。实测踩过。
+Source: "..\mihomo\wintun.dll";              DestDir: "{app}"; Flags: ignoreversion
+Source: "..\vendor\mihomo.exe";              DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\渡口助手"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "在借网与直连之间切换"; Tasks: startmenuicon
 Name: "{autodesktop}\渡口助手";  Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "在借网与直连之间切换"; Tasks: desktopicon
-Name: "{userstartup}\渡口自动启动"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: autostart
+
+; 注意：这里**故意没有** {userstartup} 的快捷方式。
+;
+; 为什么：客户端的 manifest 是 requireAdministrator，往启动文件夹放 .lnk
+; 会导致每次开机弹一个 UAC 窗口，必须点「是」才能用 —— 跟「便捷」相反。
+; 改由 [Run] 里调客户端的 /install-autostart 参数，让它自己建一个
+; RunLevel=HighestAvailable 的计划任务（不弹 UAC）。见 [Code] 段。
 
 [Run]
+; 装完先设自启（如果需要），再启动程序。
+; /install-autostart 是客户端支持的一个静默参数。
+Filename: "{app}\{#AppExeName}"; Parameters: "/install-autostart"; \
+  Flags: runhidden waituntilterminated; Tasks: autostart
 Filename: "{app}\{#AppExeName}"; Description: "立即启动渡口助手"; \
   Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
-; 交给程序自己清：还原原代理 → 杀隧道/代理进程 → 删自启
+; 交给程序自己清：还原原代理 → 杀隧道/代理进程 → 删自启（含计划任务）
 Filename: "{app}\{#AppExeName}"; Parameters: "/uninstall"; \
   Flags: runhidden waituntilterminated; RunOnceId: "FerryCleanup"
 

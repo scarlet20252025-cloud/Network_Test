@@ -16,7 +16,7 @@ namespace Ferry
         Cfg _cfg;
         LicenseState _lic = new LicenseState();
 
-        Label _lblAcct, _lblBig, _lblDesc, _lblQuota, _rowTunnel, _rowBridge, _rowProxy;
+        Label _lblAcct, _lblBig, _lblDesc, _lblQuota, _rowTunnel, _rowBridge, _rowProxy, _rowTun;
         Panel _card, _logCard, _actCard;
         Label _lblActTitle, _lblActHint;
         TextBox _txtCode;
@@ -46,8 +46,18 @@ namespace Ferry
                     // 开机自启时不该弹窗，直接驻留托盘
                     BeginInvoke(new Action(delegate { Hide(); }));
                 }
+                // /start 参数：启动即借网。
+                // 用途：桌面快捷方式一键借网（不用先打开界面再点按钮），
+                // 也让自动化测试能可靠触发，不依赖窗口坐标。
+                if (StartBorrowOnLoad)
+                {
+                    BeginInvoke(new Action(delegate { DoStart(); }));
+                }
             };
         }
+
+        /// <summary>启动后立即借网（由 Program 解析 /start 参数设置）。</summary>
+        public bool StartBorrowOnLoad = false;
 
         // ── 界面 ────────────────────────────────────────────────
 
@@ -84,7 +94,10 @@ namespace Ferry
 
             // ── 状态卡 ──
             _card = Theme.Card(14);
-            _card.SetBounds(20, 80, 480, 190);
+            // 高度 200：四行明细最后一行在 y=180，行高 18，到 198，留 2px 余量。
+            // 踩过的坑：加第四行（TUN）时忘了同步加高卡片，那一行被底边裁掉一半 ——
+            // 界面看着像坏了，其实数据都对。
+            _card.SetBounds(20, 80, 480, 200);
             Controls.Add(_card);
 
             _lblBig = Theme.Text2("检查中", Theme.FBig, Theme.Muted);
@@ -102,6 +115,10 @@ namespace Ferry
             _rowTunnel = Row(_card, 120);
             _rowBridge = Row(_card, 140);
             _rowProxy = Row(_card, 160);
+            // 第四行：TUN 状态。默认隐藏（只在设置里勾了全局接管时才显示），
+            // 避免普通用户看到一行「未开启」以为是故障。
+            _rowTun = Row(_card, 180);
+            _rowTun.Visible = false;
 
             // ── 激活卡：输入框直接放在主界面，不弹窗 ──
             _actCard = Theme.Card(14);
@@ -776,6 +793,17 @@ namespace Ferry
                 SetText(_lblBig, "正在走渡口", Theme.Good);
                 SetText(_lblDesc, _exitVia.Length > 0
                     ? "流量经远端主机中转 · 出口 " + _exitVia : "流量经远端主机中转", Theme.Muted);
+
+                // TUN 是 borrowing 的附加信息，不是独立分支。
+                // 踩过的坑：一开始把它写成独立的 `if (...) { } else if (proxyOn ...)`，
+                // 结果那个 else 挂到了新加的 if 上，把「正在走渡口」覆盖成「借网异常」——
+                // 界面明明在正常工作却报错。教训：else-if 链中间不能插新分支。
+                if (_cfg.UseTun && !(rt != null && rt.TunRunning))
+                {
+                    var terr = rt != null ? rt.TunError : "";
+                    SetText(_lblDesc, "已借网，但全局接管（TUN）未启用 —— 只有认代理的程序生效。" +
+                        (terr.Length > 0 ? Environment.NewLine + "原因：" + terr : ""), Theme.Bad);
+                }
             }
             else if (proxyOn && proxySrv == borrowServer)
             {
@@ -802,6 +830,21 @@ namespace Ferry
 
             SetText(_rowProxy, "系统代理    " + (proxyOn ? "开  " + (proxySrv.Length > 0 ? proxySrv : "（未设置）") : "关"),
                     borrowing ? Theme.Good : Theme.Text);
+
+            // TUN 状态行。为什么单独一行而不是混在系统代理里：
+            // 这两件事是独立的 —— 系统代理可能开着但 TUN 没开（游戏不走），
+            // 也可能 TUN 开着但用户手动关了系统代理。分开显示才看得清。
+            if (_cfg.UseTun)
+            {
+                bool tunUp = rt != null && rt.TunRunning;
+                SetText(_rowTun, "全局接管    " + (tunUp ? "已开启（UDP低延迟模式）" : "未开启"),
+                        tunUp ? Theme.Good : Theme.Muted);
+                _rowTun.Visible = true;
+            }
+            else
+            {
+                _rowTun.Visible = false;
+            }
 
             _btnOn.Enabled = !_busy && !borrowing;
             _btnOff.Enabled = !_busy && (borrowing || runtimeUp || (proxyOn && proxySrv == borrowServer));

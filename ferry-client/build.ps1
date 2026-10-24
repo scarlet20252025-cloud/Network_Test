@@ -42,9 +42,20 @@ $icon = Join-Path $here 'app.ico'
 $iconArg = if (Test-Path $icon) { "/win32icon:$icon" } else { '' }
 
 # /codepage:65001 —— 源码里全是中文注释和界面文案，不指定代码页会按 ANSI 读，直接乱码
+#
+# /win32manifest —— 嵌入 app.manifest，让 exe 默认以管理员身份启动。
+# 为什么需要：TUN 模式要建虚拟网卡 + 改路由表，必须提权。
+# 没有 manifest 时用户得手动「右键→以管理员身份运行」，从快捷方式启动时
+# 那个选项还不生效，体验很差。
+# 注意 csc 的 /win32manifest 不接受空值，文件不存在就直接报错，
+# 不能像 icon 那样静默跳过 —— 静默跳过的结果是「以为嵌入了其实没有」。
+$manifest = Join-Path $here 'src\app.manifest'
+if (-not (Test-Path $manifest)) { throw "缺少 manifest：$manifest（TUN 需要它来提权）" }
+
 $args = @(
   '/nologo', '/target:winexe', "/out:$out", '/codepage:65001',
-  '/optimize+', '/platform:anycpu', '/warn:2'
+  '/optimize+', '/platform:anycpu', '/warn:2',
+  "/win32manifest:$manifest"
 ) + $refs + @($iconArg, '') + $srcs
 $args = $args | Where-Object { $_ -ne '' }
 

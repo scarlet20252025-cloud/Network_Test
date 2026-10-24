@@ -88,6 +88,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install-all.ps1
 需要代理的程序填 **`127.0.0.1:10810`**（HTTP + SOCKS5 同端口）。
 **系统代理不会被改动**，你原来的 Clash Verge 照常工作。
 
+**想要 UDP 低延迟 / 不认代理的程序也能用**：装 `Ferry-Setup-0.9.0.exe`（客户端），
+在设置里勾「UDP低延迟模式（全局接管）」。它会建一块虚拟网卡接管全部流量，
+连不认代理的程序也走渡口。需要管理员权限（安装包已默认要求）。详见 [docs/UDP低延迟模式.md](docs/UDP低延迟模式.md)。
+
 支持 UDP（游戏 / QUIC）—— 这是整条链路第一次具备这个能力。
 详见 [docs/一键部署与UDP.md](docs/一键部署与UDP.md)。
 
@@ -249,6 +253,7 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 | [docs/实测数据.md](docs/实测数据.md) | **全部实测数据**：可达性 / 抖动 / 带宽多源对比 / DNS / 稳定性 / 断网验证 |
 | [docs/踩坑记录.md](docs/踩坑记录.md) | 33 条实测踩坑，每条都有「为什么」和「怎么做」 |
 | [docs/一键部署与UDP.md](docs/一键部署与UDP.md) | **一键部署 + UDP 打通**：方案对比、实测数据、6 个新坑 |
+| [docs/UDP低延迟模式.md](docs/UDP低延迟模式.md) | **TUN 全局接管**：架构、为什么必须管理员、UAC 如何免掉、8 个坑 |
 | [docs/统一入口.md](docs/统一入口.md) | mihomo 常驻方案：端点、看护、状态持久化、自启编码三条硬要求 |
 | [docs/多人使用管理.md](docs/多人使用管理.md) | 接入架构、管理命令、面板字段、认证与配额 |
 | [docs/断网验证方法.md](docs/断网验证方法.md) | 三种验证方式、四类断网类型判定表 |

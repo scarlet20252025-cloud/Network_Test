@@ -1,6 +1,80 @@
 ## v0.10.0 — 2026-10-24
 
-> 工具层新增，客户端 exe / 安装包仍是 0.8.0。**不需要重新打包**。
+> 客户端 exe 与安装包升到 **0.9.0**（TUN + 默认管理员）。
+
+### UDP低延迟模式（TUN 全局接管）
+
+10810 那套是个 SOCKS5/HTTP 端点，只覆盖「认代理设置」的程序。多数游戏客户端
+直接连服务器、根本不看系统代理 —— 对它们来说渡口等于不存在。
+
+TUN 在网络层截获全部流量（含 UDP），才能做到「像普通网络一样」。
+
+**做法**：客户端不再自己实现 TCP/IP 栈，而是把 TUN 层委托给 mihomo：
+
+```
+TUN（截获全部流量）→ mihomo → 127.0.0.1:客户端自己的 SOCKS → ssh → 远端
+                    ↘ UDP → 远端 Python 中继
+```
+
+这样隧道、代理、认证、限速全部沿用现有实现，TUN 只是加在最外层。
+TUN 启动失败也不影响 SOCKS 模式 —— 只记 `TunError`，界面明确提示原因。
+
+**实测**：网卡 FerryTun 建立 → 全局出口从 116.23.159.136（电信）变 218.107.0.47
+（联通）→ DNS 被 fake-ip 接管（198.18.0.x）→ UDP 3/3 通。
+
+### 客户端默认以管理员启动
+
+`ferry-client/src/app.manifest` 声明 `requireAdministrator`，build.ps1 用
+`/win32manifest` 嵌入。用户双击就提权，不用手动「右键 → 以管理员身份运行」
+（那个选项从桌面快捷方式启动时还不生效）。
+
+**代价是弹 UAC**，所以配套解决了两件事：
+
+1. **开机自启改用计划任务**（`RunLevel=HighestAvailable`），登录时不弹 UAC。
+   实测普通权限创建这种任务报 `ERROR: Access is denied.`（exit 1），
+   所以安装器改成 `PrivilegesRequired=admin`。
+2. **安装时只弹一次 UAC**（`PrivilegesRequired=admin` + 装完自动建计划任务）。
+
+### 本轮踩的 8 个坑（每条都是实测）
+
+1. **`BaseDirectory` 末尾的 `\` + 引号 = 转义引号**。拼 `-d "C:\...\Ferry\"` 时
+   Windows 把 `\"` 当转义字符，mihomo 收到 `-d C:\...\Ferry" -f ...`，
+   报 `open ...tun-config.yaml\config.yaml`。修法：`TrimEnd('\\')`。
+2. **`AdapterExists` 判「存在」不够，必须判 `Status == Up`**。用
+   `netsh admin=disable` 清残留后，「已禁用」被系统记住，mihomo 重建同名网卡
+   直接是 Disabled 状态、且**不报错** —— 界面显示「已开启」，流量却全进不去。
+3. **`Get-Command python.exe` 第一个是 WindowsApps 的 Store 存根**，几 KB，
+   跑起来弹「去 Microsoft Store 安装」然后退出。必须排除路径含 `WindowsApps` 的。
+4. **中文路径 + 提权 = 失败**（仅 DSH workspace 目录）。`E:\肥鱼不乐园\` 下的 exe
+   无法提权启动，`E:\肥鱼不乐园2\`、`C:\...\测试中文\` 都正常。开发时要注意，
+   真正的安装目录 `%LOCALAPPDATA%\Ferry` 不受影响。
+5. **`else if` 链中间不能插新分支**。给 TUN 加失败提示时插了个独立 `if`，
+   结果后面那个 `else` 挂到了新 `if` 上，把「正在走渡口」覆盖成「借网异常」——
+   功能完全正常却报错。
+6. **加第四行明细必须同步加高卡片**。`_card` 高度 190、第四行在 y=180 高 18，
+   到 198 被底边裁掉一半。改成 200。
+7. **wintun.dll 必须和 mihomo.exe 同目录**。mihomo 用 Windows 默认 DLL 搜索
+   顺序，放到别处找不到，报错还很含糊。
+8. **客户端被强杀时 mihomo 子进程不跟着死**，网卡残留 → 下次启动撞名。
+   用 PID 文件 + `Remove-NetAdapter` 清理（`netsh disable` 没用，名字仍占用）。
+
+### 其它
+
+- 安装包从 2 MB 变成 **16.9 MB**（内嵌 mihomo 58 MB，lzma2 压缩后增量约 15 MB）。
+  这是 TUN 的硬成本 —— 不带的话 TUN 只能在装了 Clash Verge 的机器上用。
+- `tools/fetch-vendor.ps1`：打包前取 mihomo 二进制（不入库，61 MB）。
+- 客户端新增 `/start` `/stop` 参数：可用快捷方式一键借网，也让自动化测试
+  不依赖窗口坐标。
+- `--noproxy '*'` / `-f` 优先级 / `$ErrorActionPreference='Stop'` 等后端坑
+  见 [docs/一键部署与UDP.md](docs/一键部署与UDP.md)。
+
+---
+
+## v0.10.0-tools — 2026-10-24
+
+> 工具层版本（`mihomo/` 目录），编号与上面的客户端 0.9.0 独立。
+> 这轮把「两条线路合成一个固定端点」和「UDP 打通」做完了，
+> 客户端侧的 TUN 见上面的 0.9.0。
 
 ### UDP 打通：整条链路第一次能承载游戏和 QUIC
 

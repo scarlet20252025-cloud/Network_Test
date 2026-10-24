@@ -50,4 +50,10 @@ mihomo/*.lock
 mihomo/*.pid
 mihomo/wintun.dll
 
+# 第三方二进制（61 MB），不入库。用 tools/fetch-vendor.ps1 现取。
+# 但 wintun.dll 例外 —— 它只有 418 KB，而且版本必须和 mihomo 配套，
+# 单独下载容易拿错版本。mihomo/ 目录里那份随代码一起入库。
+vendor/*.exe
+vendor/*.zip
+
 versions/
