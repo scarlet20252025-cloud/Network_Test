@@ -164,11 +164,35 @@ def log(msg):
     print('[%s] %s' % (time.strftime('%H:%M:%S'), msg), flush=True)
 
 
+# 回环永远放行。
+#
+# 为什么：本机连自己的端口时源 IP 是 127.0.0.1，而 --allow 默认只有私网段
+# （10/8、172.16/12、192.168/16），于是「自己探测自己」被自己的规则拒绝 ——
+# 实测日志里堆了 60 多条「拒绝 127.0.0.1」，把真正的问题都埋了。
+#
+# 放行回环不增加任何暴露面：能连 127.0.0.1 的进程本来就已经在这台机上，
+# 有完全控制权。
+_LOOPBACK = None
+
+# 已经记过「拒绝」的源 IP。只用于抑制日志噪音，不参与鉴权。
+_rejected_seen = set()
+
+
+def _is_loopback(addr):
+    global _LOOPBACK
+    try:
+        return addr.is_loopback
+    except Exception:
+        return False
+
+
 def allowed_peer(ip, nets):
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
+    if _is_loopback(addr):
+        return True
     return any(addr in n for n in nets)
 
 
@@ -389,7 +413,12 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
     peer = client_writer.get_extra_info('peername')
     peer_ip = peer[0] if peer else '?'
     if not allowed_peer(peer_ip, nets):
-        log('拒绝 %s（不在允许的网段）' % peer_ip)
+        # 同一个 IP 只记第一次拒绝。
+        # 扫描器/误配置会连续撞很多次，全记下来会把日志刷满，
+        # 真正有用的记录（正常连接的断开、限速命中）就被埋了。
+        if peer_ip not in _rejected_seen:
+            _rejected_seen.add(peer_ip)
+            log('拒绝 %s（不在允许的网段，后续同 IP 不再记录）' % peer_ip)
         client_writer.close()
         return
 
