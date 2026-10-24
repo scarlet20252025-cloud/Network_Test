@@ -13,7 +13,11 @@ param(
   [int]$Port = 1080,
   [string]$InstallDir = "$env:LOCALAPPDATA\Ferry",
   [switch]$Uninstall,
-  [switch]$NoAutostart
+  [switch]$NoAutostart,
+  # 每个源 IP 的带宽上限（MB/s）。0 = 不限速。
+  # 为什么默认 10：这是「一个人别把共享出口占满」的经验值 ——
+  # 千兆校园网里 10 MB/s 单人已经很快，又不至于让第二个人卡死。
+  [double]$RateMb = 10
 )
 
 $ErrorActionPreference = 'Stop'
@@ -95,12 +99,32 @@ function Stop-Relay {
 
 function Start-Relay {
   param([string]$Python)
-  $args = '"{0}" -u "{1}" --port {2} --udp' -f $Python, $Target, $Port
+  # --rate-mb：每个源 IP 的带宽上限。0 表示不限速。
+  # 为什么限速在服务端而不是客户端：客户端是用户自己的机器，改个 config 就绕过去了。
+  $argStr = '-u "{0}" --port {1} --udp --rate-mb {2}' -f $Target, $Port, $RateMb
+
+  # ⚠ 用 .cmd 启动器，不要直接 `cmd.exe /c "..."` 里塞带引号的命令行。
+  #
+  # 踩过的坑：`cmd.exe /c ""C:\...\python.exe" -u "C:\...py" --port 1080 ... >> "log" 2>&1"`
+  # 这种三层引号在 WMI 下会被拆坏，python 拿到的是残缺参数，
+  # 表现是「spawn ret=0 看起来成功、端口却一直不通」——而且日志里什么都没有。
+  # 实测就这么白排查了一轮：文件是新的、命令行也带 --rate-mb，就是没限速，
+  # 因为进程根本没起来，一直是旧进程在服务。
+  #
+  # .cmd 里一行一条命令，没有嵌套引号，cmd.exe 解析不会出错。
+  $runner = Join-Path $InstallDir 'run-relay.cmd'
+  $lines = @(
+    '@echo off',
+    'chcp 936 >nul',
+    ('"' + $Python + '" ' + $argStr + ' >> "' + $LogFile + '" 2>&1')
+  )
+  $content = ($lines -join "`r`n") + "`r`n"
+  [IO.File]::WriteAllText($runner, $content, [Text.Encoding]::GetEncoding(936))
+
   # 用 WMI 创建进程：Process::Start 起的子进程会落在父进程的 Job 里，
   # ssh 会话一断（或调用方退出）整棵树被回收 —— 实测「刚装好就没了」。
-  $cmdline = 'cmd.exe /c "' + $args + ' >> "' + $LogFile + '" 2>&1"'
   $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-    CommandLine      = $cmdline
+    CommandLine      = 'cmd.exe /c "' + $runner + '"'
     CurrentDirectory = $InstallDir
   }
   if ($res.ReturnValue -ne 0) { Bad "创建进程失败 ReturnValue=$($res.ReturnValue)"; return $false }
@@ -192,7 +216,7 @@ if (-not $NoAutostart) {
 @echo off
 chcp 936 >nul
 rem 渡口 UDP 中继 - 登录时拉起（TCP CONNECT + UDP ASSOCIATE）
-start "" /min "$py" -u "$Target" --port $Port --udp
+start "" /min "$py" -u "$Target" --port $Port --udp --rate-mb $RateMb
 "@
     # .cmd 必须 GBK + 无 BOM + CRLF，三条都踩过：
     # 带 BOM → cmd.exe 把 BOM 当命令一部分，首行 @echo off 失效

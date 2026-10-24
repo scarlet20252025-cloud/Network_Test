@@ -135,6 +135,21 @@ CREATE TABLE IF NOT EXISTS events (
     detail      TEXT DEFAULT ''
 );
 
+-- 每台机器的累计流量与历史峰值。
+--
+-- 为什么单独存一张表而不是只留内存：_hourly 只保留最近 24 小时，
+-- 进程一重启就清空。「这台机器一共用了多少流量」这种问题必须跨重启可信，
+-- 否则详情窗里那个数字每次重启都归零，等于没有。
+CREATE TABLE IF NOT EXISTS traffic (
+    ip          TEXT PRIMARY KEY,
+    total_rx    INTEGER DEFAULT 0,
+    total_tx    INTEGER DEFAULT 0,
+    peak_rx     INTEGER DEFAULT 0,
+    peak_tx     INTEGER DEFAULT 0,
+    first_seen  INTEGER DEFAULT 0,
+    updated_at  INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
 """
@@ -802,9 +817,94 @@ def note_heartbeat(ip, rx, tx, conns, running):
         d_tx = max(0, tx - prev['tx']) if prev is not None else 0
         _hb[ip] = {'rx': rx, 'tx': tx, 'at': t,
                    'rxBps': rx_bps, 'txBps': tx_bps,
-                   'conns': conns, 'running': bool(running)}
+                   'conns': conns, 'running': bool(running),
+                   'dRx': d_rx, 'dTx': d_tx}
         note_hourly(ip, rx_bps, tx_bps, d_rx, d_tx)
         return _hb[ip]
+
+
+# ── 累计流量（内存累加 + 定期落库）──
+#
+# 为什么不每次心跳都写库：10 台机器 × 每 5 秒 = 2 次/秒 UPDATE，
+# 对 SQLite 不算重，但会持续占着写锁，和「面板读」抢。
+# 每 60 秒 flush 一次，崩溃最多丢 60 秒的量 —— 对这个用途完全够。
+_totals = {}          # ip -> {'rx','tx','peakRx','peakTx','first'}
+_totals_last_flush = 0.0
+TOTAL_FLUSH_SEC = 60
+
+
+def note_totals(ip, d_rx, d_tx, rx_bps, tx_bps):
+    """把这次心跳的增量累到内存。"""
+    t = _totals.get(ip)
+    if t is None:
+        t = _totals[ip] = {'rx': 0, 'tx': 0, 'peakRx': 0, 'peakTx': 0,
+                           'first': int(time.time())}
+    t['rx'] += max(0, d_rx)
+    t['tx'] += max(0, d_tx)
+    if rx_bps > t['peakRx']:
+        t['peakRx'] = rx_bps
+    if tx_bps > t['peakTx']:
+        t['peakTx'] = tx_bps
+
+
+def flush_totals(db, force=False):
+    """把内存里的累计量写回 DB。force=True 时无视间隔。"""
+    global _totals_last_flush
+    now_t = time.time()
+    if not force and now_t - _totals_last_flush < TOTAL_FLUSH_SEC:
+        return
+    if not _totals:
+        _totals_last_flush = now_t
+        return
+    items = list(_totals.items())
+    _totals_last_flush = now_t
+    for ip, t in items:
+        try:
+            db.x(
+                'INSERT INTO traffic (ip, total_rx, total_tx, peak_rx, peak_tx, first_seen, updated_at) '
+                'VALUES (?,?,?,?,?,?,?) '
+                'ON CONFLICT(ip) DO UPDATE SET '
+                '  total_rx = total_rx + excluded.total_rx,'
+                '  total_tx = total_tx + excluded.total_tx,'
+                '  peak_rx = MAX(peak_rx, excluded.peak_rx),'
+                '  peak_tx = MAX(peak_tx, excluded.peak_tx),'
+                '  updated_at = excluded.updated_at',
+                (ip, t['rx'], t['tx'], t['peakRx'], t['peakTx'],
+                 t['first'], int(now_t)))
+        except Exception as e:
+            sys.stderr.write('[traffic] flush %s failed: %s\n' % (ip, e))
+    # 已经写进 DB 的部分清零，避免下一轮重复累加
+    for ip, t in items:
+        if ip in _totals:
+            _totals[ip]['rx'] = 0
+            _totals[ip]['tx'] = 0
+            _totals[ip]['first'] = int(now_t)
+
+
+def traffic_of(db, ip):
+    """读某台机器的累计流量（DB 里的 + 还没落库的内存增量）。"""
+    row = None
+    try:
+        row = db.q1('SELECT * FROM traffic WHERE ip = ?', (ip,))
+    except Exception:
+        pass
+    total_rx = int(row['total_rx']) if row else 0
+    total_tx = int(row['total_tx']) if row else 0
+    peak_rx = int(row['peak_rx']) if row else 0
+    peak_tx = int(row['peak_tx']) if row else 0
+    first_seen = int(row['first_seen']) if row else 0
+
+    pend = _totals.get(ip)
+    if pend:
+        total_rx += pend['rx']
+        total_tx += pend['tx']
+        peak_rx = max(peak_rx, pend['peakRx'])
+        peak_tx = max(peak_tx, pend['peakTx'])
+        if not first_seen:
+            first_seen = pend['first']
+    return {'totalRx': total_rx, 'totalTx': total_tx,
+            'peakRx': peak_rx, 'peakTx': peak_tx,
+            'firstSeen': first_seen}
 
 
 def heartbeat_of(ip):
@@ -1371,6 +1471,35 @@ html[data-theme="light"] .arw.up{color:#d97706}
 .notecell .notein.saving{opacity:.6}
 .notecell .notein.bad{border-color:var(--err)}
 
+/* ── 机器详情弹窗 ──
+   点表格里的 IP 打开。用固定定位 + 半透明遮罩，不用 <dialog>（老浏览器兼容）。 */
+.modal{position:fixed;inset:0;z-index:900;display:none;
+  align-items:center;justify-content:center;padding:20px}
+.modal.open{display:flex}
+.modal-bg{position:absolute;inset:0;background:rgba(0,0,0,.55);
+  backdrop-filter:blur(2px)}
+.modal-box{position:relative;width:min(560px,100%);max-height:86vh;
+  background:var(--card);border:1px solid var(--line);border-radius:16px;
+  box-shadow:0 18px 50px rgba(0,0,0,.45);display:flex;flex-direction:column;
+  overflow:hidden}
+.modal-head{display:flex;align-items:center;justify-content:space-between;
+  padding:16px 18px 12px;border-bottom:1px solid var(--line)}
+.modal-title{font-size:16px;font-weight:700;font-family:Consolas,Monaco,monospace}
+.modal-close{background:transparent;border:0;color:var(--fg2);font-size:22px;
+  line-height:1;cursor:pointer;padding:0 4px;border-radius:6px}
+.modal-close:hover{color:var(--fg);background:var(--line)}
+.modal-body{padding:16px 18px 20px;overflow-y:auto;font-size:13px}
+.dgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin:0 0 4px}
+.ditem{background:var(--card2);border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px}
+.ditem .k{font-size:11.5px;color:var(--fg2);margin-bottom:5px}
+.ditem .v{font-size:15px;font-weight:600;font-family:Consolas,Monaco,monospace;
+  word-break:break-all}
+.ditem.wide{grid-column:1 / -1}
+.dsec{margin:16px 0 8px;font-size:12px;color:var(--fg2);letter-spacing:.4px}
+.devlist{margin:0;padding-left:16px;line-height:1.9;font-size:12px;color:var(--fg2)}
+.devlist b{color:var(--fg);font-weight:500}
+
 /* 授权档位：一排可选按钮，比下拉框少一次点击 */
 .tiers{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 0}
 .tier{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
@@ -1587,7 +1716,7 @@ html[data-theme="light"] .arw.up{color:#d97706}
       td.classList.remove('editing');
       inp.style.display = 'none';
       if (showValue !== undefined) {
-        txt.textContent = showValue || '点笔填写';
+        txt.textContent = showValue || '点击编辑';
         if (showValue) txt.classList.remove('empty');
         else txt.classList.add('empty');
       }
@@ -1648,7 +1777,139 @@ html[data-theme="light"] .arw.up{color:#d97706}
     var cells = document.querySelectorAll('.notecell');
     Array.prototype.forEach.call(cells, bindNote);
   }
-  bindAllNotes();
+
+  // ⚠ 必须等 DOM 就绪再绑。
+  //
+  // 踩过的坑：这段 <script> 是随 LIVE_UI 插在页面**靠前**位置的，
+  // 而备注所在的 <table> 在它后面。直接调 bindAllNotes() 时行还不存在，
+  // querySelectorAll 返回空 —— 表现就是「点笔毫无反应」，控制台也不报错。
+  // 实测就是这个原因。
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bindAllNotes);
+  } else {
+    bindAllNotes();
+  }
+
+  // ── 机器详情弹窗 ──
+  //
+  // 点表格里的 IP 打开。数据从 /api/admin/client?ip= 拿。
+  //
+  // 为什么放在这里而不是单独写个页面：管理员看的是「这一行」，跳走再回来
+  // 会丢失滚动位置和实时数据的连续性。弹窗更适合这种「顺带看一眼」的场景。
+  function fmtDur(sec){
+    if (!sec || sec < 0) return '—';
+    var d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
+        m = Math.floor(sec % 3600 / 60);
+    if (d > 0) return d + ' 天 ' + h + ' 小时';
+    if (h > 0) return h + ' 小时 ' + m + ' 分';
+    return m + ' 分';
+  }
+  function fmtTime(ts){
+    if (!ts) return '—';
+    var d = new Date(ts * 1000);
+    function p(n){ return (n < 10 ? '0' : '') + n; }
+    return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate()) +
+           ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  function item(k, v, wide){
+    return '<div class="ditem' + (wide ? ' wide' : '') + '"><div class="k">' + k +
+           '</div><div class="v">' + (v == null ? '—' : v) + '</div></div>';
+  }
+
+  function openDetail(ip){
+    var modal = document.getElementById('clientModal');
+    var body = document.getElementById('clientBody');
+    var title = document.getElementById('clientTitle');
+    if (!modal || !body) return;
+    title.textContent = ip;
+    body.innerHTML = '<div class="hint">加载中…</div>';
+    modal.classList.add('open');
+
+    fetch('/api/admin/client?ip=' + encodeURIComponent(ip),
+          {credentials:'same-origin', cache:'no-store'})
+      .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(d){
+        if (!d.ok) throw new Error(d.error || '读取失败');
+        var h = [];
+        h.push('<div class="dgrid">');
+        h.push(item('在线状态', d.online
+          ? '<span style="color:var(--accent)">在线</span> · ' + d.conns + ' 条连接'
+          : '<span style="color:var(--fg2)">离线</span>'));
+        h.push(item('授权', d.enabled
+          ? (d.expiresAt ? '<span style="color:var(--accent)">有效</span> · 到期 ' + fmtTime(d.expiresAt)
+                         : '<span style="color:var(--accent)">有效</span> · 永久')
+          : '<span style="color:var(--err)">已停用</span>'));
+        h.push(item('当前下行', d.online ? fmtBps(d.rxBps) : '—'));
+        h.push(item('当前上行', d.online ? fmtBps(d.txBps) : '—'));
+        h.push(item('累计下行', fmtBytes(d.totalRx)));
+        h.push(item('累计上行', fmtBytes(d.totalTx)));
+        h.push(item('历史最高下行', fmtBps(d.peakRx)));
+        h.push(item('历史最高上行', fmtBps(d.peakTx)));
+        h.push(item('近 24 小时流量',
+          fmtBytes(d.sum24Rx) + ' ↓ / ' + fmtBytes(d.sum24Tx) + ' ↑', true));
+        h.push(item('近 24 小时峰值',
+          fmtBps(d.peak24Rx) + ' ↓ / ' + fmtBps(d.peak24Tx) + ' ↑', true));
+        h.push('</div>');
+
+        h.push('<div class="dsec">时间线</div><ul class="devlist">');
+        h.push('<li>首次激活 <b>' + fmtTime(d.createdAt) + '</b>');
+        if (d.firstSeen) h.push('<li>首次上报流量 <b>' + fmtTime(d.firstSeen) + '</b>');
+        h.push('<li>最后活动 <b>' + fmtTime(d.lastSeen) + '</b>');
+        if (d.online && d.lastSeen) {
+          h.push('<li>已在线 <b>' + fmtDur(Math.floor(Date.now()/1000) - d.lastSeen) +
+                 '</b>（按最后心跳算）');
+        }
+        h.push('</ul>');
+
+        if (d.events && d.events.length) {
+          h.push('<div class="dsec">最近事件</div><ul class="devlist">');
+          d.events.forEach(function(e){
+            h.push('<li>' + fmtTime(e.ts) + ' · <b>' + e.kind + '</b>' +
+                   (e.detail ? ' · ' + e.detail : '') + '</li>');
+          });
+          h.push('</ul>');
+        }
+        body.innerHTML = h.join('');
+      })
+      .catch(function(e){
+        body.innerHTML = '<div class="hint" style="color:var(--err)">读取失败：' +
+                         (e.message || '网络错误') + '</div>';
+      });
+  }
+
+  function closeDetail(){
+    var m = document.getElementById('clientModal');
+    if (m) m.classList.remove('open');
+  }
+
+  function bindIpCells(){
+    var cells = document.querySelectorAll('.ipcell');
+    Array.prototype.forEach.call(cells, function(td){
+      if (td.getAttribute('data-bound') === '1') return;
+      td.setAttribute('data-bound', '1');
+      td.addEventListener('click', function(){
+        openDetail(td.getAttribute('data-ip'));
+      });
+    });
+    var bg = document.querySelector('#clientModal .modal-bg');
+    var btn = document.querySelector('#clientModal .modal-close');
+    if (bg && !bg.getAttribute('data-bound')) {
+      bg.setAttribute('data-bound', '1');
+      bg.addEventListener('click', closeDetail);
+    }
+    if (btn && !btn.getAttribute('data-bound')) {
+      btn.setAttribute('data-bound', '1');
+      btn.addEventListener('click', closeDetail);
+    }
+    document.addEventListener('keydown', function(e){
+      if (e.key === 'Escape') closeDetail();
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bindIpCells);
+  } else {
+    bindIpCells();
+  }
 
   function tick(){
     fetch('/api/admin/live', {credentials:'same-origin', cache:'no-store'})
@@ -1660,6 +1921,20 @@ html[data-theme="light"] .arw.up{color:#d97706}
   tick();
 })();
 </script>
+
+<!-- 机器详情弹窗的骨架。放在这里（跟着 LIVE_UI 一起）而不是页面最底部，
+     是为了让「弹窗样式 + 弹窗 JS + 弹窗 DOM」三件东西待在同一个位置，
+     改的时候不用满文件找。 -->
+<div class="modal" id="clientModal" aria-hidden="true">
+  <div class="modal-bg"></div>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="clientTitle">
+    <div class="modal-head">
+      <span class="modal-title" id="clientTitle">—</span>
+      <button type="button" class="modal-close" aria-label="关闭">&times;</button>
+    </div>
+    <div class="modal-body" id="clientBody"></div>
+  </div>
+</div>
 '''
 
 
@@ -1709,9 +1984,11 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
     #   彩色 emoji，跟深色主题打架；SVG 用 currentColor，永远跟着文字颜色走。
     cli_rows = ''.join(f"""<tr data-ip="{html.escape(r['ip'])}" data-rank="{1000000 - i}">
   <td class="st"><span class="dot off"></span><span class="stx">离线</span></td>
-  <td class="mono">{html.escape(r['ip'])}</td>
+  <td class="mono ipcell" data-ip="{html.escape(r['ip'])}" title="点击查看详情"
+      style="cursor:pointer;color:var(--accent);text-decoration:underline;
+             text-decoration-style:dotted;text-underline-offset:3px">{html.escape(r['ip'])}</td>
   <td class="notecell" data-ip="{html.escape(r['ip'])}" data-note="{html.escape(r['note'] or '')}">
-    <span class="notetxt{' empty' if not r['note'] else ''}">{html.escape(r['note'] or '点笔填写')}</span>
+    <span class="notetxt{' empty' if not r['note'] else ''}">{html.escape(r['note'] or '点击编辑')}</span>
     <button type="button" class="notebtn" title="编辑备注" aria-label="编辑备注">
       <svg viewBox="0 0 16 16" width="12" height="12" fill="none"
            stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
@@ -2515,6 +2792,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_logout()
             elif path == '/api/admin/live':
                 self.handle_api_admin_live()
+            elif path == '/api/admin/client':
+                self.handle_api_admin_client(
+                    urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
             elif path == '/admin':
                 self.handle_admin()
             elif path == '/proxy.mjs':
@@ -3076,6 +3356,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             rx = tx = conns = 0
 
         h = note_heartbeat(ip, rx, tx, conns, body.get('running'))
+        # 累计量直接用 note_heartbeat 算好的增量（它已经和上一次心跳比过）。
+        # 不要在这里另存一份"上次的值" —— HTTPServer 每个请求都是新的处理实例，
+        # 挂在 self 上的属性下一个请求就没了。
+        note_totals(ip, h.get('dRx', 0), h.get('dTx', 0), h['rxBps'], h['txBps'])
+        flush_totals(self.db)
         # 把算出来的速率回给客户端 —— 方便排查「为什么面板没数字」
         self.send_json({'ok': True, 'rxBps': h['rxBps'], 'txBps': h['txBps']})
 
@@ -3253,6 +3538,67 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.redirect('/', cookie='bn_sess=; Path=/; Max-Age=0')
 
     # ── 管理 ──
+
+    def handle_api_admin_client(self, qs):
+        """单台机器的详情：累计流量、历史峰值、授权、在线、事件。
+
+        给管理面板的「点 IP 看详情」用。
+
+        为什么要有这页：管理面板的表格只能扫一眼当前状态，
+        而「这台机器一共用了多少流量」「历史上最快跑过多少」「什么时候激活的」
+        这些要翻库才知道。管理员想判断「是不是有人偷偷挂下载」时，
+        这几个数字比瞬时速率有用得多。
+        """
+        if not self._require_admin():
+            return
+        ip = (qs.get('ip') or [''])[0].strip()
+        if not ip:
+            self.send_json({'ok': False, 'error': 'missing ip'}, 400)
+            return
+
+        cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
+        if not cli:
+            self.send_json({'ok': False, 'error': 'not found'}, 404)
+            return
+
+        hb = heartbeat_of(ip)
+        tr = traffic_of(self.db, ip)
+        hours = hourly_of(ip)
+
+        # 最近 24 小时的峰值（hourly 里的，跟总历史峰值分开给）
+        peak24rx = max([h['peakRx'] for h in hours] or [0])
+        peak24tx = max([h['peakTx'] for h in hours] or [0])
+        sum24rx = sum(h['rx'] for h in hours)
+        sum24tx = sum(h['tx'] for h in hours)
+
+        ev = self.db.q(
+            'SELECT ts, kind, detail FROM events WHERE ip = ? ORDER BY id DESC LIMIT 20',
+            (ip,))
+
+        self.send_json({
+            'ok': True,
+            'ip': ip,
+            'note': cli['note'] or '',
+            'enabled': bool(cli['enabled']),
+            'createdAt': int(cli['created_at'] or 0),
+            'expiresAt': int(cli['expires_at'] or 0),
+            'lastSeen': int(cli['last_seen'] or 0),
+            'online': hb is not None,
+            'rxBps': int(hb['rxBps']) if hb else 0,
+            'txBps': int(hb['txBps']) if hb else 0,
+            'conns': int(hb['conns']) if hb else 0,
+            'totalRx': tr['totalRx'],
+            'totalTx': tr['totalTx'],
+            'peakRx': tr['peakRx'],
+            'peakTx': tr['peakTx'],
+            'firstSeen': tr['firstSeen'],
+            'peak24Rx': peak24rx,
+            'peak24Tx': peak24tx,
+            'sum24Rx': sum24rx,
+            'sum24Tx': sum24tx,
+            'events': [{'ts': int(r['ts']), 'kind': r['kind'], 'detail': r['detail']}
+                       for r in ev],
+        })
 
     def handle_api_admin_live(self):
         """管理面版轮询用。只有管理员能看 —— 这里会暴露谁在用。"""

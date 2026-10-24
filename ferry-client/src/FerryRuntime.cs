@@ -77,43 +77,83 @@ namespace Ferry
                 _log("端口被占用，已调整：SOCKS " + _socksPort + " → HTTP " + _httpPort +
                      "（原设定 " + _cfg.SocksPort + "/" + _cfg.HttpPort + "）");
 
-            // ① 隧道
-            _tunnel = new Tunnel(_cfg, _socksPort, _log);
-            if (!_tunnel.Start()) { _tunnel = null; return "隧道启动失败"; }
+            // 上游 SOCKS 的位置：直连模式在远端，隧道模式在本机。
+            string upstreamHost = "127.0.0.1";
+            int upstreamPort = _socksPort;
 
-            // ② 等 SOCKS 端口真的能连（ssh 建隧道要一点时间）
-            bool ok = false;
-            for (int i = 0; i < 40; i++)
+            if (_cfg.DirectSocks)
             {
-                Thread.Sleep(500);
-                if (PortOpen(_socksPort, 300)) { ok = true; break; }
-                if (_tunnel == null || !_tunnel.Alive) break;
+                // ── 直连模式（A 方案）──
+                //
+                // 不启 ssh，直接把上游指向远端 pcs 的 SOCKS5。
+                // 这样服务端看到的源 IP 就是本机，能按机器限速。
+                // 一个上游同时提供 TCP 和 UDP，比「SSH 管 TCP、另开一路管 UDP」简单。
+                //
+                // 代价是明文 —— 想加密就关掉 DirectSocks 退回隧道模式。
+                upstreamHost = _cfg.RemoteHost;
+                upstreamPort = _cfg.RelayPort > 0 ? _cfg.RelayPort : 1080;
+
+                _log("直连模式：上游 " + upstreamHost + ":" + upstreamPort + "（不走 SSH，服务端可限速）");
+
+                bool reach = false;
+                for (int i = 0; i < 20; i++)
+                {
+                    if (PortOpen(upstreamHost, upstreamPort, 600)) { reach = true; break; }
+                    Thread.Sleep(300);
+                }
+                if (!reach)
+                    return "连不上远端 SOCKS " + upstreamHost + ":" + upstreamPort +
+                           "（确认远端中继在跑、端口没被防火墙挡）";
             }
-            if (!ok)
+            else
             {
-                _tunnel.Stop();
-                _tunnel = null;
-                return "隧道没能在 20 秒内建立（检查远端是否可达、密钥是否已授权）";
+                // ① 隧道（老路径，加密但限速不生效）
+                _tunnel = new Tunnel(_cfg, _socksPort, _log);
+                if (!_tunnel.Start()) { _tunnel = null; return "隧道启动失败"; }
+
+                // ② 等 SOCKS 端口真的能连（ssh 建隧道要一点时间）
+                bool ok = false;
+                for (int i = 0; i < 40; i++)
+                {
+                    Thread.Sleep(500);
+                    if (PortOpen(_socksPort, 300)) { ok = true; break; }
+                    if (_tunnel == null || !_tunnel.Alive) break;
+                }
+                if (!ok)
+                {
+                    _tunnel.Stop();
+                    _tunnel = null;
+                    return "隧道没能在 20 秒内建立（检查远端是否可达、密钥是否已授权）";
+                }
             }
 
-            // ③ 本地代理
-            _proxy = new ProxyServer(_httpPort, _socksPort, _log);
+            // ③ 本地代理：入口还是本机，只是上游可能是远端
+            //
+            // 直连模式下本地**不再单独开 SOCKS 端口** —— ProxyServer 那个混合端口
+            // （_httpPort）本身就同时吃 HTTP 和 SOCKS5，再开一个纯 SOCKS 端口是浪费。
+            // 所以把 _socksPort 设成 _httpPort，让 UI 和 ports.json 反映真实情况
+            // （以前这里会另外 FindFree 一个端口，但根本没监听它，日志里那个号是假的）。
+            if (_cfg.DirectSocks) _socksPort = _httpPort;
+            _proxy = new ProxyServer(_httpPort, upstreamPort, upstreamHost, _log);
             if (!_proxy.Start())
             {
                 _proxy = null;
-                _tunnel.Stop();
-                _tunnel = null;
+                if (_tunnel != null) { _tunnel.Stop(); _tunnel = null; }
                 return "本地代理端口 " + _httpPort + " 起不来";
             }
 
             _running = true;
 
-            // ⑤ TUN（可选）：在 SOCKS 已经跑通之后再加一层。
+            // ⑤ TUN（可选）：在代理已经跑通之后再加一层。
             //
-            // 为什么放在最后而不是最前：
-            //   TUN 的上游就是这个 SOCKS 端口。SOCKS 没起来就开 TUN，
+            // 为什么放在最后：TUN 的上游就是本机代理端口。代理没起来就开 TUN，
             //   等于把所有流量导进一个死端口 —— 那几秒会彻底断网。
-            //   放在最后，失败了也只是「TUN 不可用」，原有 SOCKS 照常工作。
+            //   放在最后，失败了也只是「TUN 不可用」，原有代理照常工作。
+            //
+            // 为什么上游传 _httpPort 而不是 _socksPort：
+            //   _httpPort 是本地 ProxyServer 的混合端口（同时听 HTTP 和 SOCKS5），
+            //   让 TUN 走它能把这个层级的字节数也算进去 —— 心跳上报的流量才准。
+            //   直接传 _socksPort 会绕过 ProxyServer，TUN 那部分流量面板上看不到。
             //
             // 为什么失败不算整体失败：
             //   TUN 需要管理员 + wintun.dll。缺一个就开不了，但用户借网
@@ -122,7 +162,7 @@ namespace Ferry
             {
                 _tunError = "";
                 _tun = new TunMode(_cfg, _appDir, _log);
-                var terr = _tun.Start(_socksPort, _cfg.UdpRelayHost, _cfg.UdpRelayPort);
+                var terr = _tun.Start(_httpPort, _cfg.UdpRelayHost, _cfg.UdpRelayPort);
                 if (terr.Length > 0)
                 {
                     _tunError = terr;
@@ -182,11 +222,20 @@ namespace Ferry
 
         static bool PortOpen(int port, int timeoutMs)
         {
+            return PortOpen("127.0.0.1", port, timeoutMs);
+        }
+
+        /// <summary>探任意主机的端口。直连模式要探远端，不能只探回环。</summary>
+        static bool PortOpen(string host, int port, int timeoutMs)
+        {
             try
             {
                 using (var c = new System.Net.Sockets.TcpClient())
                 {
-                    var ar = c.BeginConnect(System.Net.IPAddress.Loopback, port, null, null);
+                    System.Net.IPAddress addr;
+                    if (!System.Net.IPAddress.TryParse(host ?? "", out addr))
+                        addr = System.Net.IPAddress.Loopback;
+                    var ar = c.BeginConnect(addr, port, null, null);
                     if (!ar.AsyncWaitHandle.WaitOne(timeoutMs)) return false;
                     c.EndConnect(ar);
                     return true;
