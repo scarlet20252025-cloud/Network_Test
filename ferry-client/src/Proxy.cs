@@ -36,6 +36,19 @@ namespace Ferry
         TcpListener _listener;
         volatile bool _running;
         long _connTotal, _connActive, _bytesUp, _bytesDown;
+        long _connRejected;
+
+        /// <summary>
+        /// 同时处理的连接上限。
+        ///
+        /// 为什么是 400：每个连接占 3 个线程（1 个 conn + 2 个 copy），
+        /// 400 连接 = 1200 线程，已经接近「上下文切换开始明显拖慢」的量级。
+        /// 正常使用（浏览器几十个标签 + 几个后台程序）远到不了这个数；
+        /// 真到了说明有别的东西在刷连接，这时候拒绝比拖死整机好。
+        /// </summary>
+        const int MaxConns = 400;
+
+        public long ConnRejected { get { return Interlocked.Read(ref _connRejected); } }
 
         public ProxyServer(int listenPort, int socksPort, Action<string> log)
             : this(listenPort, socksPort, "127.0.0.1", log)
@@ -118,9 +131,29 @@ namespace Ferry
 
                 var c = client;
                 Interlocked.Increment(ref _connTotal);
-                Interlocked.Increment(ref _connActive);
+
+                // 并发上限。超过就**直接拒绝**，不要无限制开线程。
+                //
+                // 为什么需要：TUN 全局接管时，本机所有程序的所有连接都进这里。
+                // 一个浏览器开 20 个标签就是几百连接，每个连接要
+                // 1 个 HandleConn 线程 + 2 个 copy 线程 —— 无上限的话
+                // 很容易上千线程，上下文切换把整机拖慢，
+                // 而且进程句柄数会顶到系统上限（实测 40 连接已 984 句柄）。
+                //
+                // 拒绝对协议是安全的：HTTP 客户端会看到连接被关并重试，
+                // SOCKS5 会失败，都比让整机卡死好。
+                long active = Interlocked.Increment(ref _connActive);
+                if (active > MaxConns)
+                {
+                    Interlocked.Decrement(ref _connActive);
+                    Interlocked.Increment(ref _connRejected);
+                    try { c.Close(); } catch (Exception) { }
+                    continue;
+                }
+
                 var t = new Thread(delegate () { HandleConn(c); });
                 t.IsBackground = true;
+                t.Name = "ferry-conn";
                 t.Start();
             }
         }
@@ -454,13 +487,44 @@ namespace Ferry
                 catch (Exception) { }
             };
 
-            var t1 = Task.Factory.StartNew(delegate () { copy(a, b, true); });
-            var t2 = Task.Factory.StartNew(delegate () { copy(b, a, false); });
-            Task.WaitAny(new Task[] { t1, t2 });
+            // ⚠ 用**专用线程**，不用 Task.Factory.StartNew。
+            //
+            // 踩过的坑：原来这里两个方向都走 Task.Factory.StartNew，而 copy()
+            // 里是同步阻塞的 src.Read —— 这是线程池反模式。
+            // 线程池遇到「一堆阻塞任务」会每秒只注入 1~2 个新线程，
+            // 连接一多就严重积压：新连接迟迟拿不到执行机会，
+            // 而同一线程池上还有心跳上报、授权检查、UI 回调在排队 ——
+            // 整机都跟着卡。实测 40 个连接时客户端已经 61 线程。
+            //
+            // 换成未托管的专用线程：每个方向一个，生命周期明确，
+            // 不占用线程池配额，卡也只卡它自己那条连接。
+            var anyDone = new ManualResetEventSlim(false);
+
+            Thread th1 = new Thread(delegate ()
+            {
+                try { copy(a, b, true); } catch (Exception) { } finally { anyDone.Set(); }
+            });
+            Thread th2 = new Thread(delegate ()
+            {
+                try { copy(b, a, false); } catch (Exception) { } finally { anyDone.Set(); }
+            });
+            th1.IsBackground = true;
+            th2.IsBackground = true;
+            th1.Name = "ferry-copy-up";
+            th2.Name = "ferry-copy-down";
+            th1.Start();
+            th2.Start();
+
+            // 任一方向结束就收尾，绝不等两个都 EOF。
+            // 超长兜底 6 小时：防止某个 socket 卡死在半开状态导致线程永久泄漏。
+            anyDone.Wait(TimeSpan.FromHours(6));
+
             // 一端结束 → 两端都关，另一端自然退出
             try { a.Close(); } catch (Exception) { }
             try { b.Close(); } catch (Exception) { }
-            try { Task.WaitAll(new Task[] { t1, t2 }, 3000); } catch (Exception) { }
+            th1.Join(3000);
+            th2.Join(3000);
+            anyDone.Dispose();
         }
 
         // ── 小工具 ──────────────────────────────────────────────
