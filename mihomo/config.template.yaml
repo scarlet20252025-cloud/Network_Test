@@ -40,13 +40,14 @@ profile:
 
 proxies:
   # 上游一：SSH 动态转发（pcs，联通出口）
-  # 只支持 TCP（OpenSSH 的 -D 不实现 SOCKS5 UDP ASSOCIATE），udp: true 是
-  # 让 mihomo 去试；上游拒绝时它自己回落到 TCP，不会崩。
+  # 只支持 TCP（OpenSSH 的 -D 不实现 SOCKS5 UDP ASSOCIATE）。
+  # udp: false 是**故意**的：写 true 会让 mihomo 真的去试 UDP，
+  # 每个 UDP 包先失败再回落，游戏/DNS 反而更慢。明确关掉更诚实。
   - name: ferry-ssh
     type: socks5
     server: 127.0.0.1
     port: __SSH_PORT__
-    udp: true
+    udp: false
 
   # 上游二：WireGuard 隧道内的远端 SOCKS5（xt，电信出口）
   # 远端 ferry-socks5-server.py 只实现 CONNECT，同样只有 TCP。
@@ -54,10 +55,26 @@ proxies:
     type: socks5
     server: 10.66.67.1
     port: 1080
+    udp: false
+
+  # 上游三：pcs 上的 UDP 中继（**唯一支持 UDP 的线路**）
+  #
+  # 这是 ferry-socks5-server.py v2 新增的 UDP ASSOCIATE 能力。
+  # 走的是校园网直连（不是 WG、不是 SSH），实测 UDP 往返 6.8ms。
+  #
+  # 为什么不复用 ferry-ssh：OpenSSH 的 -D 在协议层面就不实现 UDP ASSOCIATE，
+  # 那是 ssh 的限制，不是配置问题。
+  # 为什么单独起一条而不是替换 ferry-ssh：TCP 走 SSH 更稳（实测 5.2–9.3 MB/s），
+  # UDP 才走这条。两条各管一段，规则里按流量类型分流。
+  - name: ferry-udp
+    type: socks5
+    server: __UDP_HOST__
+    port: __UDP_PORT__
     udp: true
 
 proxy-groups:
   # 自动线路：按健康检查结果自动选，第一条挂了自动切第二条
+  # 只含 TCP 线路 —— UDP 走不了 SSH/WG，见下面的 ferry-udp-group
   - name: ferry-auto
     type: fallback
     proxies: [ferry-ssh, ferry-wg]
@@ -66,11 +83,23 @@ proxy-groups:
     interval: 30
     tolerance: 50
 
-  # 总开关：默认 DIRECT（等于不借网），切到 ferry-auto 就自动借网
-  # 这样「开/关借网」和「选哪条线」是同一个动作，不需要两个开关
+  # 总开关（TCP）：默认 DIRECT（等于不借网），切到 ferry-auto 就自动借网
   - name: ferry
     type: select
     proxies: [DIRECT, ferry-auto, ferry-ssh, ferry-wg]
+
+  # 总开关（UDP）：**独立的一个组**，因为 UDP 只有一条可用线路。
+  #
+  # 为什么不把 ferry-udp 塞进上面的 ferry 组：
+  #   那个组里有 ferry-ssh / ferry-wg，它们 udp: false。mihomo 选到它们时
+  #   UDP 包会被直接丢弃 —— 用户看到的是「开了借网，游戏还是连不上」，
+  #   而且没有任何报错可查。
+  #   分开之后规则用 NETWORK,udp 精确分流，TCP 和 UDP 各走各的路。
+  #
+  # 默认也是 DIRECT。On/Off 会同时切两个组，用户仍然只有一个开关。
+  - name: ferry-udp-group
+    type: select
+    proxies: [DIRECT, ferry-udp]
 
 rules:
   # 内网与回环永远直连 —— 借网时如果把这些也代理出去，
@@ -79,5 +108,7 @@ rules:
   - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
   - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
   - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
-  # 其余全部交给 ferry 组决定
+  # UDP 单独分流：只有 ferry-udp 这条线路能承载
+  - NETWORK,udp,ferry-udp-group
+  # 其余（TCP）全部交给 ferry 组决定
   - MATCH,ferry

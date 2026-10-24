@@ -71,6 +71,19 @@ $MiExe = 'D:\Clash Verge\verge-mihomo.exe'
 # SSH 隧道端口候选（按优先级）。探测时会跳过没在听的。
 $SshPortCandidates = @(10800, 10801, 10808, 10809)
 
+# 远端 UDP 中继（pcs 上的 ferry-socks5-server.py --udp）。
+# 这是整条链路唯一能承载 UDP 的线路，详见 config.template.yaml 里的注释。
+$UdpHost = '10.13.24.1'
+$UdpPort = 1080
+
+# SSH 隧道目标。pcs 在 ~/.ssh/config 里有别名，但这里写全参数更明确 ——
+# 自启时环境变量/配置目录可能不完整，别名解析失败会得到「Could not resolve」。
+$SshTarget = 'pcserver@10.13.24.1'
+$SshPort   = 22
+
+# 记录上一次用过的 SSH 端口，避免看护循环每次都重复渲染配置
+$script:LastSshPort = -1
+
 $StartupDir = [Environment]::GetFolderPath('Startup')
 $StartupCmd = Join-Path $StartupDir 'FerryMihomo.cmd'
 
@@ -198,11 +211,30 @@ function Build-Config {
   $out = $raw.
     Replace('__MIXED_PORT__', [string]$MixedPort).
     Replace('__API_PORT__', [string]$ApiPort).
-    Replace('__SSH_PORT__', [string]$sshPort)
+    Replace('__SSH_PORT__', [string]$sshPort).
+    Replace('__UDP_HOST__', $UdpHost).
+    Replace('__UDP_PORT__', [string]$UdpPort)
   # mihomo 要求 UTF-8 无 BOM（带 BOM 会报 yaml 解析错）
   [IO.File]::WriteAllText($ConfigPath, $out, (New-Object Text.UTF8Encoding $false))
-  Write-KLog "配置已渲染: SSH=$sshPort mixed=$MixedPort api=$ApiPort"
+  Write-KLog "配置已渲染: SSH=$sshPort mixed=$MixedPort api=$ApiPort UDP=$UdpHost`:$UdpPort"
   return $sshPort
+}
+
+# 远端 UDP 中继是否活着。
+#
+# 为什么要单独探测而不是等 mihomo 自己发现：mihomo 的健康检查只测 TCP
+# （fallback 组的 url 是 http://...）。UDP 线路死了它不会报，用户只会看到
+# 「游戏连不上」而查不到原因。这里用一次 TCP 连接确认 relay 进程在，
+# 因为同一个进程既提供 TCP CONNECT 也提供 UDP ASSOCIATE。
+function Test-UdpRelay {
+  param([int]$TimeoutMs = 800)
+  try {
+    $c = New-Object Net.Sockets.TcpClient
+    $iar = $c.BeginConnect($UdpHost, $UdpPort, $null, $null)
+    $ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+    $c.Close()
+    return [bool]$ok
+  } catch { return $false }
 }
 
 # ---------------- 启停 ----------------
@@ -273,7 +305,9 @@ function Restore-Selection {
   if (@('DIRECT', 'ferry-auto', 'ferry-ssh', 'ferry-wg') -notcontains $want) { return }
   if ($want -eq 'DIRECT') { return }   # 默认就是这个，不用 PUT
   $null = Invoke-Api '/proxies/ferry' 'PUT' (@{ name = $want } | ConvertTo-Json -Compress)
-  Write-KLog "已恢复上次选择: $want"
+  # UDP 组跟着一起恢复，否则重启后 TCP 在借网、UDP 在直连，用户会觉得时好时坏
+  $null = Invoke-Api '/proxies/ferry-udp-group' 'PUT' (@{ name = 'ferry-udp' } | ConvertTo-Json -Compress)
+  Write-KLog "已恢复上次选择: $want（UDP 也切到 ferry-udp）"
 }
 
 function Save-Selection {
@@ -284,6 +318,108 @@ function Save-Selection {
 function Get-KeeperProc {
   Get-CimInstance Win32_Process -Filter "Name='powershell.exe' or Name='pwsh.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like '*mihomo-keeper.ps1*' -and $_.CommandLine -like '*Watch*' }
+}
+
+# ---------------- SSH 隧道自管理 ----------------
+#
+# 为什么 keeper 要自己管 SSH 隧道：
+#   原来有**两个**自启项（BorrowNetKeeper.cmd 拉 ssh-tunnel-keeper，
+#   FerryMihomo.cmd 拉 mihomo）。它们各自探测端口、各自拉起进程，
+#   实测出现两种烂状态：
+#     ① 两个都跑起来，抢同一个端口，后起的绑不上，隧道时通时断
+#     ② ssh-tunnel-keeper 根本没在跑（实测某次开机后 10801 是手动起的，
+#        keeper 进程数为 0），mihomo 连着一条没人保活的隧道，
+#        断了就永久断
+#   所以改成**单一自启入口**：只留 FerryMihomo.cmd，由它统一负责
+#   「SSH 隧道 + mihomo 端点」整条链。多一个自启项就多一处状态竞争。
+
+# 我们自己拉起的 ssh 进程 PID（用于停止时精确回收，不误杀用户手动起的）
+$SshPidPath = Join-Path $Here 'mihomo-ssh.pid'
+
+function Get-OwnSshProc {
+  if (-not (Test-Path $SshPidPath)) { return $null }
+  $raw = ("$(Get-Content $SshPidPath -Raw -ErrorAction SilentlyContinue)").Trim()
+  if (-not $raw) { return $null }
+  $procId = 0
+  if (-not [int]::TryParse($raw, [ref]$procId)) { return $null }
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue
+  if (-not $p) { return $null }
+  # 双重校验：必须是 ssh.exe，且命令行里是 -D 动态转发
+  if ($p.Name -ne 'ssh.exe') { return $null }
+  if ($p.CommandLine -notlike '*-D*') { return $null }
+  return $p
+}
+
+# 确保有一条可用的 SSH SOCKS 隧道。返回实际在听的端口（失败返回 0）。
+#
+# 关键决策：**已经有隧道在听就不动它**。
+# 用户可能手动起了一条（实测常见），或者 keeper 上次起的还在。
+# 只要端口通，就没必要重开 —— 重开会在切换瞬间断网，体验更差。
+function Ensure-SshTunnel {
+  # 1) 已经有隧道在听？直接用
+  $existing = Get-SshSocksPort
+  if (Test-PortOpen $existing 300) {
+    if ($existing -ne $script:LastSshPort) {
+      Write-KLog "SSH 隧道已在听: 127.0.0.1:$existing（复用，不重开）"
+      $script:LastSshPort = $existing
+    }
+    return $existing
+  }
+
+  # 2) 没有 → 自己拉一条
+  $sshExe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'
+  if (-not (Test-Path $sshExe)) {
+    $c = Get-Command ssh.exe -ErrorAction SilentlyContinue
+    if ($c) { $sshExe = $c.Source } else { $sshExe = 'ssh.exe' }
+  }
+
+  # 选一个空闲端口。优先 10801（渡口的惯用端口），被占就顺延。
+  $port = 0
+  foreach ($cand in $SshPortCandidates) {
+    if (-not (Test-PortOpen $cand 150)) { $port = $cand; break }
+  }
+  if (-not $port) {
+    Write-KLog '所有候选端口都被占用，无法起 SSH 隧道' 'ERROR'
+    return 0
+  }
+
+  # 参数拼装必须用括号把 -f 的模板整体括起来。
+  # 踩过的坑：写成
+  #   '-N ... {0} ... ' + '-o ... {2}' -f $port, $SshPort, $SshTarget
+  # 时 `-f` 只作用于**最后那个字符串字面量**（+ 的优先级高于 -f），
+  # 结果 ssh 收到的是字面量 `-D 127.0.0.1:{0}`，报
+  #   Bad dynamic forwarding specification '127.0.0.1:{0}'
+  # 而且因为 -N 立刻失败退出，日志里只会看到「12s 内未就绪」，看不出真因。
+  $argLine = ('-N -T -D 127.0.0.1:{0} -p {1} -o BatchMode=yes -o ExitOnForwardFailure=yes ' +
+              '-o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new {2}') -f
+              $port, $SshPort, $SshTarget
+  $cmd = '"{0}" {1}' -f $sshExe, $argLine
+  try {
+    $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+      CommandLine = $cmd
+    } -ErrorAction Stop
+  } catch {
+    Write-KLog "拉起 ssh 失败: $($_.Exception.Message)" 'ERROR'
+    return 0
+  }
+  if ($res.ReturnValue -ne 0) {
+    Write-KLog "WMI 创建 ssh 失败 ReturnValue=$($res.ReturnValue)" 'ERROR'
+    return 0
+  }
+  $newPid = [int]$res.ProcessId
+  [IO.File]::WriteAllText($SshPidPath, "$newPid", (New-Object Text.UTF8Encoding $false))
+
+  # 等隧道就绪（最多 12 秒）。ssh 建连 + 认证通常 1–3 秒。
+  for ($i = 0; $i -lt 40; $i++) {
+    Start-Sleep -Milliseconds 300
+    if (Test-PortOpen $port 150) {
+      Write-KLog "SSH 隧道已拉起 PID=$newPid → 127.0.0.1:$port（目标 $SshTarget）"
+      $script:LastSshPort = $port
+      return $port
+    }
+  }
+  Write-KLog "SSH 隧道 12s 内未就绪（端口 $port）—— 检查 ssh $SshTarget 能否连通" 'ERROR'
+  return 0
 }
 
 # 看护循环的单例判定。
@@ -403,21 +539,39 @@ switch ($Action) {
     }
     if ($w) { Ok "看护循环已停 (PID $w)" }
     if (Stop-Mi) { Ok 'mihomo 已停止' } else { Warn 'mihomo 本来就没在跑' }
+
+    # 只停我们自己拉起来的 ssh，不动用户手动起的那条。
+    # 这是从 2026-10-23 那次事故学来的：当时用 Get-Process python | Stop-Process
+    # 按进程名误杀了正式服务。按 PID 文件 + 双重校验才安全。
+    $ownSsh = Get-OwnSshProc
+    if ($ownSsh) {
+      try {
+        Stop-Process -Id $ownSsh.ProcessId -Force -ErrorAction Stop
+        Ok "已停止本工具拉起的 SSH 隧道 (PID $($ownSsh.ProcessId))"
+      } catch { }
+    }
+    Remove-Item $SshPidPath -Force -ErrorAction SilentlyContinue
   }
 
   'On' {
     $r = Invoke-Api '/proxies/ferry' 'PUT' (@{ name = 'ferry-auto' } | ConvertTo-Json -Compress)
     if ($null -ne $r -or (Test-PortOpen $MixedPort)) {
+      # UDP 是独立的组，必须一起切 —— 否则用户以为开了借网，
+      # 结果游戏/QUIC 还在走直连，而且没有任何报错提示。
+      $null = Invoke-Api '/proxies/ferry-udp-group' 'PUT' (@{ name = 'ferry-udp' } | ConvertTo-Json -Compress)
       Save-Selection 'ferry-auto'
       $a = Invoke-Api '/proxies/ferry-auto'
-      Ok "已借网 → ferry-auto → $($a.now)"
+      $u = if (Test-UdpRelay) { 'ferry-udp' } else { '不可用（relay 没起）' }
+      Ok "已借网 → TCP: ferry-auto → $($a.now)"
+      Ok "         UDP: $u"
     } else { Bad '切换失败（端点没起来？先 Start）'; exit 1 }
   }
 
   'Off' {
     $null = Invoke-Api '/proxies/ferry' 'PUT' (@{ name = 'DIRECT' } | ConvertTo-Json -Compress)
+    $null = Invoke-Api '/proxies/ferry-udp-group' 'PUT' (@{ name = 'DIRECT' } | ConvertTo-Json -Compress)
     Save-Selection 'DIRECT'
-    Ok '已恢复直连（ferry → DIRECT）'
+    Ok '已恢复直连（TCP 与 UDP 都回到 DIRECT）'
   }
 
   'Switch' {
@@ -426,31 +580,49 @@ switch ($Action) {
       Bad "只能选: $($allowed -join ' / ')"; exit 1
     }
     $null = Invoke-Api '/proxies/ferry' 'PUT' (@{ name = $Target } | ConvertTo-Json -Compress)
+    # 选具体某条 TCP 线路时，UDP 跟着一起开（用户意图是「借网」），
+    # 因为 ferry-udp 是唯一能承载 UDP 的，没有别的选择。
+    if ($Target -ne 'DIRECT') {
+      $null = Invoke-Api '/proxies/ferry-udp-group' 'PUT' (@{ name = 'ferry-udp' } | ConvertTo-Json -Compress)
+    } else {
+      $null = Invoke-Api '/proxies/ferry-udp-group' 'PUT' (@{ name = 'DIRECT' } | ConvertTo-Json -Compress)
+    }
     Save-Selection $Target
     Ok "已切到 $Target"
   }
 
   'Install' {
-    if (-not (Test-Path $StartupCmd)) {
-      $content = @"
+    # 覆盖写，不跳过：自启内容会随代码演进（比如从 Start 改成 Watch），
+    # 用「已存在就不动」会导致升级后还在跑旧命令 —— 实测踩过。
+    $content = @"
 @echo off
 chcp 936 >nul
-rem 渡口统一入口 - 登录时拉起 mihomo（不切系统代理，只提供 127.0.0.1:$MixedPort）
+rem 渡口统一入口 - 登录时拉起（SSH 隧道 + mihomo 端点，不切系统代理）
+rem 单一入口：不要再装 ssh-tunnel-keeper 的自启，两个会抢端口
 start "" /min powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "$Here\mihomo-keeper.ps1" -Action Watch
 "@
-      # .cmd 必须写成 GBK + CRLF + 无 BOM，三条都踩过：
-      # 带 BOM：cmd.exe 把 BOM 三个字节当命令的一部分，首行 @echo off 失效，
-      #         窗口里冒一行「'∩╗┐@echo' 不是内部或外部命令」。
-      # 写 UTF-8：中文注释在 936 代码页下变乱码（仓库 commit b2e0df1 踩过）。
-      # 只有 LF：cmd.exe 的解析器把行尾的 CR 当命令终止符，纯 LF 会吃掉
-      #         每行第一个字符 —— 实测 `rem ...` 变成 `'em' 不是内部或外部命令`。
-      #         这里用 -replace 把 here-string 的 LF 全换成 CRLF。
-      $content = ($content -replace "`r`n", "`n") -replace "`n", "`r`n"
-      $gbk = [Text.Encoding]::GetEncoding(936)
-      [IO.File]::WriteAllText($StartupCmd, $content, $gbk)
-      Ok "已写入自启: $StartupCmd"
-    } else {
-      Warn "自启已存在: $StartupCmd"
+    # .cmd 必须写成 GBK + CRLF + 无 BOM，三条都踩过：
+    # 带 BOM：cmd.exe 把 BOM 三个字节当命令的一部分，首行 @echo off 失效，
+    #         窗口里冒一行「'∩╗┐@echo' 不是内部或外部命令」。
+    # 写 UTF-8：中文注释在 936 代码页下变乱码（仓库 commit b2e0df1 踩过）。
+    # 只有 LF：cmd.exe 的解析器把行尾的 CR 当命令终止符，纯 LF 会吃掉
+    #         每行第一个字符 —— 实测 `rem ...` 变成 `'em' 不是内部或外部命令`。
+    $content = ($content -replace "`r`n", "`n") -replace "`n", "`r`n"
+    $gbk = [Text.Encoding]::GetEncoding(936)
+    [IO.File]::WriteAllText($StartupCmd, $content, $gbk)
+    Ok "已写入自启: $StartupCmd"
+
+    # 顺手清掉旧的、会抢端口的自启项。
+    # 为什么自动清而不是提示用户手动删：用户的目标是「一键」，让他去
+    # 启动文件夹里找文件删，就已经不算一键了。这里只删**渡口自己的**旧项，
+    # 不动别人的（额度监控、WorkBuddy 那两个是别的项目的）。
+    $stale = @('BorrowNetKeeper.cmd', 'FerryMihomo-old.cmd')
+    foreach ($s in $stale) {
+      $p = Join-Path $StartupDir $s
+      if (Test-Path $p) {
+        Remove-Item $p -Force -ErrorAction SilentlyContinue
+        Ok "已清理旧自启: $s（避免与统一入口抢端口）"
+      }
     }
   }
 
@@ -492,12 +664,16 @@ start "" /min powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Byp
     Ok '自检完成'
   }
 
-  # 看护循环：mihomo 挂了就拉起，上游 SSH 端口变了就重渲染配置。
+  # 看护循环：整条链的健康都由它负责。
   #
-  # 为什么需要它：mihomo 自己不会在 SSH 隧道换端口后自动重连新端口 ——
+  # 每 20 秒体检三件事：
+  #   ① SSH 隧道在不在 → 不在就自己拉一条（Ensure-SshTunnel）
+  #   ② mihomo 端点在不在 → 不在就拉起
+  #   ③ 上游端口变了没 → 变了就重渲染配置 + 重启 mihomo
+  #
+  # 为什么③必须做：mihomo 自己不会在 SSH 隧道换端口后自动重连新端口 ——
   # config.yaml 里的 port 是死的。隧道从 10801 顺延到 10808 时，mihomo 会
   # 一直连那个已经不存在的 10801，表现是「代理端口还在听、但所有请求 502」。
-  # 所以每 20 秒做一次体检：端点没了 → 重启；上游端口变了 → 重渲染 + 重启。
   'Watch' {
     if (Test-Path $WatchLock) {
       $oldPid = ("$(Get-Content $WatchLock -Raw -ErrorAction SilentlyContinue)").Trim()
@@ -508,29 +684,52 @@ start "" /min powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Byp
       Write-KLog "stale watch lock (pid $oldPid), taking over"
     }
     [IO.File]::WriteAllText($WatchLock, "$PID", (New-Object Text.UTF8Encoding $false))
-    Write-KLog "watch start pid=$PID mixed=$MixedPort"
+    Write-KLog "watch start pid=$PID mixed=$MixedPort udp=$UdpHost`:$UdpPort"
 
     $lastUpstream = -1
     try {
-      # 先体检一轮再睡：这样登录自启时直接就是「Watch 起来 → 立刻拉起 mihomo」，
+      # 先体检一轮再睡：登录自启时直接就是「Watch 起来 → 立刻把整条链拉好」，
       # 不用等第一个 20 秒周期。
       while ($true) {
+        # ① SSH 隧道
+        $sshPort = Ensure-SshTunnel
+
+        # ② mihomo 端点
         if (-not (Get-MiProc) -or -not (Test-PortOpen $MixedPort 300)) {
-          Write-KLog '体检：端点不通，拉起 mihomo' 'WARN'
-          $null = Stop-Mi
-          if (Start-Mi) { $lastUpstream = Get-SshSocksPort; Write-KLog "体检：已恢复，上游 $lastUpstream" }
-        } else {
-          # 上游端口变了（隧道顺延）→ 重渲染配置并重启，否则 mihomo 连的是死端口
-          $cur = Get-SshSocksPort
-          if ($cur -ne $lastUpstream) {
-            if ($lastUpstream -ne -1) {
-              Write-KLog "体检：上游端口 $lastUpstream → $cur，重渲染配置" 'WARN'
-              $null = Stop-Mi
-              if (Start-Mi) { Write-KLog "体检：已切到新上游 $cur" }
+          if ($sshPort) {
+            Write-KLog '体检：端点不通，拉起 mihomo' 'WARN'
+            $null = Stop-Mi
+            if (Start-Mi) {
+              $lastUpstream = $sshPort
+              Write-KLog "体检：已恢复，上游 $lastUpstream"
             }
-            $lastUpstream = $cur
+          } else {
+            Write-KLog '体检：SSH 隧道不可用，暂不拉起 mihomo（否则它连死端口）' 'WARN'
+          }
+        } else {
+          # ③ 上游端口变了 → 重渲染配置并重启，否则 mihomo 连的是死端口
+          if ($sshPort -and $sshPort -ne $lastUpstream) {
+            if ($lastUpstream -ne -1) {
+              Write-KLog "体检：上游端口 $lastUpstream → $sshPort，重渲染配置" 'WARN'
+              $null = Stop-Mi
+              if (Start-Mi) { Write-KLog "体检：已切到新上游 $sshPort" }
+            }
+            $lastUpstream = $sshPort
           }
         }
+
+        # ④ UDP 中继可达性：不可达只记日志，不重启任何东西 ——
+        # relay 在远端，重启本地 mihomo 解决不了它。
+        if (-not (Test-UdpRelay)) {
+          if (-not $script:UdpWarned) {
+            Write-KLog "体检：UDP 中继 $UdpHost`:$UdpPort 不可达（TCP 不受影响）" 'WARN'
+            $script:UdpWarned = $true
+          }
+        } elseif ($script:UdpWarned) {
+          Write-KLog "体检：UDP 中继已恢复"
+          $script:UdpWarned = $false
+        }
+
         Start-Sleep -Seconds 20
       }
     }
