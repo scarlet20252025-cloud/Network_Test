@@ -702,6 +702,63 @@ _live_cache = {'at': 0.0, 'data': None}
 _live_prev = {'at': 0.0, 'rx': 0, 'tx': 0, 'ready': False}
 _live_peak = {'rx': 0, 'tx': 0}
 
+# ── 性能曲线用的采样历史 ──
+#
+# 为什么单独留一份：`_hourly` 是小时级聚合，画不出「最近 10 分钟」这种曲线。
+# 前端每 3 秒拉一次 live（服务端有 2 秒缓存），所以采样密度就是 3 秒左右。
+# 200 个点 × 3 秒 ≈ 10 分钟，和面板上标的范围一致。
+#
+# 用 deque(maxlen=200)：加满自动丢最老的，不用自己维护环形下标。
+_live_series = None          # collections.deque，延迟初始化
+LIVE_SERIES_MAX = 200
+
+# 门户进程内存（MB）。每 10 秒读一次 /proc 等价物 —— Windows 下用
+# psutil 会引入依赖，所以直接读本进程的 WorkingSet64。
+_mem_cache = {'v': 0.0, 'at': 0.0}
+
+
+def portal_mem_mb():
+    """门户进程自己的物理内存占用（MB）。
+
+    为什么显示这个而不是「内核占用」：客户端 mihomo 的内存服务端拿不到。
+    而门户长期挂着，它自己的内存涨不涨才是管理员该关心的
+    （内存持续增长通常意味着某个缓存表没清）。
+    """
+    now_t = time.time()
+    if now_t - _mem_cache['at'] < 10:
+        return _mem_cache['v']
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PMC(ctypes.Structure):
+            _fields_ = [('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD),
+                        ('PeakWorkingSetSize', ctypes.c_size_t),
+                        ('WorkingSetSize', ctypes.c_size_t),
+                        ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                        ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                        ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                        ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                        ('PagefileUsage', ctypes.c_size_t),
+                        ('PeakPagefileUsage', ctypes.c_size_t)]
+
+        pmc = PMC()
+        pmc.cb = ctypes.sizeof(PMC)
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi = ctypes.WinDLL('psapi', use_last_error=True)
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(PMC),
+                                              wintypes.DWORD]
+        if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(pmc),
+                                      pmc.cb):
+            mb = pmc.WorkingSetSize / 1048576.0
+            _mem_cache['v'] = round(mb, 1)
+            _mem_cache['at'] = now_t
+    except Exception:
+        pass
+    return _mem_cache['v']
+
+
 
 def _sh(cmd, timeout=8):
     """跑一条命令拿 stdout。失败一律返回空串 —— 监控挂了不能拖垮管理页。"""
@@ -1031,6 +1088,28 @@ def sample_live(db):
 
         online_users = [u for u in users if u['online']]
 
+        # 追加一个采样点给折线图。
+        # 上下行分开存：前端要画两条线（上传橙 / 下载蓝）。
+        global _live_series
+        if _live_series is None:
+            import collections
+            _live_series = collections.deque(maxlen=LIVE_SERIES_MAX)
+        _sum_rx = sum(u['rxBps'] for u in online_users)
+        _sum_tx = sum(u['txBps'] for u in online_users)
+        _live_series.append({'t': int(t), 'rx': _sum_rx, 'tx': _sum_tx})
+
+        # 所有机器（含离线）的累计流量 —— 卡片「上传量/下载量」用。
+        # 为什么不用 _totals 直接加：那里面可能有还没落库的增量，
+        # traffic_of() 已经把它算进去了。
+        _tot_rx = _tot_tx = 0
+        for _r in rows:
+            try:
+                _tr = traffic_of(db, _r['ip'])
+                _tot_rx += _tr['totalRx']
+                _tot_tx += _tr['totalTx']
+            except Exception:
+                pass
+
         # 顶部指标用「所有在线机器的心跳速率之和」。
         # 为什么不用网卡总量：那是整台机器（含 sshd、门户自己）的流量，
         # 和「用户借网有多快」不是一回事；网络里一有别的动作数字就跳。
@@ -1048,6 +1127,13 @@ def sample_live(db):
             # 服务端网卡实测（排查用，面板不直接用）
             'netRxBps': net_rx_bps,
             'netTxBps': net_tx_bps,
+            # 折线图数据
+            'series': list(_live_series),
+            # 累计流量（所有机器相加）
+            'totalRx': _tot_rx,
+            'totalTx': _tot_tx,
+            # 门户进程自身内存
+            'memMB': portal_mem_mb(),
             # 还有多少台机器在走 SSH 隧道（老客户端），用来判断升级情况
             'tunnelConns': sum(peers.values()),
         }
@@ -1497,6 +1583,88 @@ html[data-theme="light"] .arw.up{color:#d97706}
 .notecell .notein.saving{opacity:.6}
 .notecell .notein.bad{border-color:var(--err)}
 
+/* ── 性能面板：折线图 + 六卡片 ──
+   参考「路由器/监控面板」的常见布局：上面一条时间曲线看趋势，
+   下面 2x3 的数字卡看当前值。曲线能看出「刚才那波是不是突发」，
+   纯数字看不出。 */
+.perfpanel{background:var(--card);border:1px solid var(--line);
+  border-radius:14px;padding:14px 16px 16px;margin:0 0 16px;
+  box-shadow:var(--shadow)}
+
+.perf-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  margin-bottom:10px}
+.perf-title{font-size:13.5px;font-weight:700;color:var(--fg)}
+.perf-range{font-size:11px;color:var(--fg2);background:var(--card2);
+  border:1px solid var(--line);border-radius:99px;padding:1px 8px}
+.perf-load{margin-left:auto;display:flex;align-items:center;gap:7px;
+  font-size:12px;color:var(--fg2);flex-wrap:wrap}
+.perf-load b{font-size:15px;font-family:Consolas,Monaco,monospace;
+  color:var(--fg);line-height:1}
+.pf-lbl{font-size:11.5px;color:var(--fg2)}
+.pf-cap{font-size:11.5px;color:var(--fg2);font-family:Consolas,Monaco,monospace}
+
+/* 图表容器：固定高度，SVG 拉伸填满（preserveAspectRatio=none 让它横向铺开） */
+.chart-wrap{position:relative;height:132px;margin:2px 0 0;
+  background:linear-gradient(180deg,color-mix(in srgb,var(--card2) 60%,transparent),transparent);
+  border-radius:10px;overflow:hidden}
+.chart-wrap svg{display:block;width:100%;height:100%}
+
+/* 横向网格线 + Y 轴文字（JS 生成） */
+.chart-wrap .grid-line{stroke:var(--line);stroke-width:1;
+  stroke-dasharray:3 4;opacity:.65}
+.chart-y{position:absolute;left:0;top:0;bottom:0;width:56px;
+  pointer-events:none}
+.chart-y .ylab{position:absolute;left:4px;transform:translateY(-50%);
+  font-size:10px;color:var(--fg2);font-family:Consolas,Monaco,monospace;
+  white-space:nowrap;letter-spacing:.2px}
+/* 曲线左边缘留出 Y 轴宽度，否则线会压在数字上 */
+.chart-wrap svg{padding-left:56px;box-sizing:border-box}
+
+.chart-axis{display:flex;justify-content:space-between;margin:3px 2px 0;
+  font-size:9.5px;color:var(--fg2);font-family:Consolas,Monaco,monospace}
+
+.perf-foot{display:flex;gap:16px;margin:9px 0 12px;font-size:11.5px;
+  color:var(--fg2);flex-wrap:wrap;font-family:Consolas,Monaco,monospace}
+
+/* ── 2x3 指标卡 ── */
+.perfgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+@media(max-width:820px){ .perfgrid{grid-template-columns:repeat(2,1fr)} }
+@media(max-width:520px){ .perfgrid{grid-template-columns:1fr} }
+
+.pcard{display:flex;align-items:center;gap:11px;
+  background:var(--card2);border:1px solid var(--line);border-radius:11px;
+  padding:11px 13px;min-width:0;
+  transition:border-color .18s,background .18s}
+.pcard:hover{border-color:var(--line2)}
+
+/* 图标：圆形底色 + 同色符号。
+   为什么用 &#8593; &#8595; 这类字符而不是 emoji：
+   ✏️⚡☁ 在多数系统上会被渲染成彩色 emoji，跟深色主题打架，
+   而且不受 color 控制。Unicode 箭头 + 明确的 color 才是可控的。 */
+.pico{flex:0 0 auto;width:30px;height:30px;border-radius:9px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:15px;font-weight:700;line-height:1}
+.pbody{min-width:0;flex:1 1 auto}
+.plbl{font-size:11px;color:var(--fg2);margin-bottom:3px;white-space:nowrap}
+.pval{font-size:17px;font-weight:700;font-family:Consolas,Monaco,monospace;
+  line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* 四套配色。上传=橙、下载=蓝、连接=绿、内存=紫 —— 和曲线颜色对齐，
+   看曲线看到橙色就知道是上传。 */
+.pcard.up   .pico{background:rgba(255,166,87,.14);color:#ffa657}
+.pcard.up   .pval{color:#ffa657}
+.pcard.down .pico{background:rgba(74,158,255,.14);color:#4a9eff}
+.pcard.down .pval{color:#4a9eff}
+.pcard.conn .pico{background:rgba(61,220,151,.14);color:var(--ok)}
+.pcard.conn .pval{color:var(--ok)}
+.pcard.mem  .pico{background:rgba(165,140,255,.14);color:#a58cff}
+.pcard.mem  .pval{color:#a58cff}
+/* 「量」那两张用更淡的图标底，和「速度」区分开 */
+.pcard.up2   .pico{background:rgba(255,166,87,.10);color:#ffa657}
+.pcard.up2   .pval{color:var(--fg)}
+.pcard.down2 .pico{background:rgba(74,158,255,.10);color:#4a9eff}
+.pcard.down2 .pval{color:var(--fg)}
+
 /* ── 载荷仪表 ──
    三段配色跟「在线/拥挤/饱和」对应，条上的两个刻度线就是边界，
    用户不用记阈值，看指针落在哪一段就知道。 */
@@ -1658,57 +1826,87 @@ html[data-theme="light"] .arw.up{color:#d97706}
 .tier:has(input:checked) span{color:var(--accent);font-weight:600}
 </style>
 
-<div class="livehead" style="margin:2px 0 14px">
-  <!-- 载荷仪表：替掉原来那行「下行峰值 / 上行峰值」。
-       原因：峰值是个没有参照物的数字 —— 7 MB/s 到底算快还是慢？
-       换成「当前速率 ÷ 出口带宽」的百分比，才知道离卡顿还有多远。 -->
-  <div class="gauge" id="gaugeBox">
-    <div class="gauge-top">
-      <span class="gauge-lab">出口载荷</span>
-      <span class="gauge-val" id="gVal">—</span>
-      <span class="gauge-cap" id="gCap">/ —</span>
+<div class="perfpanel">
+  <div class="perf-head">
+    <span class="perf-title">流量趋势</span>
+    <span class="perf-range">10 分钟</span>
+    <span class="perf-load">
+      <span class="pf-lbl">出口载荷</span>
+      <b id="gVal">—</b>
+      <span id="gCap" class="pf-cap">/ —</span>
       <span class="gauge-tag" id="gTag">—</span>
+    </span>
+    <span class="livestamp" id="lvStamp">正在连接…</span>
+  </div>
+
+  <div class="chart-wrap">
+    <svg id="perfChart" viewBox="0 0 800 132" preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="gradDown" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#4a9eff" stop-opacity="0.32"/>
+          <stop offset="100%" stop-color="#4a9eff" stop-opacity="0"/>
+        </linearGradient>
+        <linearGradient id="gradUp" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#ffa657" stop-opacity="0.30"/>
+          <stop offset="100%" stop-color="#ffa657" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      <g id="chartGrid"></g>
+      <path id="chartAreaUp"   fill="url(#gradUp)"   d=""></path>
+      <path id="chartAreaDown" fill="url(#gradDown)" d=""></path>
+      <polyline id="chartLineUp"   fill="none" stroke="#ffa657" stroke-width="1.5"
+                stroke-linejoin="round" stroke-linecap="round" points=""></polyline>
+      <polyline id="chartLineDown" fill="none" stroke="#4a9eff" stroke-width="1.5"
+                stroke-linejoin="round" stroke-linecap="round" points=""></polyline>
+    </svg>
+    <!-- Y 轴标签放在 HTML 里，不放 SVG。
+         原因：SVG 用了 preserveAspectRatio="none" 才能自由拉伸铺满，
+         但那样里面的 <text> 也会被横向拉扁，数字变形。 -->
+    <div class="chart-y" id="chartY"></div>
+  </div>
+  <div class="chart-axis" id="chartAxis"></div>
+
+  <div class="perf-foot">
+    <span id="gHead">余量 —</span>
+    <span id="gPerIp">单机最快 —</span>
+    <span id="gPeak">峰值 —</span>
+  </div>
+
+  <div class="perfgrid">
+    <div class="pcard up">
+      <div class="pico">&#8593;</div>
+      <div class="pbody"><div class="plbl">上传速度</div>
+        <div class="pval"><span id="pcTxSpd">—</span></div></div>
     </div>
-    <div class="gauge-bar">
-      <div class="gauge-fill" id="gFill" style="width:0%"></div>
-      <i class="gauge-mark" style="left:60%" title="60% 起进入拥挤区"></i>
-      <i class="gauge-mark hot" style="left:85%" title="85% 起会明显卡顿"></i>
+    <div class="pcard down">
+      <div class="pico">&#8595;</div>
+      <div class="pbody"><div class="plbl">下载速度</div>
+        <div class="pval"><span id="pcRxSpd">—</span></div></div>
     </div>
-    <div class="gauge-foot">
-      <span id="gHead">余量 —</span>
-      <span id="gPerIp">单机最快 —</span>
-      <span id="gPeak">峰值 —</span>
+    <div class="pcard conn">
+      <div class="pico">&#8644;</div>
+      <div class="pbody"><div class="plbl">活跃连接</div>
+        <div class="pval"><span id="pcConns">—</span></div></div>
+    </div>
+    <div class="pcard up2">
+      <div class="pico">&#8593;</div>
+      <div class="pbody"><div class="plbl">上传量</div>
+        <div class="pval"><span id="pcTxTot">—</span></div></div>
+    </div>
+    <div class="pcard down2">
+      <div class="pico">&#8595;</div>
+      <div class="pbody"><div class="plbl">下载量</div>
+        <div class="pval"><span id="pcRxTot">—</span></div></div>
+    </div>
+    <div class="pcard mem">
+      <div class="pico">&#9635;</div>
+      <div class="pbody"><div class="plbl">服务端内存</div>
+        <div class="pval"><span id="pcMem">—</span></div></div>
     </div>
   </div>
-  <div class="livestamp" id="lvStamp">正在连接…</div>
 </div>
 
-<div class="livegrid">
-  <div class="livecard" id="lcOnline">
-    <div class="lbl">正在借网</div>
-    <div class="val"><span id="lvOnline">—</span><span class="unit">台</span></div>
-    <div class="sub" id="lvOnlineSub">—</div>
-    <div class="spark"></div>
-  </div>
-  <div class="livecard" id="lcConns">
-    <div class="lbl">活跃连接</div>
-    <div class="val"><span id="lvConns">—</span><span class="unit">条</span></div>
-    <div class="sub">到本机 22 端口</div>
-    <div class="spark"></div>
-  </div>
-  <div class="livecard" id="lcRx">
-    <div class="lbl">下行速率</div>
-    <div class="val"><span id="lvRx">—</span></div>
-    <div class="bar"><i id="lvRxBar"></i></div>
-    <div class="spark"></div>
-  </div>
-  <div class="livecard" id="lcTx">
-    <div class="lbl">上行速率</div>
-    <div class="val"><span id="lvTx">—</span></div>
-    <div class="bar"><i id="lvTxBar"></i></div>
-    <div class="spark"></div>
-  </div>
-</div>
+
 
 <script>
 (function(){
@@ -1718,71 +1916,212 @@ html[data-theme="light"] .arw.up{color:#d97706}
       return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
     });
   }
-  function setHot(id, on){
-    var el = document.getElementById(id);
-    if (el) el.className = 'livecard' + (on ? ' hot' : '');
-  }
   function fmtBps(n){
     if (!n || n < 1) return '—';
     var u = ['B/s','KB/s','MB/s','GB/s'], i = 0, v = n;
     while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
     return (v >= 100 ? v.toFixed(0) : v.toFixed(v >= 10 ? 1 : 2)) + ' ' + u[i];
   }
-  // ── 载荷仪表 ──
+  // ── 性能面板：折线图 + 六卡片 ──
   //
-  // 为什么不再显示「峰值 KB/s」：那个数字没有参照物。
-  // 有了出口带宽，才能回答「现在吃满了吗、离卡顿还有多远」。
-  function renderGauge(d){
+  // 为什么用 SVG 手画而不是 canvas：canvas 要做 DPI 缩放、要处理重绘、
+  // 而且缩放窗口时会糊。SVG 用 viewBox + preserveAspectRatio="none"
+  // 就能自动铺满容器，代码还短。也不引第三方图表库（门户的卖点是零依赖）。
+  var CHART_H = 132, CHART_PAD_T = 10, CHART_PAD_B = 6;
+
+  function fmtSpeed(n){
+    if (!n || n < 1) return '0 B/s';
+    var u = ['B/s','KB/s','MB/s','GB/s'], i = 0, v = n;
+    while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
+    return (v >= 100 ? v.toFixed(0) : v.toFixed(v >= 10 ? 1 : 2)) + ' ' + u[i];
+  }
+  // 刻度专用：整数不带小数点（30 而不是 30.0）。
+  // 卡片仍然用 fmtSpeed —— 那里 1.28 MB/s 的两位小数是有意义的。
+  function fmtSpeedTick(n){
+    if (!n || n < 1) return '0';
+    var u = ['B','KB','MB','GB'], i = 0, v = n;
+    while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
+    var s = (Math.abs(v - Math.round(v)) < 0.05)
+      ? String(Math.round(v))
+      : v.toFixed(v >= 10 ? 0 : 1);
+    return s + ' ' + u[i] + '/s';
+  }
+  function fmtBytes2(n){
+    if (!n || n < 1) return '0 B';
+    var u = ['B','KB','MB','GB','TB'], i = 0, v = n;
+    while (v >= 1024 && i < u.length-1) { v /= 1024; i++; }
+    return (v >= 100 ? v.toFixed(0) : v.toFixed(v >= 10 ? 1 : 2)) + ' ' + u[i];
+  }
+  function fmtClock(ts){
+    var d = new Date(ts * 1000);
+    function p(x){ return (x < 10 ? '0' : '') + x; }
+    return p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  // 把一条序列映射成 SVG 点串。
+  // headroom：Y 轴顶部留白比例，让峰值不贴顶。
+  function buildPoints(vals, maxV, w, h){
+    var n = vals.length;
+    if (n < 2) return { line: '', area: '' };
+    var step = w / (n - 1);
+    var pts = [];
+    for (var i = 0; i < n; i++) {
+      var y = h - (maxV > 0 ? (vals[i] / maxV) * h : 0);
+      if (y < 0) y = 0;
+      if (y > h) y = h;
+      pts.push((i * step).toFixed(1) + ',' + y.toFixed(1));
+    }
+    var line = pts.join(' ');
+    var area = 'M0,' + h + ' L' + pts.join(' L') + ' L' + w + ',' + h + ' Z';
+    return { line: line, area: area };
+  }
+
+  function renderChart(d){
+    var series = d.series || [];
+    var svg = document.getElementById('perfChart');
+    if (!svg) return;
+
+    var W = 800, H = CHART_H;
+    var plotH = H - CHART_PAD_T - CHART_PAD_B;
+
+    // Y 轴：取两条线的最大值，向上取到一个「好看」的刻度
+    var maxV = 0;
+    for (var i = 0; i < series.length; i++) {
+      if (series[i].rx > maxV) maxV = series[i].rx;
+      if (series[i].tx > maxV) maxV = series[i].tx;
+    }
+    if (maxV < 1024) maxV = 1024;          // 全静默时也画一条基线，别让它抖
+
+    // 刻度取整分两步，否则会得到 57.2 / 38.1 / 19.1 这种带小数的刻度：
+    //   ① 先把 maxV/3 换算到**显示单位**（B/KB/MB/GB），在那个单位下取整
+    //   ② 再换算回字节
+    // 这样刻度是 60/40/20/0 MB/s 或 1.5/1.0/0.5/0 MB/s，都是能一眼读的数。
+    var du = ['B/s', 'KB/s', 'MB/s', 'GB/s'], di = 0, dv = maxV / 3;
+    while (dv >= 1024 && di < du.length - 1) { dv /= 1024; di++; }
+    var dmag = Math.pow(10, Math.floor(Math.log10(dv || 1)));
+    var dnorm = (dv || 1) / dmag;
+    // 允许 1 / 1.5 / 2 / 3 / 5 / 10 —— 加 1.5 和 3 是为了让刻度更贴实际值，
+    // 不然 19 MB/s 会被推到 20（可以）但 7 MB/s 会被推到 10（浪费一半高度）
+    var dn;
+    if (dnorm <= 1) dn = 1;
+    else if (dnorm <= 1.5) dn = 1.5;
+    else if (dnorm <= 2) dn = 2;
+    else if (dnorm <= 3) dn = 3;
+    else if (dnorm <= 5) dn = 5;
+    else dn = 10;
+    var unitInDisp = dn * dmag;            // 以显示单位计的格高
+    var top = unitInDisp * Math.pow(1024, di) * 3;
+
+    var rxVals = [], txVals = [];
+    for (var j = 0; j < series.length; j++) { rxVals.push(series[j].rx || 0); txVals.push(series[j].tx || 0); }
+
+    var down = buildPoints(rxVals, top, W, plotH);
+    var up = buildPoints(txVals, top, W, plotH);
+    var off = 'translate(0,' + CHART_PAD_T + ')';
+
+    var pDown = document.getElementById('chartLineDown');
+    var pUp = document.getElementById('chartLineUp');
+    var aDown = document.getElementById('chartAreaDown');
+    var aUp = document.getElementById('chartAreaUp');
+    if (pDown) { pDown.setAttribute('points', down.line); pDown.setAttribute('transform', off); }
+    if (pUp)   { pUp.setAttribute('points', up.line);     pUp.setAttribute('transform', off); }
+    if (aDown) { aDown.setAttribute('d', down.area);       aDown.setAttribute('transform', off); }
+    if (aUp)   { aUp.setAttribute('d', up.area);           aUp.setAttribute('transform', off); }
+
+    // 网格 + Y 轴刻度（3 条：0 / 中 / 顶）
+    var grid = document.getElementById('chartGrid');
+    var ylab = document.getElementById('chartY');
+    if (grid) {
+      var g = '';
+      for (var k = 0; k <= 3; k++) {
+        var gy = CHART_PAD_T + plotH * (k / 3);
+        g += '<line class="grid-line" x1="0" y1="' + gy.toFixed(1) +
+             '" x2="' + W + '" y2="' + gy.toFixed(1) + '"/>';
+      }
+      grid.innerHTML = g;
+    }
+    if (ylab) {
+      // 百分比定位，跟 SVG 的 CHART_H 对齐。用 top 百分比而不是像素，
+      // 这样容器高度变了也不用重算。
+      var yh = '';
+      for (var m = 0; m <= 3; m++) {
+        var pctY = (CHART_PAD_T + plotH * (m / 3)) / H * 100;
+        var v = top * (1 - m / 3);
+        yh += '<span class="ylab" style="top:' + pctY.toFixed(2) + '%">' +
+              fmtSpeedTick(v) + '</span>';
+      }
+      ylab.innerHTML = yh;
+    }
+
+    // X 轴时间标签：首 / 中 / 尾
+    var axis = document.getElementById('chartAxis');
+    if (axis) {
+      if (series.length >= 2) {
+        var t0 = series[0].t, t1 = series[series.length - 1].t;
+        axis.innerHTML = '<span>' + fmtClock(t0) + '</span>' +
+                         '<span>' + fmtClock((t0 + t1) / 2) + '</span>' +
+                         '<span>' + fmtClock(t1) + '</span>';
+      } else {
+        axis.innerHTML = '<span>—</span><span>—</span><span>—</span>';
+      }
+    }
+  }
+
+  function renderPerf(d){
     var n = d.net || {};
+
+    // 标题行：载荷 + 状态标签
     var pct = Math.max(0, Math.min(100, n.loadPct || 0));
-    var fill = document.getElementById('gFill');
     var val = document.getElementById('gVal');
     var cap = document.getElementById('gCap');
     var tag = document.getElementById('gTag');
-    if (!fill || !val) return;
-
-    val.innerHTML = fmtBps(n.curBps || 0);
-    cap.innerHTML = '/ ' + (n.uplinkMbps ? n.uplinkMbps.toFixed(0) + ' Mbps' : '—');
-
+    if (val) val.innerHTML = fmtSpeed(n.curBps || 0);
+    if (cap) cap.innerHTML = '/ ' + (n.uplinkMbps ? n.uplinkMbps.toFixed(0) + ' Mbps' : '—');
     var lv = n.level || 'ok';
-    fill.style.width = pct + '%';
-    fill.className = 'gauge-fill ' + lv;
-    val.style.color = lv === 'hot' ? 'var(--err)' : (lv === 'warn' ? 'var(--warn)' : 'var(--ok)');
+    if (tag) {
+      tag.textContent = ({ok:'畅通', warn:'偏挤', hot:'饱和'}[lv] || '—') +
+                        ' · ' + pct.toFixed(0) + '%';
+      tag.className = 'gauge-tag ' + lv;
+    }
+    if (val) val.style.color = lv === 'hot' ? 'var(--err)' : (lv === 'warn' ? 'var(--warn)' : 'var(--ok)');
 
-    var label = {ok: '畅通', warn: '偏挤', hot: '饱和'}[lv] || '—';
-    tag.textContent = label + ' · ' + pct.toFixed(0) + '%';
-    tag.className = 'gauge-tag ' + lv;
+    // 六张卡
+    var set = function(id, txt){ var e = document.getElementById(id); if (e) e.textContent = txt; };
+    set('pcTxSpd', fmtSpeed(d.txBps || 0));
+    set('pcRxSpd', fmtSpeed(d.rxBps || 0));
+    set('pcConns', String(d.conns || 0) + ' 条');
+    set('pcTxTot', fmtBytes2(d.totalTx || 0));
+    set('pcRxTot', fmtBytes2(d.totalRx || 0));
+    set('pcMem',   (d.memMB ? d.memMB.toFixed(1) : '—') + ' MB');
 
+    // 副行：余量 / 单机最快 / 本次峰值
     var head = document.getElementById('gHead');
-    if (head) head.textContent = '余量 ' + fmtBps(n.headroomBps || 0) +
+    if (head) head.textContent = '余量 ' + fmtSpeed(n.headroomBps || 0) +
       (n.online ? ' · ' + n.online + ' 台在线' : '');
 
-    // 单机最快 / 自己的配额 —— 用来回答「是不是有人撞到限速了」
     var fastest = 0;
-    (d.list || []).forEach(function(u){ if (u.online) fastest = Math.max(fastest, (u.rxBps||0) + (u.txBps||0)); });
+    (d.list || []).forEach(function(u){
+      if (u.online) fastest = Math.max(fastest, (u.rxBps || 0) + (u.txBps || 0));
+    });
     var perIp = document.getElementById('gPerIp');
     if (perIp) {
       var capBps = (n.perIpMb || 0) * 1024 * 1024;
-      var s = '单机最快 ' + fmtBps(fastest);
+      var s = '单机最快 ' + fmtSpeed(fastest);
       if (capBps > 0) {
         s += ' / 配额 ' + n.perIpMb.toFixed(0) + ' MB/s';
-        if (fastest >= capBps * 0.92) s += ' ⚠已贴限速';
+        if (fastest >= capBps * 0.92) s += '  ← 瓶颈在单机限速';
       } else {
         s += '（未设单机限速）';
       }
-      // 瓶颈判断：明确告诉管理员「现在卡在哪一层」。
-      // 千兆出口下 10 MB/s 单机限速其实很难打满总量，
-      // 所以「有人撞到自己的配额」比「出口饱和」更常见 ——
-      // 只给一个载荷百分比会让人误以为「才 16%，没问题」。
-      if (capBps > 0 && fastest >= capBps * 0.92) {
-        s += '  ← 瓶颈在单机限速';
-      } else if (n.overload || pct >= 85) {
+      if (!(capBps > 0 && fastest >= capBps * 0.92) && (n.overload || pct >= 85)) {
         s += '  ← 瓶颈在出口带宽';
       }
       perIp.textContent = s;
     }
     var pk = document.getElementById('gPeak');
-    if (pk) pk.textContent = '本次最高 ' + fmtBps(Math.max(peak.rx, peak.tx));
+    if (pk) pk.textContent = '本次最高 ' + fmtSpeed(Math.max(peak.rx, peak.tx));
+
+    renderChart(d);
   }
 
   // ── 右侧带宽控制台 ──
@@ -1892,26 +2231,15 @@ html[data-theme="light"] .arw.up{color:#d97706}
   }
 
   function render(d){
-    document.getElementById('lvOnline').textContent = d.onlineCount;
-    document.getElementById('lvOnlineSub').textContent =
-      d.onlineCount === 0 ? '当前没人借网' : (d.conns + ' 条隧道连接');
-    document.getElementById('lvConns').textContent = d.conns;
-
-    document.getElementById('lvRx').innerHTML = fmtBps(d.rxBps);
-    document.getElementById('lvTx').innerHTML = fmtBps(d.txBps);
+    // ⚠ 这里**只能**操作还存在的元素。
+    //
+    // 踩过的坑：改版后忘了删旧的 `document.getElementById('lvOnline').textContent = ...`，
+    // 那个元素已经没了 → getElementById 返回 null → `.textContent` 抛 TypeError
+    // → render 整个中断 → 折线图和六卡片永远不更新。
+    // 页面上表现为「数字一直不动」，很容易误判成后端没返回数据。
     if (d.rxBps > peak.rx) peak.rx = d.rxBps;
     if (d.txBps > peak.tx) peak.tx = d.txBps;
-    renderGauge(d);
-
-    var rb = document.getElementById('lvRxBar');
-    var tb = document.getElementById('lvTxBar');
-    if (rb) rb.style.width = (peak.rx > 0 ? Math.max(2, d.rxBps/peak.rx*100) : 0) + '%';
-    if (tb) tb.style.width = (peak.tx > 0 ? Math.max(2, d.txBps/peak.tx*100) : 0) + '%';
-
-    setHot('lcOnline', d.onlineCount > 0);
-    setHot('lcConns', d.conns > 0);
-    setHot('lcRx', d.rxBps > 4096);
-    setHot('lcTx', d.txBps > 4096);
+    renderPerf(d);
 
     // ── 用户列表：只更新已有行，然后按 rank 重排 ──
     // 不能重建行：行里有 form 和 CSRF token，重建会丢。
