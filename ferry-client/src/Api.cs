@@ -200,15 +200,19 @@ namespace Ferry
         /// 的网络字节数 —— 只有客户端自己知道。5 秒一次，失败静默忽略
         /// （断网时本来就连不上门户，不该刷错误）。
         /// </summary>
-        public static void Heartbeat(Cfg cfg, long rxBytes, long txBytes, int conns, bool running)
+        public static void Heartbeat(Cfg cfg, long rxBytes, long txBytes, int conns, bool running,
+                                     string mode)
         {
             if (!cfg.Activated || string.IsNullOrEmpty(cfg.PortalUrl)) return;
             try
             {
                 var url = cfg.PortalUrl.TrimEnd('/') + "/api/heartbeat";
+                // mode：直连（direct）还是 SSH 隧道（ssh）。管理面板有这一列，
+                // 管理员才能一眼看出「这台还在走老的加密路径」。
                 var payload = "{\"ip\":\"" + Esc(cfg.AccountIp) + "\",\"token\":\"" + Esc(cfg.Token) +
                               "\",\"rxBytes\":" + rxBytes + ",\"txBytes\":" + txBytes +
-                              ",\"conns\":" + conns + ",\"running\":" + (running ? "true" : "false") + "}";
+                              ",\"conns\":" + conns + ",\"running\":" + (running ? "true" : "false") +
+                              ",\"mode\":\"" + Esc(mode ?? "") + "\"}";
                 var req = Make(url, "POST");
                 req.Timeout = 5000;
                 req.ContentType = "application/json; charset=utf-8";
