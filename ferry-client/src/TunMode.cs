@@ -325,6 +325,10 @@ namespace Ferry
                     LogTunLine(e.Data);
                 };
                 p.Start();
+                // 同 Tunnel：把 mihomo 也放进 Job。不这样的话客户端被强杀会留下
+                // 残留的 mihomo + FerryTun 虚拟网卡，下次启动直接撞名
+                // （Cannot create a file when that file already exists）。
+                JobKeeper.Add(p);
                 p.BeginOutputReadLine();
                 p.BeginErrorReadLine();
                 _proc = p;

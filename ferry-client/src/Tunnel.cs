@@ -109,6 +109,10 @@ namespace Ferry
                     if (!string.IsNullOrEmpty(e.Data)) _log("[ssh] " + e.Data);
                 };
                 p.Start();
+                // 立刻把 ssh 拉进 Job —— 客户端被强杀时它会跟着死。
+                // 不加这一步的话，每次非正常退出都会留一个孤儿 ssh 占着端口，
+                // 试几次之后「端口被占用，已调整」就会一路上飘（实测堆到 10 个）。
+                JobKeeper.Add(p);
                 p.BeginErrorReadLine();
                 p.BeginOutputReadLine();
                 _proc = p;

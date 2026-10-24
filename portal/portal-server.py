@@ -379,9 +379,35 @@ def csrf_get(key):
 
 
 def csrf_set(key):
-    tok = new_csrf()
-    _csrf[key] = tok
-    return tok
+    """取（或首次创建）这个会话的 CSRF token。
+
+    ⚠ 这里**不轮换**，是修一个实际会踩到的 bug 才改的。
+
+    原来的实现每次调用都 `new_csrf()` 覆盖旧值 —— 效果是「每渲染一次页面，
+    上一个 token 立刻失效」。整页刷新的老流程看不出问题（因为每次提交都会
+    重新渲染并带回新 token）。
+
+    但一旦有 fetch/局部更新就会炸：
+      · 用户点笔改备注 → fetch 保存成功 → 服务端悄悄轮换了 token
+      · 用户接着点「停用」→ 表单里还是旧 token → 403
+      · 或者再改第二条备注 → 403
+    实测就是这样：第二次保存返回 403，用户看到「保存失败」但不知道为什么。
+
+    稳定性 vs 安全性的取舍：
+      token 仍然随机不可猜（32 字节）、绑定客户端 IP、只活在这个进程里。
+      失去的只是「每次请求换一次」这个额外保护 —— 那对绑定了 IP 的
+      管理会话来说收益很小，而代价是随时可能 403。
+    登录成功时用 csrf_rotate() 主动换一次，防会话固定。
+    """
+    if key not in _csrf:
+        _csrf[key] = new_csrf()
+    return _csrf[key]
+
+
+def csrf_rotate(key):
+    """主动轮换（登录成功 / 登出时用）。"""
+    _csrf[key] = new_csrf()
+    return _csrf[key]
 
 
 def csrf_check(key, token):
@@ -1316,6 +1342,35 @@ html[data-theme="light"] .arw.up{color:#d97706}
 /* 密码列表 / 事件列表也限高滚动，几十条也不会把页面拉长 */
 .listwrap.sm{max-height:300px}
 
+/* ── 备注列：点笔才编辑 ──
+   非编辑态只显示文字 + 一个跟文字同色的小笔，输入框完全不在布局里。
+   为什么不做成一整列输入框：20 台机器就是 20 个输入框，表格看起来
+   全是框，真正的信息（IP/速率/状态）反而被淹没。 */
+.notecell{position:relative;white-space:nowrap}
+.notecell .notetxt{cursor:default}
+.notecell .notetxt.empty{color:var(--fg2);opacity:.55}
+/* 笔默认半透明，鼠标移到这一格才变实 —— 平时不抢注意力 */
+.notecell .notebtn{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:20px;height:20px;margin-left:6px;padding:0;
+  background:transparent;border:0;border-radius:5px;
+  color:var(--fg2);opacity:0;cursor:pointer;
+  transition:opacity .15s,background .15s,color .15s;
+  vertical-align:middle;
+}
+.notecell:hover .notebtn{opacity:.75}
+.notecell .notebtn:hover{opacity:1;background:var(--line);color:var(--accent)}
+.notecell .notebtn:focus-visible{opacity:1;outline:2px solid var(--accent);outline-offset:1px}
+.notecell .notein{
+  width:130px;padding:2px 6px;font-size:12px;
+  background:var(--card2);border:1px solid var(--accent);
+  border-radius:5px;color:var(--fg);font-family:inherit;
+}
+.notecell.editing .notetxt,
+.notecell.editing .notebtn{display:none}
+.notecell .notein.saving{opacity:.6}
+.notecell .notein.bad{border-color:var(--err)}
+
 /* 授权档位：一排可选按钮，比下拉框少一次点击 */
 .tiers{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 0}
 .tier{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
@@ -1490,6 +1545,111 @@ html[data-theme="light"] .arw.up{color:#d97706}
     ts.className = 'livestamp bad';
     ts.textContent = '连接中断 · ' + msg;
   }
+
+  // ── 备注编辑 ──
+  //
+  // 交互：点笔 → 出输入框（聚焦、全选）；回车或点别处 → 自动保存；
+  //       Esc → 取消不改。
+  //
+  // 为什么用 fetch 而不是表单提交：表单提交会整页刷新，用户改一条备注
+  // 就被弹回页面顶部、实时监控数据也重新加载一遍，体验很差。
+  // 这里保存成功后只更新那一格 DOM。
+  //
+  // CSRF：/admin/setnote 仍然校验 csrf。页面上的 csrf 从**任意一个**已有表单里取
+  // （页面上有多份同值 token），不需要额外渲染一个隐藏表单。
+  function csrfToken(){
+    var i = document.querySelector('input[name="csrf"]');
+    return i ? i.value : '';
+  }
+
+  function bindNote(td){
+    if (td.getAttribute('data-bound') === '1') return;
+    td.setAttribute('data-bound', '1');
+
+    var txt = td.querySelector('.notetxt');
+    var btn = td.querySelector('.notebtn');
+    var inp = td.querySelector('.notein');
+    if (!txt || !btn || !inp) return;
+
+    var original = td.getAttribute('data-note') || '';
+    var saving = false;
+
+    function open(){
+      if (saving) return;
+      inp.value = original;
+      td.classList.add('editing');
+      inp.style.display = '';
+      inp.focus();
+      inp.select();
+    }
+
+    function close(showValue){
+      td.classList.remove('editing');
+      inp.style.display = 'none';
+      if (showValue !== undefined) {
+        txt.textContent = showValue || '点笔填写';
+        if (showValue) txt.classList.remove('empty');
+        else txt.classList.add('empty');
+      }
+    }
+
+    function save(){
+      if (saving) return;
+      var v = inp.value.trim();
+      if (v === original) { close(v); return; }
+
+      saving = true;
+      inp.classList.add('saving');
+      inp.classList.remove('bad');
+
+      var body = new URLSearchParams();
+      body.append('csrf', csrfToken());
+      body.append('ip', td.getAttribute('data-ip'));
+      body.append('note', v);
+
+      fetch('/admin/setnote', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded',
+                  'X-Requested-With': 'fetch'},
+        body: body.toString()
+      }).then(function(r){
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      }).then(function(d){
+        if (!d.ok) throw new Error(d.error || '保存失败');
+        original = v;
+        td.setAttribute('data-note', v);
+        // 行内的 .notetxt 要跟着更新，否则下次点笔又拿旧值
+        saving = false;
+        inp.classList.remove('saving');
+        close(v);
+      }).catch(function(e){
+        saving = false;
+        inp.classList.remove('saving');
+        inp.classList.add('bad');
+        inp.title = '保存失败：' + e.message;
+        // 不关闭编辑态 —— 让用户能重试，别把刚输入的内容吞掉
+      });
+    }
+
+    btn.addEventListener('click', function(e){ e.preventDefault(); open(); });
+    inp.addEventListener('keydown', function(e){
+      if (e.key === 'Enter') { e.preventDefault(); save(); }
+      else if (e.key === 'Escape') { e.preventDefault(); close(original); }
+    });
+    // blur = 点别处。用 setTimeout 让 click 先跑完（点笔自己不该触发保存）
+    inp.addEventListener('blur', function(){
+      setTimeout(function(){ if (td.classList.contains('editing')) save(); }, 80);
+    });
+  }
+
+  function bindAllNotes(){
+    var cells = document.querySelectorAll('.notecell');
+    Array.prototype.forEach.call(cells, bindNote);
+  }
+  bindAllNotes();
+
   function tick(){
     fetch('/api/admin/live', {credentials:'same-origin', cache:'no-store'})
       .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
@@ -1542,10 +1702,24 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
 </tr>""" for r in inv)
 
     # 行里带 data-ip / data-rank，前端按 rank 重排 DOM（不重建行，保住 CSRF）
+    #
+    # 备注列做成「点笔才编辑」：
+    #   非编辑态只显示文字 + 一个小笔图标（避免一整列输入框把表格撑得很吵）。
+    #   笔是内联 SVG 而不是 emoji —— ✏️ 这类字符在多数系统上会被渲染成
+    #   彩色 emoji，跟深色主题打架；SVG 用 currentColor，永远跟着文字颜色走。
     cli_rows = ''.join(f"""<tr data-ip="{html.escape(r['ip'])}" data-rank="{1000000 - i}">
   <td class="st"><span class="dot off"></span><span class="stx">离线</span></td>
   <td class="mono">{html.escape(r['ip'])}</td>
-  <td class="muted">{html.escape(r['note']) or '<span class="muted">—</span>'}</td>
+  <td class="notecell" data-ip="{html.escape(r['ip'])}" data-note="{html.escape(r['note'] or '')}">
+    <span class="notetxt{' empty' if not r['note'] else ''}">{html.escape(r['note'] or '点笔填写')}</span>
+    <button type="button" class="notebtn" title="编辑备注" aria-label="编辑备注">
+      <svg viewBox="0 0 16 16" width="12" height="12" fill="none"
+           stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+           stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13H3v-2z"/></svg>
+    </button>
+    <input type="text" class="notein" maxlength="60" value="{html.escape(r['note'] or '')}"
+           style="display:none" placeholder="备注">
+  </td>
   <td class="num rx"><span class="arw down">&#8595;</span>—</td>
   <td class="num tx"><span class="arw up">&#8593;</span>—</td>
   <td class="num cs">—</td>
@@ -1624,7 +1798,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
       <th class="numh"><span class="arw down">&#8595;</span>下行</th>
       <th class="numh"><span class="arw up">&#8593;</span>上行</th>
       <th class="numh">连接</th>
-      <th>账号</th><th>最后活动</th><th>操作</th>
+      <th>授权</th><th>最后活动</th><th>操作</th>
     </tr></thead>
     <tbody>{cli_rows}</tbody>
   </table>
@@ -2452,6 +2626,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_admin_revoke(form)
             elif path == '/admin/toggle':
                 self.handle_admin_toggle(form)
+            elif path == '/admin/setnote':
+                self.handle_admin_setnote(form)
             elif path == '/admin/unlock':
                 self.handle_unlock(form)
             else:
@@ -3112,6 +3288,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         rate_ok(src_ip, 'admin')
         _csrf.pop('adminlogin|' + src_ip, None)
+        # 登录成功主动换一次管理区 token（防会话固定）。
+        # 之后这个 token 在会话内保持稳定，见 csrf_set 的说明。
+        csrf_rotate('admin|' + src_ip)
         self.redirect('/admin',
                       cookie=f'bn_admin={self._admin_cookie()}; Path=/; HttpOnly; SameSite=Lax')
 
@@ -3160,6 +3339,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.db.x('UPDATE invites SET revoked = 1 WHERE id = ?', (iid,))
         self.db.log('invite_revoke', self.client_ip(), f'id={iid}')
         self.send_html(admin_page(self.db, msg='已撤销', csrf=csrf_set('admin|' + self.client_ip())))
+
+    def handle_admin_setnote(self, form):
+        """改某台机器的备注。
+
+        为什么要能改：备注是给人看的（「张三-3楼」「实验室那台」），
+        时间一长必然需要修正。以前只有创建密钥时能填，设备列表只能读 ——
+        等于备注写错了就永远改不了。
+
+        两种响应格式：
+          · 普通表单提交 → 整页重定向回管理面板
+          · fetch（X-Requested-With: fetch）→ 返回 JSON，前端只更新那一格
+            （整页刷新会把用户弹回顶部、实时监控也重新拉一遍）
+        """
+        if not self._require_admin():
+            return
+
+        wants_json = (self.headers.get('X-Requested-With', '') == 'fetch')
+
+        def reply(ok, msgtext, code=200):
+            if wants_json:
+                self.send_json({'ok': ok, 'error': '' if ok else msgtext}, code if not ok else 200)
+            else:
+                self.send_html(admin_page(
+                    self.db, msg=msgtext if ok else '', err='' if ok else msgtext,
+                    csrf=csrf_set('admin|' + self.client_ip())), code)
+
+        ip = (form.get('ip') or '').strip()
+        note = (form.get('note') or '').strip()
+        if len(note) > 60:
+            note = note[:60]
+
+        cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
+        if not cli:
+            reply(False, '找不到这个 IP', 404)
+            return
+
+        self.db.x('UPDATE clients SET note = ? WHERE ip = ?', (note, ip))
+        self.db.log('client_note', self.client_ip(), f'{ip} -> {note[:40]}')
+
+        if wants_json:
+            self.send_json({'ok': True, 'ip': ip, 'note': note})
+        else:
+            self.send_html(admin_page(
+                self.db, msg=f'{ip} 的备注已{"更新" if note else "清空"}',
+                csrf=csrf_set('admin|' + self.client_ip())))
 
     def handle_admin_toggle(self, form):
         if not self._require_admin():
