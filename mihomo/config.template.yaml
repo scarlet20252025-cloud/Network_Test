@@ -1,0 +1,83 @@
+# 渡口 · 统一线路入口（mihomo 内核）
+#
+# 这个文件是**模板**，不要直接给 mihomo 用。
+# mihomo-keeper.ps1 启动时会探测上游真实端口，把 __占位符__ 换掉，
+# 渲染出同目录的 config.yaml，再交给 mihomo。
+#
+# 为什么需要模板：SSH 隧道的 SOCKS 端口不是固定的
+#   （keeper 用 10800，但端口被占时会顺延；手动起的可能落在 10801/10808）。
+#   把端口写死，一旦顺延，mihomo 就连到一个死端口，表现是「代理全挂但界面显示正常」。
+#   踩过的坑：ports.json 里记 10800，实际在听 10801。
+
+mixed-port: __MIXED_PORT__
+external-controller: 127.0.0.1:__API_PORT__
+secret: ""
+mode: rule
+log-level: info
+ipv6: false
+
+# 不用 geoip.dat / geosite.dat。
+# 为什么：本配置的 rules 只有内网 CIDR + MATCH，一条 GEOIP 都没有 ——
+# 那两个文件合计 20 MB，纯占地方（曾经复制过来，后来规则简化后就多余了）。
+# 如果将来要加 `GEOIP,CN,DIRECT` 之类的规则，再把它们从
+# D:\Clash Verge\resources\ 拷过来。
+geodata-mode: false
+geo-auto-update: false
+
+# 延迟测两次取平均，避免单次抖动误判线路好坏
+unified-delay: true
+# 多个解析结果并发连接，先连上的用 —— 断网/弱网时体感提升明显
+tcp-concurrent: true
+
+# 不记住上次选中的节点。
+# 为什么：默认必须永远是 DIRECT（=没借网）。如果记住上次选择，
+# 用户上次开着借网、这次开机时校园网是通的，就会莫名其妙先走隧道。
+# 踩过的坑：测试时切到 ferry-wg，重启后 ferry 直接是 ferry-wg，
+# 差点误判成「默认值写错了」。
+profile:
+  store-selected: false
+  store-fake-ip: false
+
+proxies:
+  # 上游一：SSH 动态转发（pcs，联通出口）
+  # 只支持 TCP（OpenSSH 的 -D 不实现 SOCKS5 UDP ASSOCIATE），udp: true 是
+  # 让 mihomo 去试；上游拒绝时它自己回落到 TCP，不会崩。
+  - name: ferry-ssh
+    type: socks5
+    server: 127.0.0.1
+    port: __SSH_PORT__
+    udp: true
+
+  # 上游二：WireGuard 隧道内的远端 SOCKS5（xt，电信出口）
+  # 远端 ferry-socks5-server.py 只实现 CONNECT，同样只有 TCP。
+  - name: ferry-wg
+    type: socks5
+    server: 10.66.67.1
+    port: 1080
+    udp: true
+
+proxy-groups:
+  # 自动线路：按健康检查结果自动选，第一条挂了自动切第二条
+  - name: ferry-auto
+    type: fallback
+    proxies: [ferry-ssh, ferry-wg]
+    # 用 generate_204 而不是 baidu：204 无正文，判断快且不受页面改版影响
+    url: http://connect.rom.miui.com/generate_204
+    interval: 30
+    tolerance: 50
+
+  # 总开关：默认 DIRECT（等于不借网），切到 ferry-auto 就自动借网
+  # 这样「开/关借网」和「选哪条线」是同一个动作，不需要两个开关
+  - name: ferry
+    type: select
+    proxies: [DIRECT, ferry-auto, ferry-ssh, ferry-wg]
+
+rules:
+  # 内网与回环永远直连 —— 借网时如果把这些也代理出去，
+  # 局域网里的打印机/共享/远端 SSH 会立刻失联
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  # 其余全部交给 ferry 组决定
+  - MATCH,ferry

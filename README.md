@@ -68,6 +68,21 @@ powershell -ExecutionPolicy Bypass -File tools\渡口助手.ps1
 
 托盘常驻，状态卡 + 链路明细 + 日志窗。
 
+### 方式 D：统一入口（推荐自用，一条命令切换线路）
+
+把「直连 / SSH→pcs / WG→xt」合成**一个固定端点** `127.0.0.1:10810`
+（HTTP + SOCKS5 同端口），自动选活的线路、自动切换、崩溃自动恢复。
+
+```powershell
+cd mihomo
+.\mihomo-keeper.ps1 On        # 借网（自动选活线路）
+.\mihomo-keeper.ps1 Status    # 看三态出口、当前线路、看护状态
+.\mihomo-keeper.ps1 Off       # 恢复直连
+.\mihomo-keeper.ps1 Install   # 装登录自启
+```
+
+**不动系统代理**，只提供端点。详见 [docs/统一入口.md](docs/统一入口.md)。
+
 ---
 
 ## 三、端口不用记
@@ -81,6 +96,10 @@ tools\ferry.ps1 -Action On -SocksPort 20808 -HttpPort 20809
 ```
 
 解析优先级：**显式参数 > `.proxy-state/ports.json` > 默认 10808/10809**
+
+> ⚠️ `ports.json` **不可信**：它只在 dual-proxy 以 auto 模式跑过时才写，
+> 手动起的 `ssh -D` 不会写。实测 `ports.json` 记 10800、实际在听 10801。
+> 所以 `mihomo/mihomo-keeper.ps1` 不读它，而是现场探测真实监听端口。
 
 ---
 
@@ -161,6 +180,15 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 | `tools/ssh-tunnel-keeper.ps1` | 隧道保活，断线 5 秒重连，单例锁 |
 | `tools/Get-FerryPorts.ps1` | **端口解析唯一入口**，所有脚本共用 |
 
+### 统一入口（mihomo）
+
+| 文件 | 作用 |
+|---|---|
+| `mihomo/mihomo-keeper.ps1` | 主控：启停、借网开关、看护循环、自启安装 |
+| `mihomo/config.template.yaml` | mihomo 配置模板（端口占位符启动时渲染） |
+| `mihomo/mihomo-state.txt` | 记住上次选择，崩溃恢复后保持借网状态 |
+| `mihomo/wintun.dll` | TUN 备用（现阶段用不上，需要管理员） |
+
 ### 多用户
 
 | 文件 | 作用 |
@@ -208,6 +236,7 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 |---|---|
 | [docs/实测数据.md](docs/实测数据.md) | **全部实测数据**：可达性 / 抖动 / 带宽多源对比 / DNS / 稳定性 / 断网验证 |
 | [docs/踩坑记录.md](docs/踩坑记录.md) | 27 条实测踩坑，每条都有「为什么」和「怎么做」 |
+| [docs/统一入口.md](docs/统一入口.md) | mihomo 常驻方案：端点、看护、状态持久化、自启编码三条硬要求 |
 | [docs/多人使用管理.md](docs/多人使用管理.md) | 接入架构、管理命令、面板字段、认证与配额 |
 | [docs/断网验证方法.md](docs/断网验证方法.md) | 三种验证方式、四类断网类型判定表 |
 | [docs/远端部署.md](docs/远端部署.md) | 远端 sshd / WireGuard / 端口转发 |
@@ -235,6 +264,17 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 
 5. **令牌是明文存在 `users.json` 里**
    这台机器本身要管好，不要把该文件同步到公开仓库。
+
+6. **统一入口只有 TCP，不是「普通网络」**
+   两个上游（OpenSSH `-D`、`ferry-socks5-server.py`）都只实现 SOCKS5 CONNECT，
+   UDP 走不通 —— 游戏、QUIC、部分视频通话不能用。它只是一个 SOCKS5/HTTP
+   端点，只覆盖「认代理设置」的程序。要全局透明代理必须 TUN，而 TUN 需要
+   管理员（实测 `Access is denied`）。
+
+7. **WG 线路的出口与直连相同**
+   实测两路出口都是 116.23.159.136（电信）。`ferry-wg` 节点保留是为了将来
+   接 UDP，不是因为它能换运营商。**换出口靠 SSH→pcs 的联通线路**
+   （218.107.0.47）。
 
 ---
 
