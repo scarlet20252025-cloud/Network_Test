@@ -131,6 +131,20 @@ class RateTable:
 # 全局的限速表。main() 里按 --rate-mb 初始化。
 RATES = RateTable(0)
 
+# ── UDP 关联登记 ──
+#
+# 每个关联占 **2 个 UDP 端口**（client_sock + target_sock）。
+# Windows 动态端口范围默认 49152~65535 = 16384 个，
+# 也就是最多约 8000 个关联 —— 听起来很多，但客户端如果每次都新建关联
+# （mihomo 在某些情况下会），几分钟就能堆到几千，然后新连接全部 bind 失败。
+#
+# 更要命的是原来**没有回收**：UDP_IDLE_TIMEOUT 定义了却没被任何代码使用，
+# last_active 只写不读。客户端异常断开（不发 FIN）时关联会一直挂到
+# TCP 超时（几分钟）。这就是「正常使用不下载也会卡」的潜在原因之一。
+_relays = set()
+RELAY_HARD_LIMIT = 3000     # 硬上限，超了直接拒绝新的 ASSOCIATE
+_relay_reaper_started = False
+
 # 全局总带宽上限（所有 IP 加起来）。0 = 不限。
 #
 # 为什么需要这一层：每 IP 限 10 MB/s，5 个人同时满速就是 50 MB/s ——
@@ -254,6 +268,7 @@ class UdpRelay:
     """
 
     def __init__(self, client_ip, client_port, on_close=None):
+        self._on_close_cb = on_close
         self.client_addr = (client_ip, client_port)
         # 实际收到 UDP 包的源地址。**必须**用它回发，不能用 client_addr。
         #
@@ -343,7 +358,7 @@ class UdpRelay:
             % (self.client_addr[0], self.port,
                self.stats['up'], self.stats['down'], self.stats['pkts']))
         if self.on_close:
-            self.on_close()
+            self.on_close(self)
 
 
 class _UdpProto(asyncio.DatagramProtocol):
@@ -417,9 +432,20 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
                 await client_reader.readexactly(16)
             await client_reader.readexactly(2)
 
-            relay = UdpRelay(peer_ip, peer[1] if peer else 0)
+            if len(_relays) >= RELAY_HARD_LIMIT:
+                log('%s UDP ASSOCIATE 被拒：关联数已达上限 %d'
+                    % (peer_ip, RELAY_HARD_LIMIT))
+                client_writer.write(b'\x00' + b'\x00' * 6)
+                await client_writer.drain()
+                client_writer.close()
+                return
+
+            relay = UdpRelay(peer_ip, peer[1] if peer else 0,
+                             on_close=lambda r: _relays.discard(r))
             port = await relay.start()
-            log('%s UDP ASSOCIATE → 中继端口 %d' % (peer_ip, port))
+            _relays.add(relay)
+            log('%s UDP ASSOCIATE → 中继端口 %d（当前关联 %d）'
+                % (peer_ip, port, len(_relays)))
 
             # 返回 BND.ADDR / BND.PORT。这里用 0.0.0.0 让客户端自己
             # 决定连哪个地址 —— 客户端可能是通过 WG、也可能是直连来的，
@@ -497,6 +523,44 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
             client_writer.close()
         except Exception:
             pass
+
+
+async def reap_idle_relays():
+    """定期回收空闲的 UDP 关联。
+
+    为什么必须有这个：
+      每个关联占 2 个 UDP 端口（client_sock + target_sock）。
+      关联的生命周期绑定 TCP 控制连接 —— 客户端正常断开时控制连接 EOF，
+      关联立刻关闭。但客户端**异常**断开（进程被杀、网线拔掉、休眠）时
+      没有 FIN，TCP 要等好几分钟才超时，这期间那两个端口一直占着。
+
+      原来 UDP_IDLE_TIMEOUT 常量定义了却没人用，last_active 只写不读 ——
+      等于没有回收。实测日志里几秒一个 ASSOCIATE，正常用一整天能堆几千个，
+      Windows 动态端口（默认 16384 个）迟早被吃光，之后新连接全部 bind 失败。
+
+    为什么按「最近有没有流量」而不是「创建了多久」：
+      一个正在挂着长连接的游戏会一直有包（心跳），不该被回收；
+      而创建了很久但早就没流量的关联才是垃圾。
+    """
+    global _relay_reaper_started
+    if _relay_reaper_started:
+        return
+    _relay_reaper_started = True
+    while True:
+        await asyncio.sleep(30)
+        try:
+            now_t = time.time()
+            dead = [r for r in list(_relays)
+                    if not r.closed and now_t - r.last_active > UDP_IDLE_TIMEOUT]
+            for r in dead:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            if dead:
+                log('回收空闲 UDP 关联 %d 个（剩 %d）' % (len(dead), len(_relays)))
+        except Exception as e:
+            log('UDP 关联回收出错（忽略）: %s' % e)
 
 
 async def watch_rate_conf(conf_path, initial_mb):
@@ -583,11 +647,13 @@ async def main():
     log('限速配置文件: %s（改了就热生效，不用重启）' % conf_path)
 
     watcher = asyncio.ensure_future(watch_rate_conf(conf_path, args.rate_mb))
+    reaper = asyncio.ensure_future(reap_idle_relays())
     try:
         async with server:
             await server.serve_forever()
     finally:
         watcher.cancel()
+        reaper.cancel()
 
 
 if __name__ == '__main__':

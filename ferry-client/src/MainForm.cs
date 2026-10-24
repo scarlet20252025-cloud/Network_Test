@@ -307,7 +307,18 @@ namespace Ferry
             _licTimer.Tick += delegate { CheckLicense(false); CheckUpdate(); };
             _licTimer.Start();
 
-            CheckUpdate();
+            // 启动后延迟 4 秒再查更新。
+            // 为什么不立刻查：程序刚起来时界面还在初始化，
+            // 如果马上弹一个「有新版本」对话框，会盖住主窗口、看起来像崩了。
+            // 4 秒足够让主界面画完。
+            var updDelay = new System.Windows.Forms.Timer(); updDelay.Interval = 4000;
+            updDelay.Tick += delegate
+            {
+                updDelay.Stop();
+                updDelay.Dispose();
+                CheckUpdate();
+            };
+            updDelay.Start();
         }
 
         void ProbeNet()
@@ -568,7 +579,29 @@ namespace Ferry
             var mode = rt != null ? rt.Mode : (_cfg.DirectSocks ? "direct" : "ssh");
             ThreadPool.QueueUserWorkItem(delegate
             {
-                Api.Heartbeat(_cfg, rx, tx, conns, running, mode);
+                var hb = Api.Heartbeat(_cfg, rx, tx, conns, running, mode);
+
+                // 服务端说这个账号不能用了 → 立刻断。
+                //
+                // 为什么靠心跳而不是等 CheckLicense：后者最长 6 小时才跑一次，
+                // 管理员封了人之后那段时间用户完全无感、还在正常借网。
+                // 心跳 5 秒一次，捎带这个状态等于零成本快速生效。
+                if (hb.Revoked && _rt != null && _rt.Running)
+                {
+                    try
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            Log(hb.Expired
+                                ? "授权已到期，服务端要求停止借网 —— 正在切回直连"
+                                : "账号已被管理员停用 —— 正在切回直连");
+                            DoStop();
+                            _licTimer.Stop();
+                            _licTimer.Start();   // 立刻重新拉一次授权状态，把界面切到「未激活」
+                        }));
+                    }
+                    catch (Exception) { }
+                }
             });
         }
 
@@ -666,15 +699,37 @@ namespace Ferry
                 var v = Api.Version(_cfg.PortalUrl);
                 if (!v.Ok) return;
                 var mine = Application.ProductVersion;
-                if (Api.CompareVer(v.Latest, mine) > 0)
-                    BeginInvoke(new Action(delegate
-                    {
-                        _btnUpd.Text = "更新 " + v.Latest;
-                        _btnUpd.Visible = true;
-                        Log("发现新版本 " + v.Latest + "（当前 " + mine + "）");
-                    }));
+                if (Api.CompareVer(v.Latest, mine) <= 0)
+                {
+                    // 没有更新就完全静默 —— 不留任何痕迹，不刷日志。
+                    // 用户的要求是「检查完没更新就静默后台」。
+                    return;
+                }
+
+                BeginInvoke(new Action(delegate
+                {
+                    _btnUpd.Text = "更新 " + v.Latest;
+                    _btnUpd.Visible = true;
+                    Log("发现新版本 " + v.Latest + "（当前 " + mine + "）");
+
+                    // 同一个版本只弹一次。
+                    // 为什么需要这个：定时器每 6 小时查一次，如果每次都弹，
+                    // 用户选了「以后再说」还是会被反复打扰。
+                    if (_updPrompted == v.Latest) return;
+                    _updPrompted = v.Latest;
+
+                    var r = MessageBox.Show(this,
+                        "发现新版本 " + v.Latest + "（当前 " + mine + "）\n\n" +
+                        "现在更新吗？安装会静默覆盖，配置和授权都不受影响。\n" +
+                        "选「否」就继续用当前版本，本次运行不再提醒。",
+                        "有可用更新", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                    if (r == DialogResult.Yes) DoUpdate();
+                }));
             });
         }
+
+        /// <summary>已经弹过提示的版本号。同一个版本不重复弹。</summary>
+        string _updPrompted = "";
 
         void DoUpdate()
         {
@@ -824,9 +879,21 @@ namespace Ferry
                 SetText(_lblDesc, "正常使用本机网络。断网时点「开始借网」。", Theme.Muted);
             }
 
-            // 三行明细（原版就有，看得出卡在哪一环）
-            SetText(_rowTunnel, "隧道        " + (tunnelUp ? "已连接（端口 " + socksPort + "）"
-                    : (runtimeUp ? "重连中…" : "未连接")), tunnelUp ? Theme.Text : Theme.Muted);
+            // 明细行
+            //
+            // 「隧道」这一行在直连模式下必须换文案。
+            // 踩过的坑：直连模式压根不建 SSH 隧道（_tunnel 是 null），
+            // 而旧逻辑只要 tunnelUp=false 又 runtimeUp=true 就显示「重连中…」——
+            // 用户看到永远在重连，以为坏了，其实一切正常，只是不需要隧道。
+            if (_cfg.DirectSocks)
+            {
+                SetText(_rowTunnel, "隧道        直连模式（不走 SSH）", Theme.Muted);
+            }
+            else
+            {
+                SetText(_rowTunnel, "隧道        " + (tunnelUp ? "已连接（端口 " + socksPort + "）"
+                        : (runtimeUp ? "重连中…" : "未连接")), tunnelUp ? Theme.Text : Theme.Muted);
+            }
 
             SetText(_rowBridge, "本地代理    " + (bridgeUp ? "运行中（端口 " + httpPort + "）" : "未运行"),
                     bridgeUp ? Theme.Text : Theme.Muted);

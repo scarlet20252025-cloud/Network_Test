@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
   mihomo-keeper.ps1 — 渡口统一入口（常驻）
 
@@ -476,6 +476,18 @@ function Test-WatchAlive {
   $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcId" -ErrorAction SilentlyContinue
   if (-not $proc) { return $false }
   if ($proc.Name -notmatch 'powershell|pwsh') { return $false }
+
+  # ⚠ 命令行读不到时**必须保守认为它还活着**。
+  #
+  # 踩过的坑：提权启动的进程，普通权限查 CommandLine 拿到的是空字符串
+  # （Windows 的跨完整性级别限制）。原来的写法
+  #   return ($proc.CommandLine -like '*mihomo-keeper.ps1*' -and ... -like '*Watch*')
+  # 对空字符串返回 false → 判定「旧的已经死了」→ 接管锁 → 又起一个 Watch。
+  # 实测堆出了 5 个 Watch 同时跑，每个都在无效重启 mihomo，用户看到
+  # 任务管理器里十几条进程。
+  #
+  # 正确做法：只有**明确读到**命令行且不是 Watch 时，才判定它死了。
+  if (-not $proc.CommandLine) { return $true }
   return ($proc.CommandLine -like '*mihomo-keeper.ps1*' -and $proc.CommandLine -like '*Watch*')
 }
 
@@ -734,13 +746,38 @@ start "" /min powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Byp
   # config.yaml 里的 port 是死的。隧道从 10801 顺延到 10808 时，mihomo 会
   # 一直连那个已经不存在的 10801，表现是「代理端口还在听、但所有请求 502」。
   'Watch' {
+    # 单例用命名 Mutex，不用 PID 文件。
+    #
+    # 为什么换：PID 文件方案有两个死穴 ——
+    #   ① 提权进程读不到 CommandLine，`Test-WatchAlive` 会误判「旧的已死」
+    #      （见该函数的注释，实测因此堆出 5 个 Watch）
+    #   ② 两个进程同时读-写锁文件有竞态
+    # Mutex 是内核对象：进程一退出自动释放，不存在「残留文件」和「PID 复用」。
+    try {
+      if (-not $script:WatchMutex) {
+        $script:WatchMutex = New-Object System.Threading.Mutex($false, 'Local\FerryMihomoWatch')
+      }
+      $acquired = $false
+      try {
+        $acquired = $script:WatchMutex.WaitOne(0)
+      } catch [System.Threading.AbandonedMutexException] {
+        # 上一个持锁进程是被强杀的 —— 锁已经归我们，继续。
+        $acquired = $true
+      }
+      if (-not $acquired) {
+        Write-KLog "watch already running (mutex held), nothing to do"
+        exit 0
+      }
+    } catch {
+      Write-KLog "mutex 不可用（$($_.Exception.Message)），退回 PID 文件判断" 'WARN'
+    }
+
     if (Test-Path $WatchLock) {
       $oldPid = ("$(Get-Content $WatchLock -Raw -ErrorAction SilentlyContinue)").Trim()
       if ($oldPid -and $oldPid -ne "$PID" -and (Test-WatchAlive $oldPid)) {
         Write-KLog "watch already running (pid $oldPid), nothing to do"
         exit 0
       }
-      Write-KLog "stale watch lock (pid $oldPid), taking over"
     }
     [IO.File]::WriteAllText($WatchLock, "$PID", (New-Object Text.UTF8Encoding $false))
     Write-KLog "watch start pid=$PID mixed=$MixedPort udp=$UdpHost`:$UdpPort"
