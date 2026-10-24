@@ -1,3 +1,59 @@
+## v0.9.0 — 2026-10-24
+
+> 本版是**工具层**新增（`mihomo/` 目录），客户端 exe 与安装包仍是 0.8.0，
+> 无需重新打包。`v0.7.0` / `v0.8.0` 两个版本的记录缺失，成品对应
+> `dist/渡口助手.exe` 与 `dist/Ferry-Setup-0.8.0.exe`。
+
+### 统一入口：两条线路合成一个固定端点（`mihomo/`）
+
+在此之前线路是「三个裸端口」（直连 / SSH→pcs:10801 / WG→xt:1080），
+用哪条靠人记端口、改系统代理、手动判断存活。现在收进一个端点。
+
+- `mihomo/config.template.yaml` —— mihomo 配置模板，占位符在启动时渲染
+- `mihomo/mihomo-keeper.ps1` —— 主控（Status/Start/Watch/Stop/On/Off/Switch/Install/Test）
+- 端点固定 **`127.0.0.1:10810`**，HTTP + SOCKS5 同端口
+- `ferry` select 组默认 **DIRECT**（=没借网），切 `ferry-auto` 才是借网
+- `ferry-auto` 是 fallback 组，健康检查 `generate_204` 每 30s，主线路挂了自动切
+
+**关键实测结论：WG 线路的出口 IP 与直连完全相同**（都是电信 116.23.159.136），
+它在「换运营商」上零价值。真正换出口的是 SSH→pcs 的联通线路
+（218.107.0.47）。WG 的唯一理论优势（承载 UDP）也因上游只实现 CONNECT 而为零。
+
+### 看护循环（`-Action Watch`）
+
+自启跑的是 Watch 不是 Start。每 20 秒体检：
+
+- mihomo 挂了 → 重新拉起（实测强杀后 25 秒内恢复）
+- 上游 SSH 端口顺延（10801 → 10808）→ 重渲染配置 + 重启
+  （不做的话表现是「10810 还在听，但所有请求 502」）
+
+带单例锁 + PID 复用防护。`Stop` 会连看护一起停，否则 20 秒后被拉回来。
+
+### 借网状态持久化（`mihomo-state.txt`）
+
+`store-selected: false` 保证开机不自动借网，但副作用是看护重启 mihomo 后
+正在借网的用户被静默打回直连（实测发生过）。改成自己记 state 文件：
+`On/Off/Switch` 时写，启动时读回来。两个需求都成立。
+
+### 自启
+
+`%APPDATA%\...\Startup\FerryMihomo.cmd`，跑 `-Action Watch`。
+用启动文件夹而非计划任务（`schtasks` 需管理员，实测 Access denied）。
+
+这个 `.cmd` 的编码要求三条，每条都踩过：**GBK + 无 BOM + CRLF**。
+- 带 BOM → 首行 `@echo off` 失效，报 `'∩╗┐@echo' 不是内部或外部命令`
+- 纯 LF → 每行第一个字符被吃掉，`rem` 变成 `'em' 不是内部或外部命令`
+- UTF-8 → `chcp 936` 下中文注释乱码（同 `b2e0df1` 那次）
+
+### 不动系统代理
+
+本脚本只提供端点，不写 `HKCU\...\Internet Settings`。实测 `On` 之后
+`ProxyEnable=1 ProxyServer=127.0.0.1:7897`（用户自己的 Clash Verge）纹丝不动。
+
+详见 [docs/统一入口.md](docs/统一入口.md)。
+
+---
+
 ## v0.6.0 — 2026-10-23
 
 ### 更名：borrow-net → Ferry（渡口）
