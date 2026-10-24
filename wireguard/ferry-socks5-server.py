@@ -39,6 +39,7 @@
 import argparse
 import asyncio
 import ipaddress
+import os
 import socket
 import struct
 import sys
@@ -103,6 +104,20 @@ class RateTable:
         self.lock = asyncio.Lock()
         self.map = {}
 
+    def set_rate(self, rate_bps):
+        """热更新限速值。
+
+        为什么需要：管理员在面板上改限速时，不能重启中继 ——
+        那会掐断所有正在传的连接（用户正在下载的文件直接断）。
+        这里就地改所有已有 limiter 的 rate，下个包立刻按新速率走。
+
+        rate 从有到无（设 0）时，已有 limiter 的 rate 也置 0，
+        `throttle()` 会立刻返回不等待，效果等同解除限速。
+        """
+        self.rate_bps = rate_bps
+        for lim in self.map.values():
+            lim.rate = float(rate_bps or 0)
+
     async def get(self, ip):
         if self.rate_bps <= 0:
             return None
@@ -115,6 +130,20 @@ class RateTable:
 
 # 全局的限速表。main() 里按 --rate-mb 初始化。
 RATES = RateTable(0)
+
+# 全局总带宽上限（所有 IP 加起来）。0 = 不限。
+#
+# 为什么需要这一层：每 IP 限 10 MB/s，5 个人同时满速就是 50 MB/s ——
+# 远端的物理出口（校园网到联通）根本扛不住，结果是所有人都卡。
+# 每人都有了配额之后，还要有个「总阀门」兜住出口。
+GLOBAL = RateLimiter(0)
+
+# 热重载的配置文件。两行：
+#   第 1 行：每 IP 多少 MB/s（0 = 不限）
+#   第 2 行：全局多少 MB/s（0 = 不限，可省略）
+# 跟中继脚本同目录，部署脚本会建。
+RATE_CONF_NAME = 'rate-mb.txt'
+_rate_conf_mtime = -1.0
 
 
 def log(msg):
@@ -137,6 +166,12 @@ async def pipe(reader, writer, label, counter, limiter=None):
                 break
             # 先限速再写：反过来的话数据已经进内核缓冲区了，
             # 那一段等于没限（实测双方向都这样会明显超速）。
+            #
+            # 两层限速串联：先过「全站总阀门」，再过「这个 IP 的配额」。
+            # 顺序不重要（都是等待），但两级都过才能同时满足
+            # 「每人不超过 X」和「所有人加起来不超过 Y」。
+            if GLOBAL.rate > 0:
+                await GLOBAL.throttle(len(data))
             if limiter is not None:
                 await limiter.throttle(len(data))
             writer.write(data)
@@ -464,6 +499,56 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
             pass
 
 
+async def watch_rate_conf(conf_path, initial_mb):
+    """盯着限速配置文件，变了就地热更新。
+
+    文件格式（纯文本两行数字）：
+        10      <- 每 IP 上限 MB/s（0 = 不限）
+        0       <- 全站总上限 MB/s（0 或省略 = 不限）
+
+    为什么用文件而不是控制端口：
+      门户和中继都在同一台机器上，文件是最简单、最不会挂的通道 ——
+      不需要额外监听端口（少一个暴露面），也不用处理鉴权。
+      门户写文件、这里读，中间没有任何协议。
+
+    为什么每 5 秒轮询而不是文件通知：
+      Windows 上跨进程文件变更通知要走 win32 API，标准库里没有；
+      5 秒延迟对「调限速」这种低频操作完全够用。
+    """
+    global _rate_conf_mtime
+    while True:
+        try:
+            if os.path.exists(conf_path):
+                mt = os.stat(conf_path).st_mtime
+                if mt != _rate_conf_mtime:
+                    _rate_conf_mtime = mt
+                    raw = open(conf_path, encoding='utf-8').read()
+                    lines = [x.strip() for x in raw.splitlines()]
+
+                    def num(idx, dflt):
+                        if len(lines) <= idx or not lines[idx]:
+                            return dflt
+                        try:
+                            return max(0.0, float(lines[idx].split()[0]))
+                        except (ValueError, IndexError):
+                            return dflt
+
+                    per_ip = num(0, initial_mb)
+                    total = num(1, 0.0)
+
+                    RATES.set_rate(int(per_ip * 1024 * 1024))
+                    # 全局没有 per-IP 那种对象表要同步，直接改一个 float
+                    GLOBAL.rate = float(int(total * 1024 * 1024))
+
+                    log('限速已热更新: 每 IP %s，全站 %s'
+                        % ((('%.2f MB/s' % per_ip) if per_ip > 0 else '不限'),
+                           (('%.2f MB/s' % total) if total > 0 else '不限')))
+        except Exception as e:
+            # 文件正被写一半、或内容不是数字 —— 忽略这一轮，下轮再试。
+            # 绝不能因为读配置失败就让这个循环退出（那就再也不热更新了）。
+            log('读限速配置失败（忽略）: %s' % e)
+        await asyncio.sleep(5)
+
 async def main():
     global RATES
     ap = argparse.ArgumentParser()
@@ -486,6 +571,8 @@ async def main():
     rate_bps = int(max(0.0, args.rate_mb) * 1024 * 1024)
     RATES = RateTable(rate_bps)
 
+    conf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), RATE_CONF_NAME)
+
     server = await asyncio.start_server(
         lambda r, w: handle(r, w, nets, args.udp), args.bind, args.port)
     addrs = ', '.join(str(s.getsockname()) for s in server.sockets)
@@ -493,8 +580,14 @@ async def main():
         % (addrs, ', '.join(str(n) for n in nets),
            '已启用' if args.udp else '未启用',
            ('%.1f MB/s / IP' % args.rate_mb) if rate_bps > 0 else '不限'))
-    async with server:
-        await server.serve_forever()
+    log('限速配置文件: %s（改了就热生效，不用重启）' % conf_path)
+
+    watcher = asyncio.ensure_future(watch_rate_conf(conf_path, args.rate_mb))
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        watcher.cancel()
 
 
 if __name__ == '__main__':

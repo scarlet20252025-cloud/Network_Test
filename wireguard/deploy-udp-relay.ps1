@@ -89,12 +89,57 @@ function Get-RelayProc {
 }
 
 function Stop-Relay {
+  <#
+    三条路都走一遍，因为每一条单独都不可靠：
+
+    ① PID 文件：精确，但强杀/覆盖安装后文件可能是旧的，
+       而且 Windows 会把死掉的 PID 复用给别的进程（要靠命令行二次校验）。
+
+    ② 端口 owner：最接近"真的有人在服务这个端口"这个事实。
+       PID 文件丢了也要能停掉。实测踩过：PID 文件里的号对应的进程早就没了，
+       而真正的中继还在跑 —— 于是"停止"什么都没做，新进程启不来（端口被占），
+       部署脚本却报"已启动 PID xxx"（那个 xxx 其实是新进程刚起就退出的号）。
+       表现是：文件是新的、命令行参数也对，就是不生效 —— 因为跑的是旧进程。
+
+    ③ 命令行匹配全杀：兜底，处理"多个残留实例"的情况。
+  #>
+  $killed = @()
+
   $p = Get-RelayProc
   if ($p) {
-    try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; Ok "已停止 PID $($p.ProcessId)" }
-    catch { Warn "停止失败: $($_.Exception.Message)" }
+    try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; $killed += $p.ProcessId }
+    catch { Warn "PID 文件里的进程停不掉: $($_.Exception.Message)" }
   }
+
+  # 端口 owner
+  try {
+    $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    if ($conn) {
+      $owner = [int]$conn.OwningProcess
+      if ($owner -gt 0 -and $killed -notcontains $owner) {
+        $op = Get-CimInstance Win32_Process -Filter "ProcessId=$owner" -ErrorAction SilentlyContinue
+        if ($op -and $op.Name -match 'python') {
+          try { Stop-Process -Id $owner -Force -ErrorAction Stop; $killed += $owner } catch { }
+        }
+      }
+    }
+  } catch { }
+
+  # 兜底：所有命令行里带 ferry-socks5-server 的 python
+  try {
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+      ForEach-Object {
+        if ($_.CommandLine -and $_.CommandLine -like '*ferry-socks5-server*' -and
+            $killed -notcontains $_.ProcessId) {
+          try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; $killed += $_.ProcessId } catch { }
+        }
+      }
+  } catch { }
+
+  if ($killed.Count -gt 0) { Ok ("已停止中继进程: " + ($killed -join ', ')) }
   Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+  if ($killed.Count -gt 0) { Start-Sleep -Seconds 2 }
 }
 
 function Start-Relay {
