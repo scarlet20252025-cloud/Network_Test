@@ -53,6 +53,15 @@ namespace Ferry
         public string TunError { get { return _tunError; } }
         string _tunError = "";
 
+        /// <summary>
+        /// 实际用的连接模式："direct"（直连远端 SOCKS5）或 "ssh"（SSH 隧道）。
+        ///
+        /// 注意这是**运行时**的真相，不是配置意图：直连模式下如果远端连不上，
+        /// Start() 会直接返回错误，不会悄悄退回 SSH。所以两者一致。
+        /// 管理面板用这个值显示「这台走的是哪条路」。
+        /// </summary>
+        public string Mode { get { return _cfg.DirectSocks ? "direct" : "ssh"; } }
+
         /// <summary>系统代理该指向的地址。</summary>
         public string BorrowServer { get { return "http://127.0.0.1:" + _httpPort; } }
 

@@ -563,9 +563,12 @@ namespace Ferry
             var tx = rt != null ? rt.BytesUp : 0;     // 上行 = 本机 → 远端
             var conns = rt != null ? (int)rt.ConnActive : 0;
             var running = rt != null && rt.Running;
+            // 连接模式：运行时优先（它反映真实走的是哪条路），
+            // 没在借网时用配置值，面板上不会空着。
+            var mode = rt != null ? rt.Mode : (_cfg.DirectSocks ? "direct" : "ssh");
             ThreadPool.QueueUserWorkItem(delegate
             {
-                Api.Heartbeat(_cfg, rx, tx, conns, running);
+                Api.Heartbeat(_cfg, rx, tx, conns, running, mode);
             });
         }
 

@@ -801,7 +801,7 @@ def hourly_of(ip):
              'rx': slot[k]['rx'], 'tx': slot[k]['tx']} for k in keys]
 
 
-def note_heartbeat(ip, rx, tx, conns, running):
+def note_heartbeat(ip, rx, tx, conns, running, mode=''):
     """记一次心跳并算速率。"""
     t = time.time()
     with _hb_lock:
@@ -818,6 +818,7 @@ def note_heartbeat(ip, rx, tx, conns, running):
         _hb[ip] = {'rx': rx, 'tx': tx, 'at': t,
                    'rxBps': rx_bps, 'txBps': tx_bps,
                    'conns': conns, 'running': bool(running),
+                   'mode': (mode or '')[:16],
                    'dRx': d_rx, 'dTx': d_tx}
         note_hourly(ip, rx_bps, tx_bps, d_rx, d_tx)
         return _hb[ip]
@@ -919,119 +920,93 @@ def heartbeat_of(ip):
 
 
 def sample_live(db):
-    """采一次现场。带 2 秒缓存。"""
+    """采一次现场。带 2 秒缓存。
+
+    ⚠ 在线判据是「有心跳」，不是「有 SSH 连接」。
+
+    为什么改（实测踩过）：直连模式（A 方案）下客户端根本不建 SSH 隧道，
+    「到本机 22 端口的 ESTABLISHED 连接」永远是 0，于是
+      · 所有设备被判成离线
+      · 速率列全是「—」
+      · 顶部四个指标卡全是 0
+    而详情弹窗里数据又是对的（那条路直接读心跳）。面板看起来完全坏了。
+
+    心跳是客户端每 5 秒主动上报的，跟走 SSH 还是走 SOCKS 无关，
+    才是唯一可靠的在线判据。SSH 连接数现在只作为「隧道数」的参考值。
+    """
     with _live_lock:
         t = time.time()
         if _live_cache['data'] is not None and t - _live_cache['at'] < 2.0:
             return _live_cache['data']
 
+        # 只用于展示「隧道连接数」参考值，不再参与在线判断
         peers = _ssh_peers()
         nb = _net_bytes()
 
-        rx_bps = tx_bps = 0
+        net_rx_bps = net_tx_bps = 0
         if nb is not None:
             if _live_prev['ready']:
                 dt = t - _live_prev['at']
                 if dt > 0.2:
-                    rx_bps = max(0, int((nb[0] - _live_prev['rx']) / dt))
-                    tx_bps = max(0, int((nb[1] - _live_prev['tx']) / dt))
-                    _live_peak['rx'] = max(_live_peak['rx'], rx_bps)
-                    _live_peak['tx'] = max(_live_peak['tx'], tx_bps)
+                    net_rx_bps = max(0, int((nb[0] - _live_prev['rx']) / dt))
+                    net_tx_bps = max(0, int((nb[1] - _live_prev['tx']) / dt))
+                    _live_peak['rx'] = max(_live_peak['rx'], net_rx_bps)
+                    _live_peak['tx'] = max(_live_peak['tx'], net_tx_bps)
             _live_prev.update(at=t, rx=nb[0], tx=nb[1], ready=True)
 
-        # 补上账号信息（备注 / 是否停用），让管理页一眼看出是谁
-        users = {}
-        for ip in peers:
-            row = db.q1('SELECT ip, enabled, note FROM clients WHERE ip = ?', (ip,))
-            users[ip] = {'enabled': bool(row['enabled']) if row else False,
-                         'registered': row is not None,
-                         'note': (row['note'] if row else '') or ''}
-
-        # 把心跳里的速率并进 online 列表
-        online = []
-        for ip, n in peers.items():
-            h = heartbeat_of(ip) or {}
-            online.append({
-                'ip': ip,
-                'conns': n,
-                'rxBps': h.get('rxBps', 0),
-                'txBps': h.get('txBps', 0),
-                'reported': bool(h),
-            })
-        online.sort(key=lambda x: -(x['rxBps'] + x['txBps']))
-
-        # 全量账号（不只是在线的）——管理页要「在线的置顶、离线的往下」
-        users = []
+        rows = []
         try:
-            for r in db.q('SELECT ip, enabled, note, last_seen, created_at FROM clients'):
-                ip = r['ip']
-                h = heartbeat_of(ip) or {}
-                on = ip in peers
-                users.append({
-                    'ip': ip,
-                    'enabled': bool(r['enabled']),
-                    'note': r['note'] or '',
-                    'online': on,
-                    'conns': peers.get(ip, 0),
-                    'rxBps': h.get('rxBps', 0) if on else 0,
-                    'txBps': h.get('txBps', 0) if on else 0,
-                    'reported': bool(h) and on,
-                    'lastSeen': int(r['last_seen'] or 0),
-                })
+            rows = db.q('SELECT ip, enabled, note, last_seen FROM clients')
         except Exception:
-            pass
-        # 在线优先，其次按总速率降序，再按最后活动降序
+            rows = []
+
+        users = []
+        for r in rows:
+            ip = r['ip']
+            h = heartbeat_of(ip)
+            on = h is not None
+            users.append({
+                'ip': ip,
+                'enabled': bool(r['enabled']),
+                'note': r['note'] or '',
+                'online': on,
+                'conns': int(h['conns']) if h else 0,
+                'rxBps': int(h['rxBps']) if h else 0,
+                'txBps': int(h['txBps']) if h else 0,
+                'reported': on,
+                'mode': (h.get('mode') or '') if h else '',
+                'lastSeen': int(r['last_seen'] or 0),
+            })
+        # 在线优先 → 总速率降序 → 最后活动降序
         users.sort(key=lambda u: (0 if u['online'] else 1,
                                   -(u['rxBps'] + u['txBps']),
                                   -u['lastSeen']))
 
-        # 全量账号（不只是在线的）——管理页要「在线置顶、离线靠下」
-        ulist = []
-        try:
-            for r in db.q('SELECT ip, enabled, note, last_seen FROM clients'):
-                ip = r['ip']
-                h = heartbeat_of(ip) or {}
-                on = ip in peers
-                ulist.append({
-                    'ip': ip,
-                    'enabled': bool(r['enabled']),
-                    'note': r['note'] or '',
-                    'online': on,
-                    'conns': peers.get(ip, 0),
-                    'rxBps': h.get('rxBps', 0) if on else 0,
-                    'txBps': h.get('txBps', 0) if on else 0,
-                    'reported': bool(h) and on,
-                    'lastSeen': int(r['last_seen'] or 0),
-                })
-        except Exception:
-            pass
-        ulist.sort(key=lambda u: (0 if u['online'] else 1,
-                                  -(u['rxBps'] + u['txBps']),
-                                  -u['lastSeen']))
+        online_users = [u for u in users if u['online']]
 
+        # 顶部指标用「所有在线机器的心跳速率之和」。
+        # 为什么不用网卡总量：那是整台机器（含 sshd、门户自己）的流量，
+        # 和「用户借网有多快」不是一回事；网络里一有别的动作数字就跳。
         data = {
             'ok': True,
             'at': int(t),
-            'online': online,
-            'list': ulist,
-            # 每小时统计给「流量」卡片用
-            'hourly': {u['ip']: hourly_of(u['ip']) for u in ulist if u['online']},
-            'onlineCount': len(peers),
-            'conns': sum(peers.values()),
-            'rxBps': rx_bps,
-            'txBps': tx_bps,
+            'list': users,
+            'hourly': {u['ip']: hourly_of(u['ip']) for u in online_users},
+            'onlineCount': len(online_users),
+            'conns': sum(u['conns'] for u in online_users),
+            'rxBps': sum(u['rxBps'] for u in online_users),
+            'txBps': sum(u['txBps'] for u in online_users),
             'peakRxBps': _live_peak['rx'],
             'peakTxBps': _live_peak['tx'],
-            'users': {u['ip']: {'enabled': u['enabled'],
-                                'registered': True,
-                                'note': u['note']} for u in users},
-            'list': users,
+            # 服务端网卡实测（排查用，面板不直接用）
+            'netRxBps': net_rx_bps,
+            'netTxBps': net_tx_bps,
+            # 还有多少台机器在走 SSH 隧道（老客户端），用来判断升级情况
+            'tunnelConns': sum(peers.values()),
         }
         _live_cache['data'] = data
         _live_cache['at'] = t
         return data
-
-
 
 def page(title, body, refresh=None, theme=None, cookie_header=None):
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ''
@@ -1471,6 +1446,21 @@ html[data-theme="light"] .arw.up{color:#d97706}
 .notecell .notein.saving{opacity:.6}
 .notecell .notein.bad{border-color:var(--err)}
 
+/* ── IP 与模式列 ──
+   IP 在线时用正常文字色（白/黑，跟主题走）、离线时压暗。
+   为什么不一律用 accent 绿：一整列绿色 IP 太抢眼，把「在线」这个信息
+   稀释掉了 —— 绿色应该留给「正在工作」的状态点，不是给所有链接。 */
+.ipcell{color:var(--fg);cursor:pointer;text-decoration:underline;
+  text-decoration-style:dotted;text-decoration-color:var(--line2);
+  text-underline-offset:3px;transition:color .15s,text-decoration-color .15s}
+.ipcell:hover{color:var(--accent);text-decoration-color:var(--accent)}
+.ipcell.off{color:var(--fg2);opacity:.6;cursor:default;text-decoration:none}
+.ipcell.off:hover{color:var(--fg2)}
+
+.modecell{font-size:12px;color:var(--fg2);white-space:nowrap}
+.modecell.direct{color:var(--accent)}
+.modecell.ssh{color:var(--fg)}
+
 /* ── 机器详情弹窗 ──
    点表格里的 IP 打开。用固定定位 + 半透明遮罩，不用 <dialog>（老浏览器兼容）。 */
 .modal{position:fixed;inset:0;z-index:900;display:none;
@@ -1619,6 +1609,23 @@ html[data-theme="light"] .arw.up{color:#d97706}
 
         // 没有心跳上报的在线用户，速率列加个提示
         if (on && !u.reported) { if (rx) rx.title = '该客户端未上报心跳（老版本）'; }
+
+        // IP 颜色跟着在线状态走：在线才是可点的正常色，离线压暗
+        var ipCell = tr.querySelector('.ipcell');
+        if (ipCell) {
+          ipCell.className = 'mono ipcell' + (on ? '' : ' off');
+          ipCell.title = on ? '点击查看详情' : '离线（仍可查看历史数据）';
+        }
+
+        // 连接模式：直连 / SSH。
+        // 老客户端不上报这个字段，显示「—」而不是瞎猜。
+        var modeCell = tr.querySelector('.modecell');
+        if (modeCell) {
+          var md = u.mode || '';
+          if (md === 'direct') { modeCell.textContent = '直连'; modeCell.className = 'modecell direct'; }
+          else if (md === 'ssh') { modeCell.textContent = 'SSH'; modeCell.className = 'modecell ssh'; }
+          else { modeCell.textContent = '—'; modeCell.className = 'modecell'; }
+        }
       });
 
       // 重排
@@ -1984,9 +1991,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
     #   彩色 emoji，跟深色主题打架；SVG 用 currentColor，永远跟着文字颜色走。
     cli_rows = ''.join(f"""<tr data-ip="{html.escape(r['ip'])}" data-rank="{1000000 - i}">
   <td class="st"><span class="dot off"></span><span class="stx">离线</span></td>
-  <td class="mono ipcell" data-ip="{html.escape(r['ip'])}" title="点击查看详情"
-      style="cursor:pointer;color:var(--accent);text-decoration:underline;
-             text-decoration-style:dotted;text-underline-offset:3px">{html.escape(r['ip'])}</td>
+  <td class="mono ipcell off" data-ip="{html.escape(r['ip'])}" title="点击查看详情">{html.escape(r['ip'])}</td>
   <td class="notecell" data-ip="{html.escape(r['ip'])}" data-note="{html.escape(r['note'] or '')}">
     <span class="notetxt{' empty' if not r['note'] else ''}">{html.escape(r['note'] or '点击编辑')}</span>
     <button type="button" class="notebtn" title="编辑备注" aria-label="编辑备注">
@@ -2000,6 +2005,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   <td class="num rx"><span class="arw down">&#8595;</span>—</td>
   <td class="num tx"><span class="arw up">&#8593;</span>—</td>
   <td class="num cs">—</td>
+  <td class="modecell">—</td>
   <td>{'<span class="ok">启用</span>' if r['enabled'] else '<span class="bad">停用</span>'}</td>
   <td class="muted">{fmt_ts(r['last_seen']) or '从未'}</td>
   <td class="nowrap">
@@ -2075,6 +2081,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
       <th class="numh"><span class="arw down">&#8595;</span>下行</th>
       <th class="numh"><span class="arw up">&#8593;</span>上行</th>
       <th class="numh">连接</th>
+      <th>模式</th>
       <th>授权</th><th>最后活动</th><th>操作</th>
     </tr></thead>
     <tbody>{cli_rows}</tbody>
@@ -3355,7 +3362,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             rx = tx = conns = 0
 
-        h = note_heartbeat(ip, rx, tx, conns, body.get('running'))
+        h = note_heartbeat(ip, rx, tx, conns, body.get('running'),
+                          str(body.get('mode') or ''))
         # 累计量直接用 note_heartbeat 算好的增量（它已经和上一次心跳比过）。
         # 不要在这里另存一份"上次的值" —— HTTPServer 每个请求都是新的处理实例，
         # 挂在 self 上的属性下一个请求就没了。
