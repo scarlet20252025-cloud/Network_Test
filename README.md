@@ -6,6 +6,8 @@
 **局域网域名**：`ferry.internal`（`.internal` 是 ICANN 保留给私有网络的 TLD，
 永远不会被公网解析占用）
 
+**当前版本**：客户端 `0.9.2` / 安装包 `Ferry-Setup-0.9.2.exe`（16.9 MB）
+
 ---
 
 ## 一、它解决什么问题
@@ -16,10 +18,16 @@
 渡口利用这一点：
 
 ```
-使用者机器 ──ssh -D──> 远端主机（能上网）──> Internet
-             ↑
-        走局域网，不需要公网出口
+使用者机器 ──直连 SOCKS5──> 远端主机（能上网）──> Internet
+                ↑
+           走局域网，不需要公网出口
 ```
+
+> v0.9 起默认**不走 SSH 加密**，改为直连远端 SOCKS5 ——
+> 因为 sshd 转发时源 IP 全变成 127.0.0.1，服务端没法按机器限速。
+> 代价是明文（局域网内可嗅探）。想加密就在设置里关掉 `directSocks`，
+> 退回 SSH 隧道（那时限速不生效）。
+
 
 **实测结论**（在实验机上删默认路由、保留 `10.0.0.0/8` 模拟断网）：
 
@@ -37,17 +45,33 @@
 
 ## 二、快速开始
 
-### 方式 A：登录门户（推荐，适合多人）
+### 方式 A：装客户端（**推荐**，这是现在的主线）
 
-1. 浏览器打开 `http://ferry.internal:8080/`（或 `http://10.13.24.1:8080/`）
-2. 输入**你的局域网 IP** 和**管理员给的临时密钥**（12 小时有效，一次性）
-3. 下载 `ferry-<你的IP>.cmd`，双击运行
+1. 浏览器打开 `http://10.13.24.1:8080/`（或 `http://ferry.internal:8080/`）
+2. 点「下载 Windows 客户端」拿到 `Ferry-Setup-0.9.2.exe`（约 17 MB，内嵌 TUN 运行时）
+3. 双击安装 → **会弹一次 UAC**（TUN 要建虚拟网卡，这是必需的）
+4. 打开「渡口助手」，填管理员给的密钥激活，之后就不用再管
 
-部署包会自动：检查 SSH 密钥 → 建隧道 → 起双协议代理 → 设系统代理 → 注册自启。
+装完之后：
 
-> 第一次需要把你的公钥发给管理员加到远端，之后不用再管。
+| 位置 | 用途 |
+|---|---|
+| 托盘图标 | 常驻。单击开菜单，双击开主窗口 |
+| 桌面「渡口助手」 | 主程序 |
+| 设置 → 开机自动启动 | 用**计划任务**实现（`RunLevel=HighestAvailable`），登录时**不弹 UAC** |
 
-### 方式 B：命令行（适合自己用）
+客户端能做这些：
+
+- **直连远端 SOCKS5**（不走 SSH，所以服务端能按机器限速）
+- **TUN 全局接管**（设置里勾「UDP低延迟模式」）—— 让不认代理的程序也走渡口
+- 系统代理备份 / 还原（退出时还原成你原来的 Clash，不会把你网搞断）
+- 启动时自动检查更新，有新版才弹窗
+- 被管理员停用 / 到期后，**5 秒内**自动切回直连
+
+> 为什么不建议用老的 `.cmd` 部署包：那套要装 Node.js、要手动配 SSH 密钥，
+> 而且没有 TUN。客户端是把这些全打进了 exe。
+
+### 方式 B：命令行工具（适合自己用 / 排障）
 
 ```powershell
 # 只建隧道 + 切系统代理
@@ -60,37 +84,22 @@ powershell -ExecutionPolicy Bypass -File tools\ferry.ps1 -Action Status
 powershell -ExecutionPolicy Bypass -File tools\ferry.ps1 -Action Off
 ```
 
-### 方式 C：图形界面
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\渡口助手.ps1
-```
-
-托盘常驻，状态卡 + 链路明细 + 日志窗。
-
-### 方式 D：一键部署（**推荐**，装一次之后只看两个图标）
+### 方式 C：mihomo 统一入口（命令行备选，功能已被客户端覆盖）
 
 ```powershell
 cd mihomo
-powershell -NoProfile -ExecutionPolicy Bypass -File install-all.ps1
+.\mihomo-keeper.ps1 On        # 借网
+.\mihomo-keeper.ps1 Status    # 看三态出口
+.\mihomo-keeper.ps1 Off       # 恢复直连
 ```
 
-一个脚本做完：环境检查 → 部署远端 UDP 中继 → 配本机统一入口 → 端到端验证
-→ 建桌面快捷方式。**不需要管理员权限**。
+把直连 / SSH→pcs / WG→xt 合成一个固定端点 `127.0.0.1:10810`，
+**不动系统代理**，只提供端点。
 
-跑完桌面多两个图标，之后双击即可：
+> ⚠ 这一套和客户端是**两套并行方案**，都开时会抢 10801/10800 端口。
+> 日常用客户端就够，这套留给「不想装 exe、只要一个 SOCKS 端点」的场景。
+> 它的自启项已默认不安装（`FerryMihomo.cmd` 已移除）。
 
-| 图标 | 作用 |
-|---|---|
-| **渡口借网** | 开启借网。TCP 走 SSH→pcs（联通出口），UDP 走 pcs 中继，自动分流 |
-| **渡口恢复直连** | 关闭借网 |
-
-需要代理的程序填 **`127.0.0.1:10810`**（HTTP + SOCKS5 同端口）。
-**系统代理不会被改动**，你原来的 Clash Verge 照常工作。
-
-**想要 UDP 低延迟 / 不认代理的程序也能用**：装 `Ferry-Setup-0.9.0.exe`（客户端），
-在设置里勾「UDP低延迟模式（全局接管）」。它会建一块虚拟网卡接管全部流量，
-连不认代理的程序也走渡口。需要管理员权限（安装包已默认要求）。详见 [docs/UDP低延迟模式.md](docs/UDP低延迟模式.md)。
 
 支持 UDP（游戏 / QUIC）—— 这是整条链路第一次具备这个能力。
 详见 [docs/一键部署与UDP.md](docs/一键部署与UDP.md)。
@@ -183,27 +192,48 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 
 ## 六、文件清单
 
-### 核心
+### 客户端（主线）
 
 | 文件 | 作用 |
 |---|---|
-| `tools/dual-proxy.mjs` | 双协议代理（HTTP + SOCKS5 单端口自动识别）、限速、隧道守护、孤儿清理 |
+| `ferry-client/src/Program.cs` | 入口。处理 `/start` `/stop` `/uninstall` `/install-autostart` |
+| `ferry-client/src/MainForm.cs` | 主窗口：状态卡、设置、托盘、自动更新、心跳 |
+| `ferry-client/src/Proxy.cs` | 内建 HTTP+SOCKS5 双协议代理（上游可指向远端） |
+| `ferry-client/src/TunMode.cs` | TUN 全局接管：委托 mihomo，管 PID 文件和残留清理 |
+| `ferry-client/src/Ferry.cs` | 系统代理备份/还原（含原代理看护） |
+| `ferry-client/src/JobKeeper.cs` | Job Object —— 强杀客户端时连带回收子进程 |
+| `ferry-client/src/app.manifest` | `requireAdministrator` + PerMonitorV2 DPI |
+| `installer/ferry.iss` | Inno Setup 安装包定义 |
+| `wireguard/ferry-socks5-server.py` | 远端 SOCKS5 服务：TCP CONNECT + UDP ASSOCIATE + **按 IP 限速** |
+
+### 核心工具（命令行）
+
+| 文件 | 作用 |
+|---|---|
+| `tools/dual-proxy.mjs` | 双协议代理（HTTP + SOCKS5 单端口自动识别）、限速、隧道守护 |
 | `tools/smart-resolve.mjs` | GitHub 系 IP 择优（健康分 + GCRA 式并发竞速） |
 | `tools/ssh-tunnel-keeper.ps1` | 隧道保活，断线 5 秒重连，单例锁 |
 | `tools/Get-FerryPorts.ps1` | **端口解析唯一入口**，所有脚本共用 |
 
-### 统一入口（mihomo）
+### 统一入口（mihomo，⚠ 命令行备选）
 
 | 文件 | 作用 |
 |---|---|
-| `mihomo/install-all.ps1` | **一键部署**（环境检查→远端中继→本机配置→验证→快捷方式） |
-| `mihomo/mihomo-keeper.ps1` | 主控：启停、借网开关、看护循环（含 SSH 隧道自管理）、自启安装 |
+| `mihomo/install-all.ps1` | 一键部署（环境检查→远端中继→本机配置→验证→快捷方式） |
+| `mihomo/mihomo-keeper.ps1` | 主控：启停、借网开关、看护循环、自启安装 |
 | `mihomo/config.template.yaml` | mihomo 配置模板（端口占位符启动时渲染） |
-| `mihomo/mihomo-state.txt` | 记住上次选择，崩溃恢复后保持借网状态 |
+| `wireguard/deploy-udp-relay.ps1` | 远端中继部署（在 pcs 上跑，含 `-RateMb`） |
+
+### 本轮新增的验证脚本
+
+| 文件 | 作用 |
+|---|---|
+| `tools/verify-proxy-restore.py` | 系统代理还原的三种场景（可达 / 不可达 / 脏值） |
+| `tools/verify-ban-kick.py` | 封禁 → 心跳带授权状态 → 客户端秒级断开（13 项） |
+| `tools/verify-udp-relay-lifecycle.py` | UDP 关联登记 / 上限 / 回收（15 项） |
+| `tools/verify-netctl-bugs.py` | 载荷仪表 + 带宽控制台（21 项） |
+| `tools/verify-note-api.py` | 备注编辑的 JSON 契约（保存/清空/404/截断） |
 | `mihomo/verify-udp-path.py` | 完整 UDP 链路验证（10810 → 中继 → 互联网） |
-| `mihomo/socks5-udp-test.py` | 直连测某 SOCKS5 服务端的 UDP ASSOCIATE |
-| `mihomo/probe-udp.py` | 测出站 UDP 是否可用 |
-| `wireguard/deploy-udp-relay.ps1` | 远端 UDP 中继部署（在 pcs 上跑） |
 
 ### 多用户
 
@@ -251,13 +281,14 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 | 文档 | 内容 |
 |---|---|
 | [docs/实测数据.md](docs/实测数据.md) | **全部实测数据**：可达性 / 抖动 / 带宽多源对比 / DNS / 稳定性 / 断网验证 |
-| [docs/踩坑记录.md](docs/踩坑记录.md) | 33 条实测踩坑，每条都有「为什么」和「怎么做」 |
-| [docs/一键部署与UDP.md](docs/一键部署与UDP.md) | **一键部署 + UDP 打通**：方案对比、实测数据、6 个新坑 |
-| [docs/UDP低延迟模式.md](docs/UDP低延迟模式.md) | **TUN 全局接管**：架构、为什么必须管理员、UAC 如何免掉、8 个坑 |
-| [docs/统一入口.md](docs/统一入口.md) | mihomo 常驻方案：端点、看护、状态持久化、自启编码三条硬要求 |
+| [docs/踩坑记录.md](docs/踩坑记录.md) | **40 条**实测踩坑，每条都有「为什么」和「怎么做」 |
+| [docs/限速与直连模式.md](docs/限速与直连模式.md) | **限速怎么真正生效**：A 方案、GCRA、为什么按 IP 不按连接 |
+| [docs/UDP低延迟模式.md](docs/UDP低延迟模式.md) | **TUN 全局接管**：架构、为什么必须管理员、UAC 如何免掉 |
 | [docs/多人使用管理.md](docs/多人使用管理.md) | 接入架构、管理命令、面板字段、认证与配额 |
 | [docs/断网验证方法.md](docs/断网验证方法.md) | 三种验证方式、四类断网类型判定表 |
 | [docs/远端部署.md](docs/远端部署.md) | 远端 sshd / WireGuard / 端口转发 |
+| [docs/一键部署与UDP.md](docs/一键部署与UDP.md) | ⚠ 命令行备选：`install-all.ps1` 一键部署 + UDP 打通过程 |
+| [docs/统一入口.md](docs/统一入口.md) | ⚠ 命令行备选：mihomo 常驻方案（端点 10810） |
 
 ---
 
@@ -283,19 +314,28 @@ python portal\portal-server.py --port 8080 --public-host 10.13.24.1
 5. **令牌是明文存在 `users.json` 里**
    这台机器本身要管好，不要把该文件同步到公开仓库。
 
-6. **统一入口的 TCP 和 UDP 走不同线路**
-   TCP 走 SSH→pcs（实测 5.2–9.3 MB/s 最稳），UDP 走 pcs 上的 Python 中继。
-   两条各管一段，规则里用 `NETWORK,udp` 分流。
+6. **客户端和 mihomo 方案不要同时开**
+   两套都监听 10800/10801 附近端口，抢起来会导致隧道时通时断。
+   日常用客户端；mihomo 那套留给「只要一个 SOCKS 端点」的场景。
 
 7. **WG 线路的出口与直连相同**
    实测两路出口都是 116.23.159.136（电信）。`ferry-wg` 节点保留是为了 TCP 冗余，
    不是因为它能换运营商。**换出口靠 SSH→pcs 的联通线路**（218.107.0.47）。
 
-8. **仍然不是「全局透明代理」**
-   10810 是个 SOCKS5/HTTP 端点，只覆盖「认代理设置」的程序。要让不认代理的
-   程序（多数游戏客户端）也走，需要 TUN，而 TUN 需要管理员
-   （实测 `configure tun interface: Access denied`）。
-   **UDP 能力已经打通**（中继层），但要走 TUN 还得提权。
+8. **客户端的 TUN 模式要管理员**
+   它要建虚拟网卡 + 改路由表（实测普通权限报
+   `configure tun interface: Access denied`）。安装包已默认要求管理员，
+   所以双击就提权；配套把开机自启改成计划任务（`RunLevel=HighestAvailable`），
+   登录时不会弹 UAC。
+
+9. **直连模式是明文 SOCKS5**
+   为了「服务端能按机器限速」，客户端默认不走 SSH 加密，直接连 `pcs:1080`。
+   同一个局域网里有人抓包能看到你访问了哪些域名和 IP。
+   想加密就在设置里关掉 `directSocks`（那时限速不生效）。
+
+10. **限速在远端，不在客户端**
+   客户端是用户自己的机器，改个 config 就绕过去了。只有远端
+   `ferry-socks5-server.py` 那个「所有流量必经」的点才真正有效。
 
 ---
 
