@@ -31,22 +31,39 @@ namespace Ferry
         ///   让 powershell 等 1.2 秒再起，旧进程那时已经退干净。
         ///   不用 cmd /c start，因为它没法带 UAC 提权。
         /// </summary>
-        public static void RestartElevated()
+        public static void RestartElevated(string extraArgs)
         {
             string exe = Application.ExecutablePath;
-            string cmd = "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"" +
-                "Start-Sleep -Milliseconds 1200; Start-Process -FilePath '" + exe +
-                "' -Verb RunAs\"";
+            var psi = new ProcessStartInfo(exe, extraArgs);
+            // ⚠ UseShellExecute = true 是这里的**关键**，不是随手写的：
+            //   · false 时 CreateProcess 启动的 powershell/子进程会进本进程的
+            //     Job Object（JobKeeper 把 ssh / mihomo 都放进去），而我们一退出
+            //     Windows 就把整个 Job 杀掉 —— 那个"延迟 1.2 秒再启动"的
+            //     powershell 也被一起毙了，结果就是「点了重启，程序只是退出了」。
+            //     （真实踩到：用户反馈"重启还是只是退出了没重启成功"）
+            //   · true 走 ShellExecute，新进程的父是 explorer，完全独立；
+            //     同时 Verb=runas 才能触发 UAC 提权。
+            psi.UseShellExecute = true;
+            psi.Verb = "runas";
+            try { psi.WorkingDirectory = System.IO.Path.GetDirectoryName(exe); }
+            catch (Exception) { }
+
             try
             {
-                var psi = new ProcessStartInfo("powershell.exe", cmd);
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = true;
-                psi.WindowStyle = ProcessWindowStyle.Hidden;
                 Process.Start(psi);
             }
-            catch (Exception) { }
-            Application.Exit();
+            catch (Exception e)
+            {
+                // 用户在 UAC 上点了"否"：别退出，继续用普通模式，
+                // 并且把原因说清楚（不然又是一次"点了没反应"）。
+                MessageBox.Show(
+                    "以管理员身份重启失败（多半是 UAC 上点了「否」）：\r\n" + e.Message +
+                    "\r\n\r\n可以手动右键程序 →「以管理员身份运行」。",
+                    "渡口", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            // 已经拉起新进程，旧的必须立刻走 —— 否则单实例锁会把它挡在门外。
+            Environment.Exit(0);
         }
     }
 }

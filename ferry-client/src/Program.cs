@@ -105,6 +105,19 @@ namespace Ferry
             bool created;
             _mutex = new Mutex(true, @"Local\FerryClient", out created);
 
+            // 提权重启时带 /allow-wait：旧实例可能还没退干净（它要先 Environment.Exit），
+            // 直接判定「已在运行」就会激活一个正在销毁的窗口然后自杀 —— 表现就是
+            // 「点了以管理员重启，结果什么都没了」。这里给它最多 10 秒。
+            if (!created && HasArg(args, "/allow-wait"))
+            {
+                for (int i = 0; i < 40 && !created; i++)
+                {
+                    Thread.Sleep(250);
+                    try { _mutex.Dispose(); } catch (Exception) { }
+                    _mutex = new Mutex(true, @"Local\FerryClient", out created);
+                }
+            }
+
             if (!created)
             {
                 // 已经在跑：把那个窗口顶到最前，而不是再开一个。

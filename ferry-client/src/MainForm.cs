@@ -29,6 +29,13 @@ namespace Ferry
         // 设置里改了全局接管时，停完借网要立刻按新设置重开一次。
         // 用一个标记跨异步回调传递，而不是嵌套线程 —— DoStop 的回调本来就在 UI 线程。
         bool _restartAfterStop;
+
+        // 主界面的「全局模式」开关。放在这里而不是设置里：
+        // 它是「要不要接 UDP / 游戏」的核心选择，藏进设置等于让用户猜。
+        CheckBox _chkGlobal;
+
+        // RefreshUi 里同步开关状态时会触发 CheckedChanged，用它挡住回环。
+        bool _syncing;
         string _exitVia = "";
         bool _hasNet = true, _probingNet;
         /// <summary>借网运行时（隧道 + 本地代理，都在本进程内）</summary>
@@ -180,6 +187,17 @@ namespace Ferry
             _btnRefresh.SetBounds(20, 438, 110, 30);
             _btnRefresh.Click += delegate { RefreshUi(); Log("已刷新"); };
             Controls.Add(_btnRefresh);
+
+            // 全局模式开关：夹在「刷新」和「设置」中间，一行放下。
+            _chkGlobal = new CheckBox();
+            _chkGlobal.Text = "全局模式";
+            _chkGlobal.Font = Theme.FSmall;
+            _chkGlobal.ForeColor = Theme.Text;
+            _chkGlobal.BackColor = Color.Transparent;
+            _chkGlobal.SetBounds(136, 444, 122, 22);
+            _chkGlobal.Checked = _cfg.UseTun;
+            _chkGlobal.CheckedChanged += delegate { OnToggleGlobal(); };
+            Controls.Add(_chkGlobal);
 
             _btnSettings = Theme.FlatButton("设置", false);
             _btnSettings.SetBounds(274, 438, 96, 30);
@@ -727,6 +745,55 @@ namespace Ferry
         /// 两次清理都幂等，重复执行没有副作用。
         /// </summary>
         /// <summary>
+        /// 主界面「全局模式」开关。
+        ///
+        /// 三种情况：
+        ///   · 打开但它需要管理员 → 确认后保存配置、提权重启（开关保持打开）
+        ///   · 打开/关闭 + 正在借网 → 借网链路按新设置重起一次（TUN 才会真的挂上/摘掉）
+        ///   · 其他 → 只保存 + 刷界面
+        /// </summary>
+        void OnToggleGlobal()
+        {
+            if (_syncing) return;
+            bool want = _chkGlobal.Checked;
+
+            if (want && !Elevator.IsAdmin())
+            {
+                var r = MessageBox.Show(this,
+                    "「全局模式」要创建虚拟网卡、接管 UDP，必须管理员权限。\r\n\r\n" +
+                    "接下来会弹一次 UAC，点「是」之后程序会以管理员身份重新启动，" +
+                    "开关会保持开启。\r\n\r\n继续吗？（取消就继续用普通模式，" +
+                    "浏览器、下载工具照样能借网）",
+                    "全局模式需要管理员权限", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                if (r != DialogResult.Yes)
+                {
+                    _syncing = true;
+                    _chkGlobal.Checked = false;
+                    _syncing = false;
+                    return;
+                }
+                _cfg.UseTun = true;
+                try { _cfg.Save(_cfgPath); } catch (Exception) { }
+                Log("开启全局模式需要管理员权限，正在以管理员身份重启…");
+                ElevateNow();
+                return;
+            }
+
+            _cfg.UseTun = want;
+            try { _cfg.Save(_cfgPath); } catch (Exception) { }
+            Log(want ? "全局模式已开启" : "全局模式已关闭");
+
+            if (_rt != null && _rt.Running && !_busy)
+            {
+                Log("按新设置重起借网链路…");
+                _restartAfterStop = true;
+                DoStop();
+                return;
+            }
+            RefreshUi();
+        }
+
+        /// <summary>
         /// 以管理员身份重启本程序。
         /// 先把借网停干净 —— 否则新进程起来时系统代理还指着旧进程的端口，
         /// 那几秒全网上不去，用户会以为「重启一下就坏了」。
@@ -743,8 +810,8 @@ namespace Ferry
                 }
             }
             catch (Exception) { }
-            Log("以管理员身份重启…");
-            Elevator.RestartElevated();
+            Log("以管理员身份重启…（UAC 上点「是」）");
+            Elevator.RestartElevated("/allow-wait");
         }
 
         void DoUninstall()
@@ -862,7 +929,12 @@ namespace Ferry
                 wc.Proxy = null;
                 wc.DownloadFile(url, tmp);
                 var psi = new ProcessStartInfo(tmp, "/SILENT /NORESTART /CLOSEAPPLICATIONS");
-                psi.UseShellExecute = false;
+                // ⚠ 必须 UseShellExecute = true：
+                //   否则安装包会被 JobKeeper 的 Job Object 收进去，而本进程
+                //   紧接着 RealQuit() 退出 —— Windows 把整个 Job 杀掉，
+                //   安装包还没开始解压就没了。用户看到的就是「点了是，然后无事发生」。
+                //   （0.9.2 的自动更新失败就是这个原因，实测复现过）
+                psi.UseShellExecute = true;
                 Process.Start(psi);
                 Log("已启动安装程序，本程序即将退出");
                 Thread.Sleep(600);
@@ -1018,6 +1090,14 @@ namespace Ferry
             SetText(_rowProxy, "系统代理    " + (proxyOn ? "开  " + (proxySrv.Length > 0 ? proxySrv : "（未设置）") : "关"),
                     borrowing ? Theme.Good : Theme.Text);
 
+            // 开关状态跟配置对齐（CheckChanged 里有 _syncing 挡回环）
+            if (_chkGlobal.Checked != _cfg.UseTun)
+            {
+                _syncing = true;
+                _chkGlobal.Checked = _cfg.UseTun;
+                _syncing = false;
+            }
+
             // TUN 状态行。为什么单独一行而不是混在系统代理里：
             // 这两件事是独立的 —— 系统代理可能开着但 TUN 没开（游戏不走），
             // 也可能 TUN 开着但用户手动关了系统代理。分开显示才看得清。
@@ -1025,7 +1105,7 @@ namespace Ferry
             {
                 // 勾了却没提权：不是「故障」，是差一步动作 ——
                 // 所以说清楚差什么、去哪儿点，别只写「未开启」。
-                SetText(_rowTun, "全局接管    已勾选 · 需管理员（设置里点「以管理员身份重启」）", Theme.Bad);
+                SetText(_rowTun, "全局接管    已勾选 · 需管理员（勾下面开关时会提示重启）", Theme.Bad);
                 _rowTun.Visible = true;
             }
             else if (_cfg.UseTun)
@@ -1040,7 +1120,7 @@ namespace Ferry
                 // 没开全局接管时**不要藏掉这一行**：
                 // 藏起来的结果是用户根本不知道有「UDP低延迟模式」这个能力，
                 // 于是游戏 / QUIC / 语音一直走不了渡口也说不清为什么。
-                SetText(_rowTun, "全局接管    未启用 · 设置里开启「UDP低延迟模式」", Theme.Muted);
+                SetText(_rowTun, "全局接管    未启用 · 勾选下方「全局模式」即可开启", Theme.Muted);
                 _rowTun.Visible = true;
             }
 
