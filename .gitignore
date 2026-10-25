@@ -15,6 +15,10 @@ users.json
 client-configs/
 .proxy-state/
 
+# 误提交的客户端二进制（0.9.5 曾漏进来一次）
+渡口助手-*.exe
+Ferry-Setup-*.exe
+
 # 临时测试/调试文件
 scratch/
 portal/portal.db
