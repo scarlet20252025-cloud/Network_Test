@@ -2931,6 +2931,11 @@ LIVE_UI = r'''
 
       // 重排
       var rows = Array.prototype.slice.call(body.children);
+      // 有备注正在编辑时**不要重排**。
+      // appendChild 会把行从原位置移除再插回去，输入框因此失焦、内容被清空 ——
+      // 用户打一半的备注每 3 秒被吃掉一次（实测反馈）。
+      // 数值更新在上面已完成，这里跳过的只是排序。
+      if (document.querySelector('.notecell.editing')) return;
       rows.sort(function(a, b){
         return (parseFloat(b.getAttribute('data-rank')) || 0) -
                (parseFloat(a.getAttribute('data-rank')) || 0);
@@ -3304,7 +3309,13 @@ LIVE_UI = r'''
   }
 
   function bootAll(){
-    bindIpCells(); bindNotes(); bindNetCtl(); bindFeedback(); bindNewCode();
+    // 只调「需要手动触发」的那几个。
+    // bindIpCells / bindAllNotes 各自在定义处就注册了 DOMContentLoaded，
+    // 这里再调一遍会重复绑定（点一次编辑触发两次）。
+    // ⚠ 原来这里写的是 bindNotes() —— 那个函数根本不存在（真名 bindAllNotes），
+    //   一执行就 ReferenceError，后面所有绑定全跳过：
+    //   表现就是「意见反馈」永远停在「加载中…」。
+    bindNetCtl(); bindFeedback(); bindNewCode();
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', bootAll);

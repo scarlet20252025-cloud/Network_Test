@@ -30,17 +30,9 @@ namespace Ferry
         CheckBox _chkAutoBorrow;
         CheckBox _chkMinimized;
         CheckBox _chkReconnect;
-        CheckBox _chkTun;
         NumericUpDown _numInterval;
         Label _lblHint, _lblVer;
 
-        /// <summary>这次保存有没有改「UDP低延迟模式（全局接管）」。
-        /// 主窗口靠它决定要不要按新设置重启借网链路。</summary>
-        public bool TunToggleChanged { get; private set; }
-
-        /// <summary>保存后需要以管理员身份重启（用户勾了 TUN 但当前不是管理员）。
-        /// 重启动作交给主窗口做 —— 它才知道怎么先把借网停干净。</summary>
-        public bool NeedElevate { get; private set; }
 
         public SettingsDialog(Cfg cfg, string cfgPath, string appDir)
             : this(cfg, cfgPath, appDir, null) { }
@@ -197,7 +189,7 @@ namespace Ferry
         void BuildUi()
         {
             Text = "设置";
-            ClientSize = new Size(470, 666);
+            ClientSize = new Size(470, 586);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = false;
@@ -214,7 +206,7 @@ namespace Ferry
             Controls.Add(sub);
 
             var card = Theme.Card(14);
-            card.SetBounds(20, 74, 430, 374);
+            card.SetBounds(20, 74, 430, 294);
             Controls.Add(card);
 
             _chkAutoStart = MakeCheck("开机自动启动",
@@ -249,7 +241,7 @@ namespace Ferry
             // 又不打断「开关 → 时长 → 保存」这条阅读顺序。
             var fbBtn = new Button();
             fbBtn.Text = "💬 意见反馈";
-            fbBtn.SetBounds(20, 612, 180, 34);
+            fbBtn.SetBounds(20, 532, 180, 34);
             fbBtn.FlatStyle = FlatStyle.Flat;
             fbBtn.FlatAppearance.BorderColor = Theme.Line;
             fbBtn.FlatAppearance.BorderSize = 1;
@@ -264,31 +256,13 @@ namespace Ferry
             // TUN：让不认系统代理的程序也走渡口，并且让 UDP 走低延迟链路。
             // 需要管理员权限 —— 客户端的 manifest 已声明 requireAdministrator，
             // 但用户可能是从旧快捷方式/命令行起的，所以运行时还要再判一次。
-            _chkTun = MakeCheck("UDP低延迟模式（全局接管）",
-                "网络层接管全部流量（含不认代理的程序），UDP 走低延迟链路。" +
-                "需管理员权限；开启后短暂断网属正常", 280);
-            _chkTun.Checked = _cfg.UseTun;
-            card.Controls.Add(_chkTun);
-
-            // 不是管理员时给一条直达路径 —— 让用户自己「右键 → 以管理员身份运行」
-            // 不现实：多数人想不到右键，更想不到得先把程序关掉。
-            var lnkElev = new LinkLabel();
-            lnkElev.Text = "以管理员身份重启程序…";
-            lnkElev.Font = Theme.FSmall;
-            lnkElev.LinkColor = Theme.Muted;
-            lnkElev.ActiveLinkColor = Theme.Accent;
-            lnkElev.LinkBehavior = LinkBehavior.HoverUnderline;
-            lnkElev.SetBounds(40, 340, 220, 18);
-            lnkElev.Visible = !Elevator.IsAdmin();
-            lnkElev.LinkClicked += delegate
-            {
-                _chkTun.Checked = true;
-                SaveAll();
-            };
-            card.Controls.Add(lnkElev);
+            // 「全局模式」在主界面状态卡里（「开启 / 关闭」按钮）。
+            // 这里**不再放第二个开关** —— 两处状态一定会不同步：
+            // 配置里 useTun=true 但进程没提权时，勾子是勾着的、TUN 却没起来，
+            // 用户不知道该信哪个，只能先取消再勾一次才触发。
 
             var lblIv = Theme.Text2("断网检测间隔", Theme.FSmall, Theme.Text);
-            lblIv.SetBounds(24, 468, 130, 20);
+            lblIv.SetBounds(24, 388, 130, 20);
             Controls.Add(lblIv);
 
             _numInterval = new NumericUpDown();
@@ -296,25 +270,25 @@ namespace Ferry
             _numInterval.Maximum = 300;
             _numInterval.Increment = 5;
             _numInterval.Value = Math.Max(10, Math.Min(300, _cfg.NetCheckSec));
-            _numInterval.SetBounds(166, 466, 90, 26);
+            _numInterval.SetBounds(166, 386, 90, 26);
             Controls.Add(_numInterval);
 
             var lblSec = Theme.Text2("秒", Theme.FSmall, Theme.Muted);
-            lblSec.SetBounds(264, 468, 30, 20);
+            lblSec.SetBounds(264, 388, 30, 20);
             Controls.Add(lblSec);
 
             _lblHint = Theme.Text2("间隔越短越灵敏，但每次检测要发一次 DNS 查询；" + Environment.NewLine +
                                    "断网后大约一个间隔内会自动开始借网。", Theme.FSmall, Theme.Muted);
-            _lblHint.SetBounds(24, 500, 424, 34);
+            _lblHint.SetBounds(24, 420, 424, 34);
             Controls.Add(_lblHint);
 
             var ok = Theme.FlatButton("保存", true);
-            ok.SetBounds(238, 612, 104, 34);
+            ok.SetBounds(238, 532, 104, 34);
             ok.Click += delegate { SaveAll(); };
             Controls.Add(ok);
 
             var cancel = Theme.FlatButton("取消", false);
-            cancel.SetBounds(350, 612, 104, 34);
+            cancel.SetBounds(350, 532, 104, 34);
             cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
             Controls.Add(cancel);
 
@@ -326,7 +300,7 @@ namespace Ferry
             lnkUninstall.LinkColor = Theme.Muted;
             lnkUninstall.ActiveLinkColor = Theme.Bad;
             lnkUninstall.LinkBehavior = LinkBehavior.HoverUnderline;
-            lnkUninstall.SetBounds(24, 558, 110, 20);
+            lnkUninstall.SetBounds(24, 478, 110, 20);
             lnkUninstall.LinkClicked += delegate
             {
                 if (_onUninstall == null) return;
@@ -343,7 +317,7 @@ namespace Ferry
             _lblVer.Font = Theme.FSmall;
             _lblVer.ForeColor = Theme.Muted;
             _lblVer.AutoSize = true;
-            _lblVer.SetBounds(142, 559, 150, 18);
+            _lblVer.SetBounds(142, 479, 150, 18);
             Controls.Add(_lblVer);
 
             var lnkCheck = new LinkLabel();
@@ -352,7 +326,7 @@ namespace Ferry
             lnkCheck.LinkColor = Theme.Accent;
             lnkCheck.ActiveLinkColor = Theme.Accent;
             lnkCheck.LinkBehavior = LinkBehavior.HoverUnderline;
-            lnkCheck.SetBounds(300, 558, 80, 20);
+            lnkCheck.SetBounds(300, 478, 80, 20);
             lnkCheck.LinkClicked += delegate { CheckUpdateManual(); };
             Controls.Add(lnkCheck);
 
@@ -382,7 +356,7 @@ namespace Ferry
         {
             base.OnLoad(e);
             // 把每条 checkbox 的说明文字挂到同一个父容器
-            foreach (var c in new[] { _chkAutoStart, _chkAutoBorrow, _chkMinimized, _chkReconnect, _chkTun })
+            foreach (var c in new[] { _chkAutoStart, _chkAutoBorrow, _chkMinimized, _chkReconnect })
             {
                 var h = c.Tag as Label;
                 if (h != null && c.Parent != null && h.Parent == null)
@@ -628,21 +602,7 @@ namespace Ferry
             _cfg.AutoReconnect = _chkReconnect.Checked;
             _cfg.NetCheckSec = (int)_numInterval.Value;
 
-            // TUN 勾了但没管理员权限：明确告诉用户会怎样，不要静默保存。
-            // 静默保存的结果是「用户以为开了，实际每次借网都失败」。
-            if (_chkTun.Checked && !Elevator.IsAdmin())
-            {
-                var r = MessageBox.Show(this,
-                    "「UDP低延迟模式（全局接管）」要创建虚拟网卡、接管 UDP，必须管理员权限。\r\n\r\n" +
-                    "保存后会以管理员身份重启一次（弹 UAC，点「是」）。\r\n" +
-                    "暂时不需要也可以选「否」：设置照样保存，只是这一项不生效 —— " +
-                    "浏览器、下载工具这些认代理的程序仍然能借网。\r\n\r\n" +
-                    "现在保存并以管理员重启吗？",
-                    "需要管理员权限", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-                NeedElevate = (r == DialogResult.Yes);
-            }
-            TunToggleChanged = _cfg.UseTun != _chkTun.Checked;
-            _cfg.UseTun = _chkTun.Checked;
+            // useTun 归主界面的「全局模式」按钮管，这里不碰。
 
             try { _cfg.Save(_cfgPath); }
             catch (Exception e)

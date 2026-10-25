@@ -30,9 +30,12 @@ namespace Ferry
         // 用一个标记跨异步回调传递，而不是嵌套线程 —— DoStop 的回调本来就在 UI 线程。
         bool _restartAfterStop;
 
-        // 主界面的「全局模式」开关。放在这里而不是设置里：
-        // 它是「要不要接 UDP / 游戏」的核心选择，藏进设置等于让用户猜。
-        CheckBox _chkGlobal;
+        // 「全局模式」的动作按钮，放在状态卡第 4 行右侧。
+        // 为什么不是复选框：复选框表达的是「设置里存了什么」，而用户关心的是
+        // 「现在到底生效没有」—— 两者会不一致（配置里 useTun=true，但进程没提权、
+        // TUN 没起来，勾子却是勾上的，用户得先取消再勾才能触发一次）。
+        // 按钮显示的是**真实运行状态**：TUN 在跑就是「关闭」，否则「开启」。
+        Button _btnGlobal;
 
         // RefreshUi 里同步开关状态时会触发 CheckedChanged，用它挡住回环。
         bool _syncing;
@@ -139,7 +142,15 @@ namespace Ferry
             // 第四行：TUN 状态。默认隐藏（只在设置里勾了全局接管时才显示），
             // 避免普通用户看到一行「未开启」以为是故障。
             _rowTun = Row(_card, 180);
-            _rowTun.Visible = false;
+            _rowTun.SetBounds(24, 180, 320, 18);
+            _rowTun.Visible = true;
+
+            // 全局模式的开关摆在「全局模式」这一行右边 —— 状态和动作在同一处。
+            _btnGlobal = Theme.FlatButton("开启", false);
+            _btnGlobal.SetBounds(390, 176, 70, 24);
+            _btnGlobal.Font = Theme.FSmall;
+            _btnGlobal.Click += delegate { OnGlobalClicked(); };
+            _card.Controls.Add(_btnGlobal);
 
             // ── 激活卡：输入框直接放在主界面，不弹窗 ──
             _actCard = Theme.Card(14);
@@ -187,17 +198,6 @@ namespace Ferry
             _btnRefresh.SetBounds(20, 438, 110, 30);
             _btnRefresh.Click += delegate { RefreshUi(); Log("已刷新"); };
             Controls.Add(_btnRefresh);
-
-            // 全局模式开关：夹在「刷新」和「设置」中间，一行放下。
-            _chkGlobal = new CheckBox();
-            _chkGlobal.Text = "全局模式";
-            _chkGlobal.Font = Theme.FSmall;
-            _chkGlobal.ForeColor = Theme.Text;
-            _chkGlobal.BackColor = Color.Transparent;
-            _chkGlobal.SetBounds(136, 444, 122, 22);
-            _chkGlobal.Checked = _cfg.UseTun;
-            _chkGlobal.CheckedChanged += delegate { OnToggleGlobal(); };
-            Controls.Add(_chkGlobal);
 
             _btnSettings = Theme.FlatButton("设置", false);
             _btnSettings.SetBounds(274, 438, 96, 30);
@@ -713,20 +713,7 @@ namespace Ferry
                 // 原来保存完什么都不做：正在借网时，隧道还是按旧设置起的，
                 // 界面也不刷新 —— 用户以为「勾了没生效」。
                 // 全局接管变了且正在借网：顺手重启链路；其他改动只刷新界面。
-                // 用户选了「以管理员身份重启」：这是最优先的动作。
-                if (dlg.NeedElevate)
-                {
-                    ElevateNow();
-                    return;
-                }
-
-                if (dlg.TunToggleChanged && _rt != null && _rt.Running && !_busy)
-                {
-                    Log("全局接管设置已改，按新设置重启借网链路…");
-                    _restartAfterStop = true;
-                    DoStop();
-                    return;
-                }
+                // 设置里只改了「自动借网 / 检测间隔」这类；useTun 归主界面按钮管。
                 RefreshUi();
             }
         }
@@ -752,26 +739,31 @@ namespace Ferry
         ///   · 打开/关闭 + 正在借网 → 借网链路按新设置重起一次（TUN 才会真的挂上/摘掉）
         ///   · 其他 → 只保存 + 刷界面
         /// </summary>
-        void OnToggleGlobal()
+        void OnGlobalClicked()
         {
-            if (_syncing) return;
-            bool want = _chkGlobal.Checked;
+            if (_busy) return;
+            bool running = _rt != null && _rt.Running;
+            bool tunUp = running && _rt.TunRunning;
 
-            if (want && !Elevator.IsAdmin())
+            if (tunUp)
+            {
+                _cfg.UseTun = false;
+                try { _cfg.Save(_cfgPath); } catch (Exception) { }
+                Log("关闭全局模式…");
+                if (running) { _restartAfterStop = true; DoStop(); return; }
+                RefreshUi();
+                return;
+            }
+
+            if (!Elevator.IsAdmin())
             {
                 var r = MessageBox.Show(this,
-                    "「全局模式」要创建虚拟网卡、接管 UDP，必须管理员权限。\r\n\r\n" +
-                    "接下来会弹一次 UAC，点「是」之后程序会以管理员身份重新启动，" +
-                    "开关会保持开启。\r\n\r\n继续吗？（取消就继续用普通模式，" +
-                    "浏览器、下载工具照样能借网）",
-                    "全局模式需要管理员权限", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-                if (r != DialogResult.Yes)
-                {
-                    _syncing = true;
-                    _chkGlobal.Checked = false;
-                    _syncing = false;
-                    return;
-                }
+                    "「全局模式」要让游戏 / QUIC / 语音也走渡口，需要创建虚拟网卡，" +
+                    "必须管理员权限。\r\n\r\n" +
+                    "点「是」之后程序会退出并自动以管理员身份重启；" +
+                    "如果你的 UAC 是「从不通知」，不会弹任何框。",
+                    "开启全局模式", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                if (r != DialogResult.Yes) return;
                 _cfg.UseTun = true;
                 try { _cfg.Save(_cfgPath); } catch (Exception) { }
                 Log("开启全局模式需要管理员权限，正在以管理员身份重启…");
@@ -779,17 +771,10 @@ namespace Ferry
                 return;
             }
 
-            _cfg.UseTun = want;
+            _cfg.UseTun = true;
             try { _cfg.Save(_cfgPath); } catch (Exception) { }
-            Log(want ? "全局模式已开启" : "全局模式已关闭");
-
-            if (_rt != null && _rt.Running && !_busy)
-            {
-                Log("按新设置重起借网链路…");
-                _restartAfterStop = true;
-                DoStop();
-                return;
-            }
+            Log("全局模式已开启");
+            if (running) { _restartAfterStop = true; DoStop(); return; }
             RefreshUi();
         }
 
@@ -955,6 +940,12 @@ namespace Ferry
         /// OnTextChanged → Invalidate → 重绘。1 秒一次心跳里更新七八个 Label，
         /// 界面静止时也在白烧 CPU（笔记本上能看出风扇）。
         /// </summary>
+        static void SetText(Button b, string text, Color color)
+        {
+            if (b.Text != text) b.Text = text;
+            if (b.ForeColor != color) b.ForeColor = color;
+        }
+
         static void SetText(Label l, string text, Color color)
         {
             if (l.Text != text) l.Text = text;
@@ -1090,38 +1081,35 @@ namespace Ferry
             SetText(_rowProxy, "系统代理    " + (proxyOn ? "开  " + (proxySrv.Length > 0 ? proxySrv : "（未设置）") : "关"),
                     borrowing ? Theme.Good : Theme.Text);
 
-            // 开关状态跟配置对齐（CheckChanged 里有 _syncing 挡回环）
-            if (_chkGlobal.Checked != _cfg.UseTun)
-            {
-                _syncing = true;
-                _chkGlobal.Checked = _cfg.UseTun;
-                _syncing = false;
-            }
-
             // TUN 状态行。为什么单独一行而不是混在系统代理里：
             // 这两件事是独立的 —— 系统代理可能开着但 TUN 没开（游戏不走），
             // 也可能 TUN 开着但用户手动关了系统代理。分开显示才看得清。
-            if (_cfg.UseTun && !Elevator.IsAdmin())
-            {
-                // 勾了却没提权：不是「故障」，是差一步动作 ——
-                // 所以说清楚差什么、去哪儿点，别只写「未开启」。
-                SetText(_rowTun, "全局接管    已勾选 · 需管理员（勾下面开关时会提示重启）", Theme.Bad);
-                _rowTun.Visible = true;
-            }
-            else if (_cfg.UseTun)
+            // 「全局模式」显示的是**真实运行状态**，不是配置里的意图。
+            // 意图（_cfg.UseTun）只决定「下次借网要不要起 TUN」。
             {
                 bool tunUp = rt != null && rt.TunRunning;
-                SetText(_rowTun, "全局接管    " + (tunUp ? "已开启（UDP低延迟模式）" : "未开启"),
-                        tunUp ? Theme.Good : Theme.Muted);
+                if (tunUp)
+                {
+                    SetText(_rowTun, "全局模式    已开启 · UDP / 游戏 / 语音都走渡口", Theme.Good);
+                    SetText(_btnGlobal, "关闭", Theme.Muted);
+                }
+                else if (_cfg.UseTun && !Elevator.IsAdmin())
+                {
+                    SetText(_rowTun, "全局模式    待管理员（点「开启」会提权重启）", Theme.Bad);
+                    SetText(_btnGlobal, "开启", Theme.Text);
+                }
+                else if (_cfg.UseTun && runtimeUp)
+                {
+                    SetText(_rowTun, "全局模式    正在启用…", Theme.Muted);
+                    SetText(_btnGlobal, "关闭", Theme.Muted);
+                }
+                else
+                {
+                    SetText(_rowTun, "全局模式    未开启 · 只有认代理的程序走渡口", Theme.Muted);
+                    SetText(_btnGlobal, "开启", Theme.Text);
+                }
                 _rowTun.Visible = true;
-            }
-            else
-            {
-                // 没开全局接管时**不要藏掉这一行**：
-                // 藏起来的结果是用户根本不知道有「UDP低延迟模式」这个能力，
-                // 于是游戏 / QUIC / 语音一直走不了渡口也说不清为什么。
-                SetText(_rowTun, "全局接管    未启用 · 勾选下方「全局模式」即可开启", Theme.Muted);
-                _rowTun.Visible = true;
+                _btnGlobal.Visible = true;
             }
 
             _btnOn.Enabled = !_busy && !borrowing;
