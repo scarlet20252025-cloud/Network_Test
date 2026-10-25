@@ -160,6 +160,260 @@ RATE_CONF_NAME = 'rate-mb.txt'
 _rate_conf_mtime = -1.0
 
 
+# --- Outbound bypass: fall back to local Clash when direct fails ---
+#
+# Why: the school blocks direct access to overseas sites (google/youtube all
+# time out), while the remote host runs Clash which CAN reach them. Borrowing
+# that exit means users do not have to configure a second proxy themselves.
+#
+# Why "concurrent race" instead of "direct first, Clash on failure":
+#   Serial would make blocked sites wait for the direct timeout (~3s), so a
+#   page load would just sit there. With racing: domestic sites win via direct
+#   (~100ms), blocked sites win via Clash (~300ms). Nobody waits.
+#
+# Why not "decide by target IP (CN vs overseas)":
+#   Maintaining an IP table is unrealistic, and a wrong guess makes domestic
+#   sites SLOWER (a pointless round trip abroad). Measured conclusion:
+#   "if direct works, Clash works too; if direct fails, only Clash works".
+#   Racing costs domestic sites nothing and covers blocked sites for free.
+CLASH_PROXY = None              # (host, port) or None (disabled)
+CLASH_FALLBACK_TIMEOUT = 1.2    # direct attempt timeout
+DIRECT_HEAD_START = 0.35        # how long direct may win exclusively
+_clash_ok_cache = {'v': None, 'at': 0.0}
+
+
+def _probe_tcp(host, port, timeout=0.5):
+    """Synchronous port probe. Startup only, never in the event loop."""
+    try:
+        s = socket.create_connection((host, port), timeout)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_clash_proxy(spec):
+    """Parse --clash-proxy into (host, port) or None.
+
+    auto: probe common ports (7890 Clash/mihomo, 7891 socks-port,
+          7897 Verge, 10808). Returns None when nothing answers, which
+          silently disables the bypass instead of breaking borrowing.
+    off:  disabled explicitly.
+    else: parse "host:port".
+    """
+    spec = (spec or '').strip().lower()
+    if spec in ('off', ''):
+        return None
+    if spec == 'auto':
+        for port in (7890, 7891, 7897, 10808):
+            if _probe_tcp('127.0.0.1', port):
+                return ('127.0.0.1', port)
+        return None
+    if ':' in spec:
+        h, _, p = spec.rpartition(':')
+        try:
+            return (h or '127.0.0.1', int(p))
+        except ValueError:
+            return None
+    return None
+
+
+async def _open_via_clash(host, port):
+    """Connect to target through the local Clash SOCKS5 port.
+
+    Clash's mixed-port speaks both HTTP and SOCKS5, so we just talk SOCKS5.
+    Returns None on any failure (caller treats it as "this path is down").
+    """
+    if not CLASH_PROXY:
+        return None
+    chost, cport = CLASH_PROXY
+    try:
+        r, w = await asyncio.wait_for(
+            asyncio.open_connection(chost, cport), timeout=8)
+    except Exception:
+        return None
+    try:
+        w.write(b'\x05\x01\x00')
+        await w.drain()
+        resp = await asyncio.wait_for(r.readexactly(2), timeout=8)
+        if resp[0] != 5 or resp[1] != 0:
+            w.close()
+            return None
+
+        req = bytearray([5, 1, 0])
+        ipobj = None
+        try:
+            ipobj = ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        if ipobj is not None and ipobj.version == 4:
+            req.append(1)
+            req += ipobj.packed
+        elif ipobj is not None and ipobj.version == 6:
+            req.append(4)
+            req += ipobj.packed
+        else:
+            try:
+                hb = host.encode('idna') if not host.isascii() else host.encode('ascii')
+            except Exception:
+                hb = host.encode('ascii', 'ignore')
+            if len(hb) > 255:
+                w.close()
+                return None
+            req.append(3)
+            req.append(len(hb))
+            req += hb
+        req += port.to_bytes(2, 'big')
+        w.write(bytes(req))
+        await w.drain()
+
+        head = await asyncio.wait_for(r.readexactly(4), timeout=8)
+        if head[1] != 0:
+            w.close()
+            return None
+        atyp = head[3]
+        if atyp == 1:
+            await asyncio.wait_for(r.readexactly(6), timeout=5)
+        elif atyp == 3:
+            ln = (await asyncio.wait_for(r.readexactly(1), timeout=5))[0]
+            await asyncio.wait_for(r.readexactly(ln + 2), timeout=5)
+        elif atyp == 4:
+            await asyncio.wait_for(r.readexactly(18), timeout=5)
+        else:
+            w.close()
+            return None
+        return r, w
+    except Exception as e:
+        # 记日志：之前这里静默 return None，排查「为什么没走 Clash」时
+        # 完全看不出原因（可能是节点挂了、被限流、握手被拒）。
+        if _clash_ok_cache.get('last_err') != str(e)[:60]:
+            _clash_ok_cache['last_err'] = str(e)[:60]
+            log('clash path failed: %s' % e)
+        try:
+            w.close()
+        except Exception:
+            pass
+        return None
+
+
+async def _open_upstream(host, port, peer_ip):
+    """Connect to target: direct gets a head start, Clash is the fallback.
+
+    Why a head start instead of a pure race:
+      Clash answers its own local handshake almost instantly, so a pure race
+      lets it steal DOMESTIC sites too -- that routes baidu abroad and back:
+      slower AND it burns the proxy plan's quota. Measured exactly that.
+
+    Why not "wait for direct to fully fail":
+      That is back to waiting the full 1.2s timeout on every blocked site.
+
+    Note: asyncio.wait(timeout=...) does NOT cancel on timeout (unlike
+    wait_for), so the direct attempt keeps running into phase 2.
+
+    Returns (reader, writer, via), via is 'direct' or 'clash'.
+    """
+    if not CLASH_PROXY:
+        r, w = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=10)
+        return r, w, 'direct'
+
+    async def try_direct():
+        return await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=CLASH_FALLBACK_TIMEOUT)
+
+    async def try_clash():
+        got = await _open_via_clash(host, port)
+        if got is None:
+            raise ConnectionError('clash unavailable')
+        return got
+
+    t_direct = asyncio.ensure_future(try_direct())
+    t_clash = asyncio.ensure_future(try_clash())
+    by_task = {t_direct: 'direct', t_clash: 'clash'}
+
+    winner = None
+    errors = []
+    try:
+        # ---- Phase 1: direct has a head start ----
+        # Wait for direct to finish OR for the window to expire.
+        # asyncio.wait_for here wraps only the *wait*, so the direct task
+        # itself keeps running into phase 2 (wait_for cancels what it wraps,
+        # and what it wraps is the inner wait coroutine, not the task).
+        try:
+            await asyncio.wait_for(
+                asyncio.wait({t_direct}, return_when=asyncio.FIRST_COMPLETED),
+                timeout=DIRECT_HEAD_START)
+        except asyncio.TimeoutError:
+            pass
+
+        # direct wins outright if it connected
+        if t_direct.done() and not t_direct.cancelled() and t_direct.exception() is None:
+            winner = t_direct
+        else:
+            if t_direct.done() and not t_direct.cancelled() and t_direct.exception() is not None:
+                errors.append(t_direct.exception())
+
+            # ---- Phase 2 ----
+            # First: did Clash already finish during phase 1? If so, use it.
+            # (An earlier version filtered completed tasks out here and lost
+            #  the ready Clash connection -- every blocked site then failed.)
+            if t_clash.done() and not t_clash.cancelled():
+                exc = t_clash.exception()
+                if exc is None:
+                    winner = t_clash
+                else:
+                    errors.append(exc)
+
+            # Otherwise wait for whichever of the two is still running.
+            if winner is None:
+                race = set(t for t in (t_direct, t_clash) if not t.done())
+                while race and winner is None:
+                    done2, race = await asyncio.wait(
+                        race, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done2:
+                        if t.cancelled():
+                            continue
+                        exc = t.exception()
+                        if exc is not None:
+                            errors.append(exc)
+                            continue
+                        winner = t
+                        break
+
+        # ---- Cancel everything except the winner ----
+        for t in (t_direct, t_clash):
+            if winner is not None and t is winner:
+                continue
+            if not t.done():
+                t.cancel()
+        for t in (t_direct, t_clash):
+            if winner is not None and t is winner:
+                continue
+            try:
+                await asyncio.gather(t, return_exceptions=True)
+            except Exception:
+                pass
+
+        if winner is None:
+            raise errors[0] if errors else ConnectionError('all upstreams failed')
+
+        via = by_task[winner]
+        r, w = winner.result()
+
+        if via == 'clash' and _clash_ok_cache['v'] is not True:
+            _clash_ok_cache['v'] = True
+            _clash_ok_cache['at'] = time.time()
+            log('direct failed, auto-routing via local Clash (e.g. %s:%d)'
+                % (host, port))
+
+        return r, w, via
+    finally:
+        for t in (t_direct, t_clash):
+            if not t.done():
+                t.cancel()
+
+
 def log(msg):
     print('[%s] %s' % (time.strftime('%H:%M:%S'), msg), flush=True)
 
@@ -519,10 +773,9 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
             return
         port = int.from_bytes(await client_reader.readexactly(2), 'big')
 
-        # ── 连目标 ──
+        # -- connect target (direct vs Clash race) --
         try:
-            up_reader, up_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=10)
+            up_reader, up_writer, via = await _open_upstream(host, port, peer_ip)
         except Exception as e:
             log('%s → %s:%d 失败: %s' % (peer_ip, host, port, e))
             client_writer.write(b'\x05\x05\x00\x01' + b'\x00' * 6)
@@ -540,7 +793,8 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
             pipe(client_reader, up_writer, 'up', counter, limiter),
             pipe(up_reader, client_writer, 'down', counter, limiter),
         )
-        log('%s → %s:%d 结束，%d 字节' % (peer_ip, host, port, counter[0]))
+        log('%s -> %s:%d done, %d bytes (%s)'
+            % (peer_ip, host, port, counter[0], via))
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
     except Exception as e:
@@ -652,7 +906,10 @@ async def main():
     ap.add_argument('--udp', action='store_true',
                     help='启用 UDP ASSOCIATE（默认关闭，因为它是可选的暴露面）')
     ap.add_argument('--rate-mb', type=float, default=10.0,
-                    help='每个源 IP 的带宽上限（MB/s）。0 = 不限速。默认 10')
+                    help='per-IP bandwidth cap in MB/s. 0 = unlimited. Default 10')
+    ap.add_argument('--clash-proxy', default='auto',
+                    help='local proxy used when direct fails, e.g. 127.0.0.1:7890. '
+                         'auto (default) = probe common ports; off = disable')
     args = ap.parse_args()
 
     nets = []
@@ -664,6 +921,9 @@ async def main():
     rate_bps = int(max(0.0, args.rate_mb) * 1024 * 1024)
     RATES = RateTable(rate_bps)
 
+    global CLASH_PROXY
+    CLASH_PROXY = _resolve_clash_proxy(args.clash_proxy)
+
     conf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), RATE_CONF_NAME)
 
     server = await asyncio.start_server(
@@ -673,7 +933,11 @@ async def main():
         % (addrs, ', '.join(str(n) for n in nets),
            '已启用' if args.udp else '未启用',
            ('%.1f MB/s / IP' % args.rate_mb) if rate_bps > 0 else '不限'))
-    log('限速配置文件: %s（改了就热生效，不用重启）' % conf_path)
+    log('rate config: %s (hot reload, no restart needed)' % conf_path)
+    if CLASH_PROXY:
+        log('outbound bypass: race to %s:%d when direct fails' % CLASH_PROXY)
+    else:
+        log('outbound bypass: disabled (no local proxy found, or --clash-proxy off)')
 
     watcher = asyncio.ensure_future(watch_rate_conf(conf_path, args.rate_mb))
     reaper = asyncio.ensure_future(reap_idle_relays())
