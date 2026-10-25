@@ -34,6 +34,10 @@ namespace Ferry
         NumericUpDown _numInterval;
         Label _lblHint, _lblVer;
 
+        /// <summary>这次保存有没有改「UDP低延迟模式（全局接管）」。
+        /// 主窗口靠它决定要不要按新设置重启借网链路。</summary>
+        public bool TunToggleChanged { get; private set; }
+
         public SettingsDialog(Cfg cfg, string cfgPath, string appDir)
             : this(cfg, cfgPath, appDir, null) { }
 
@@ -43,7 +47,12 @@ namespace Ferry
             _cfgPath = cfgPath;
             _appDir = appDir;
             _onUninstall = onUninstall;
+            // 同上：不声明 Dpi 缩放，高 DPI 下文字会被裁（设置页最明显，
+            // 因为每个勾选项下面还有一行 8.5pt 的说明）。
+            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleDimensions = new SizeF(96F, 96F);
             BuildUi();
+            Load += delegate { Theme.FitToScreen(this); };
         }
 
         static string StartupDir()
@@ -432,6 +441,8 @@ namespace Ferry
                 f.MinimizeBox = false;
                 f.BackColor = Theme.Bg;
                 f.Font = Theme.FBody;
+                f.AutoScaleMode = AutoScaleMode.Dpi;
+                f.AutoScaleDimensions = new SizeF(96F, 96F);
 
                 var title = Theme.Text2("遇到问题，或者有想让它做到的事？", Theme.FBody, Theme.Text);
                 title.SetBounds(20, 16, 420, 24);
@@ -595,6 +606,7 @@ namespace Ferry
                     "需要管理员权限", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
                 if (r != DialogResult.Yes) { return; }
             }
+            TunToggleChanged = _cfg.UseTun != _chkTun.Checked;
             _cfg.UseTun = _chkTun.Checked;
 
             try { _cfg.Save(_cfgPath); }

@@ -26,6 +26,24 @@ namespace Ferry
         public static readonly Color GoodDark = Color.FromArgb(22, 150, 143);
         public static readonly Color Bad = Color.FromArgb(231, 76, 60);
 
+        /// <summary>
+        /// 高 DPI 下窗口会被 AutoScale 放大（150% 时 748 高 → 1122），
+        /// 小屏笔记本上会超出工作区，底部按钮点不到。
+        /// 这里把窗口收进工作区并开滚动条 —— 内容可达，比「缩放回去」好：
+        /// 缩回去等于又把文字裁了。
+        /// </summary>
+        public static void FitToScreen(Form f)
+        {
+            var wa = Screen.FromControl(f).WorkingArea;
+            int w = Math.Min(f.Width, wa.Width - 24);
+            int h = Math.Min(f.Height, wa.Height - 24);
+            if (w == f.Width && h == f.Height) return;
+            f.AutoScroll = true;
+            f.Size = new Size(w, h);
+            f.Location = new Point(wa.Left + (wa.Width - w) / 2,
+                                   wa.Top + (wa.Height - h) / 2);
+        }
+
         public static readonly Font FTitle = new Font("Microsoft YaHei", 13f, FontStyle.Bold);
         public static readonly Font FBig = new Font("Microsoft YaHei", 20f, FontStyle.Bold);
         public static readonly Font FBody = new Font("Microsoft YaHei", 9.5f);

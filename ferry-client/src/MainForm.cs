@@ -25,6 +25,10 @@ namespace Ferry
         NotifyIcon _tray;
         System.Windows.Forms.Timer _fast, _slow, _licTimer, _hbTimer;
         bool _busy, _activating;
+
+        // 设置里改了全局接管时，停完借网要立刻按新设置重开一次。
+        // 用一个标记跨异步回调传递，而不是嵌套线程 —— DoStop 的回调本来就在 UI 线程。
+        bool _restartAfterStop;
         string _exitVia = "";
         bool _hasNet = true, _probingNet;
         /// <summary>借网运行时（隧道 + 本地代理，都在本进程内）</summary>
@@ -37,9 +41,19 @@ namespace Ferry
             _appDir = appDir;
             _logPath = Path.Combine(appDir, "assistant.log");
             _cfg = Cfg.Load(cfgPath);
+            // 高 DPI：让 WinForms 按系统缩放比例整体放大控件。
+            //
+            // 不写这两行 = 默认 AutoScaleMode.Font：字体 pt 固定、和设计时一模一样，
+            // WinForms 就认为「不需要缩放」，而 Windows 已经按 DPI 放大了字体绘制，
+            // 于是控件高度还是 96 DPI 的像素值 —— 文字被裁掉半行。
+            // 所以同一个 exe 在 100% 缩放下正常、125% / 150% 的机器上就被挤压，
+            // 用户看到的是「有些人窗口尺寸和文字高度都不对」。
+            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleDimensions = new SizeF(96F, 96F);
             BuildUi();
             Load += delegate
             {
+                Theme.FitToScreen(this);
                 Kickoff();
                 if (_cfg.StartMinimized)
                 {
@@ -556,8 +570,17 @@ namespace Ferry
                 BeginInvoke(new Action(delegate
                 {
                     SetBusy(false);
-                    Log("已恢复直连");
                     _exitVia = "";
+                    // 设置里改了全局接管：停完马上按新设置重开，
+                    // 用户不用自己再点一次「开始借网」，状态也会立刻刷新。
+                    if (_restartAfterStop)
+                    {
+                        _restartAfterStop = false;
+                        Log("按新设置重新开始借网…");
+                        DoStart();
+                        return;
+                    }
+                    Log("已恢复直连");
                     RefreshUi();
                     StartProxyHeal();
                 }));
@@ -668,6 +691,18 @@ namespace Ferry
                 _slow.Interval = Math.Max(10, _cfg.NetCheckSec) * 1000;
                 Log("设置已保存（断网自动借网 " + (_cfg.AutoBorrow ? "开" : "关") +
                     "，检测间隔 " + _cfg.NetCheckSec + " 秒）");
+
+                // 原来保存完什么都不做：正在借网时，隧道还是按旧设置起的，
+                // 界面也不刷新 —— 用户以为「勾了没生效」。
+                // 全局接管变了且正在借网：顺手重启链路；其他改动只刷新界面。
+                if (dlg.TunToggleChanged && _rt != null && _rt.Running)
+                {
+                    Log("全局接管设置已改，按新设置重启借网链路…");
+                    _restartAfterStop = true;
+                    DoStop();
+                    return;
+                }
+                RefreshUi();
             }
         }
 
@@ -967,7 +1002,11 @@ namespace Ferry
             }
             else
             {
-                _rowTun.Visible = false;
+                // 没开全局接管时**不要藏掉这一行**：
+                // 藏起来的结果是用户根本不知道有「UDP低延迟模式」这个能力，
+                // 于是游戏 / QUIC / 语音一直走不了渡口也说不清为什么。
+                SetText(_rowTun, "全局接管    未启用 · 设置里开启「UDP低延迟模式」", Theme.Muted);
+                _rowTun.Visible = true;
             }
 
             _btnOn.Enabled = !_busy && !borrowing;
