@@ -695,7 +695,7 @@ namespace Ferry
                 // 原来保存完什么都不做：正在借网时，隧道还是按旧设置起的，
                 // 界面也不刷新 —— 用户以为「勾了没生效」。
                 // 全局接管变了且正在借网：顺手重启链路；其他改动只刷新界面。
-                if (dlg.TunToggleChanged && _rt != null && _rt.Running)
+                if (dlg.TunToggleChanged && _rt != null && _rt.Running && !_busy)
                 {
                     Log("全局接管设置已改，按新设置重启借网链路…");
                     _restartAfterStop = true;
