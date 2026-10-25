@@ -914,7 +914,14 @@ namespace Ferry
                 var wc = new System.Net.WebClient();
                 wc.Proxy = null;
                 wc.DownloadFile(url, tmp);
-                var psi = new ProcessStartInfo(tmp, "/SILENT /NORESTART /CLOSEAPPLICATIONS");
+                // ⚠ 不要传 /CLOSEAPPLICATIONS。
+                //   Inno 收到它会用 Restart Manager 去「礼貌地」关闭占用文件的程序，
+                //   而我们的客户端在 OnFormClosing 里 cancel（缩到托盘）——
+                //   RM 等不到关闭，安装就在静默模式下**静默失败**：
+                //   用户点了「是」，下载完成，然后什么都没发生，版本还是旧的。
+                //   （实测日志：手动用 /SILENT /NORESTART 装就成功，带这个参数就失败）
+                //   关闭旧客户端由安装器的 InitializeSetup 调 /stop 负责，它会先还原系统代理。
+                var psi = new ProcessStartInfo(tmp, "/SILENT /NORESTART");
                 // ⚠ 必须 UseShellExecute = true：
                 //   否则安装包会被 JobKeeper 的 Job Object 收进去，而本进程
                 //   紧接着 RealQuit() 退出 —— Windows 把整个 Job 杀掉，

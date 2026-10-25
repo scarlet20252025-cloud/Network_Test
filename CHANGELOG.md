@@ -1,3 +1,34 @@
+## v0.13.9 — 2026-10-26
+
+> 客户端 0.9.15。自动更新的最后一块拼图：`/CLOSEAPPLICATIONS`。
+
+### 现象与定位
+
+0.9.12 点「更新」→ 下了 0.9.14、安装包也起来了，但**版本没变**，也没自动启动。
+
+对照实验（同一台机器、同一个包）：
+
+| 参数 | 结果 |
+|---|---|
+| `/SILENT /NORESTART /CLOSEAPPLICATIONS`（DoUpdate 原来用的） | 静默失败，版本不变 |
+| `/SILENT /NORESTART /LOG=…`（手工跑） | `Installation process succeeded`，`[Run]` 也把客户端拉起来了 |
+
+### 为什么
+
+`/CLOSEAPPLICATIONS` 让 Inno 用 **Restart Manager** 去「礼貌地」关闭占用文件的程序。
+而我们的客户端在 `OnFormClosing` 里 **cancel**（缩到托盘）——RM 等不到关闭，
+安装就在静默模式下静默失败，连个错误框都没有。
+
+关旧客户端本来就由安装器的 `InitializeSetup` 调 `/stop` 负责（它会先还原系统代理），
+根本不需要 RM。所以直接去掉这个参数。
+
+### 验证
+
+手工用 `/SILENT /NORESTART` 装 0.9.14 后：
+- `exe v0.9.14.0`（文件已替换）
+- 日志 `-- Run entry --  Run as: Original user  Filename: …\渡口助手.exe`
+- 进程创建时间 01:56:12，比安装完成（01:56:03）晚 9 秒 → **确实是 [Run] 拉起来的**
+
 ## v0.13.8 — 2026-10-26
 
 > 客户端 0.9.14。DPI 换了实现方式，文字不再被裁。
