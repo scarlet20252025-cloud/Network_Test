@@ -122,10 +122,17 @@ Name: "{autodesktop}\渡口助手";  Filename: "{app}\{#AppExeName}"; WorkingDir
 ; RunLevel=HighestAvailable 的计划任务（不弹 UAC）。见 [Code] 段。
 
 [Run]
-; 只启动程序。开机自启不在这里设 —— 原因见 [Code] 里 ssPostInstall 的注释：
-; 从已提权的安装器用 CreateProcess 启动 requireAdministrator 的 exe 会报 740。
+; 只启动程序。开机自启不在这里设 —— 原因见 [Code] 里 ssPostInstall 的注释。
+;
+; ⚠ 必须带 shellexec：
+;   客户端的 manifest 是 requireAdministrator，而 Inno 默认用 CreateProcess 启动。
+;   实测有用户装完立刻撞到：
+;     无法执行文件：C:\Users\<user>\AppData\Local\Ferry\渡口助手.exe
+;     CreateProcess 失败；错误代码 740。请求的操作需要提升。
+;   看起来像「装坏了」，其实只是安装向导没能替它提权。
+;   加 shellexec 改走 ShellExecute，由系统自己弹 UAC —— 用户点一次「是」就好。
 Filename: "{app}\{#AppExeName}"; Description: "立即启动渡口助手"; \
-  Flags: postinstall nowait skipifsilent
+  Flags: postinstall nowait skipifsilent shellexec
 
 [UninstallRun]
 ; 交给程序自己清：还原原代理 → 杀隧道/代理进程 → 删自启（含计划任务）

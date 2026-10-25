@@ -184,7 +184,7 @@ namespace Ferry
         void BuildUi()
         {
             Text = "设置";
-            ClientSize = new Size(470, 622);
+            ClientSize = new Size(470, 642);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = false;
@@ -201,7 +201,7 @@ namespace Ferry
             Controls.Add(sub);
 
             var card = Theme.Card(14);
-            card.SetBounds(20, 74, 430, 330);
+            card.SetBounds(20, 74, 430, 350);
             Controls.Add(card);
 
             _chkAutoStart = MakeCheck("开机自动启动",
@@ -210,17 +210,17 @@ namespace Ferry
             card.Controls.Add(_chkAutoStart);
 
             _chkAutoBorrow = MakeCheck("断网时自动借网",
-                "检测到本机连不上网时，自动开隧道并切换系统代理", 68);
+                "检测到本机连不上网时，自动开隧道并切换系统代理", 82);
             _chkAutoBorrow.Checked = _cfg.AutoBorrow;
             card.Controls.Add(_chkAutoBorrow);
 
             _chkMinimized = MakeCheck("启动后最小化到托盘",
-                "双击图标时不显示主窗口，直接驻留托盘", 120);
+                "双击图标时不显示主窗口，直接驻留托盘", 148);
             _chkMinimized.Checked = _cfg.StartMinimized;
             card.Controls.Add(_chkMinimized);
 
             _chkReconnect = MakeCheck("隧道断开时自动重连",
-                "远端重启、网络中抖时自动恢复（退避 5 秒起，最长 60 秒）", 172);
+                "远端重启、网络中抖时自动恢复（退避 5 秒起，最长 60 秒）", 214);
             _chkReconnect.Checked = _cfg.AutoReconnect;
             card.Controls.Add(_chkReconnect);
 
@@ -228,32 +228,37 @@ namespace Ferry
             // 放在设置里而不是主界面：反馈是低频操作，主界面要留给
             // 「借网/停止」这个高频动作。但入口必须好找 ——
             // 所以做成一个带说明的按钮，而不是藏在二级菜单里。
+            // 意见反馈按钮放在窗口左下角，和「保存 / 取消」同一行。
+            //
+            // 它一开始是塞在开关卡片里的（y=224），结果卡片被切成两半、
+            // 还和「UDP低延迟模式」那一项重叠过一次。它本来就是低频入口，
+            // 占着卡片中间只会把四个开关挤开 —— 挪到左下角，一眼能找到，
+            // 又不打断「开关 → 时长 → 保存」这条阅读顺序。
             var fbBtn = new Button();
             fbBtn.Text = "💬 意见反馈";
-            fbBtn.SetBounds(20, 224, 440, 40);
+            fbBtn.SetBounds(20, 588, 180, 34);
             fbBtn.FlatStyle = FlatStyle.Flat;
             fbBtn.FlatAppearance.BorderColor = Theme.Line;
             fbBtn.FlatAppearance.BorderSize = 1;
             fbBtn.BackColor = Theme.CardBg;
             fbBtn.ForeColor = Theme.Text;
             fbBtn.Font = Theme.FBody;
-            fbBtn.TextAlign = ContentAlignment.MiddleLeft;
-            fbBtn.Padding = new Padding(12, 0, 0, 0);
+            fbBtn.TextAlign = ContentAlignment.MiddleCenter;
             fbBtn.Cursor = Cursors.Hand;
             fbBtn.Click += delegate { OpenFeedback(); };
-            card.Controls.Add(fbBtn);
+            Controls.Add(fbBtn);
 
             // TUN：让不认系统代理的程序也走渡口，并且让 UDP 走低延迟链路。
             // 需要管理员权限 —— 客户端的 manifest 已声明 requireAdministrator，
             // 但用户可能是从旧快捷方式/命令行起的，所以运行时还要再判一次。
             _chkTun = MakeCheck("UDP低延迟模式（全局接管）",
-                "在网络层截获全部流量，不认代理的程序也走渡口，UDP 走低延迟链路。" +
-                "需要管理员权限；开启后短暂断网属正常（路由表重建）", 272);
+                "网络层接管全部流量（含不认代理的程序），UDP 走低延迟链路。" +
+                "需管理员权限；开启后短暂断网属正常", 280);
             _chkTun.Checked = _cfg.UseTun;
             card.Controls.Add(_chkTun);
 
             var lblIv = Theme.Text2("断网检测间隔", Theme.FSmall, Theme.Text);
-            lblIv.SetBounds(24, 424, 130, 20);
+            lblIv.SetBounds(24, 444, 130, 20);
             Controls.Add(lblIv);
 
             _numInterval = new NumericUpDown();
@@ -261,25 +266,25 @@ namespace Ferry
             _numInterval.Maximum = 300;
             _numInterval.Increment = 5;
             _numInterval.Value = Math.Max(10, Math.Min(300, _cfg.NetCheckSec));
-            _numInterval.SetBounds(166, 422, 90, 26);
+            _numInterval.SetBounds(166, 442, 90, 26);
             Controls.Add(_numInterval);
 
             var lblSec = Theme.Text2("秒", Theme.FSmall, Theme.Muted);
-            lblSec.SetBounds(264, 424, 30, 20);
+            lblSec.SetBounds(264, 444, 30, 20);
             Controls.Add(lblSec);
 
             _lblHint = Theme.Text2("间隔越短越灵敏，但每次检测要发一次 DNS 查询；" + Environment.NewLine +
                                    "断网后大约一个间隔内会自动开始借网。", Theme.FSmall, Theme.Muted);
-            _lblHint.SetBounds(24, 456, 424, 34);
+            _lblHint.SetBounds(24, 476, 424, 34);
             Controls.Add(_lblHint);
 
             var ok = Theme.FlatButton("保存", true);
-            ok.SetBounds(238, 568, 104, 34);
+            ok.SetBounds(238, 588, 104, 34);
             ok.Click += delegate { SaveAll(); };
             Controls.Add(ok);
 
             var cancel = Theme.FlatButton("取消", false);
-            cancel.SetBounds(350, 568, 104, 34);
+            cancel.SetBounds(350, 588, 104, 34);
             cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
             Controls.Add(cancel);
 
@@ -291,7 +296,7 @@ namespace Ferry
             lnkUninstall.LinkColor = Theme.Muted;
             lnkUninstall.ActiveLinkColor = Theme.Bad;
             lnkUninstall.LinkBehavior = LinkBehavior.HoverUnderline;
-            lnkUninstall.SetBounds(24, 514, 110, 20);
+            lnkUninstall.SetBounds(24, 534, 110, 20);
             lnkUninstall.LinkClicked += delegate
             {
                 if (_onUninstall == null) return;
@@ -308,7 +313,7 @@ namespace Ferry
             _lblVer.Font = Theme.FSmall;
             _lblVer.ForeColor = Theme.Muted;
             _lblVer.AutoSize = true;
-            _lblVer.SetBounds(142, 515, 150, 18);
+            _lblVer.SetBounds(142, 535, 150, 18);
             Controls.Add(_lblVer);
 
             var lnkCheck = new LinkLabel();
@@ -317,7 +322,7 @@ namespace Ferry
             lnkCheck.LinkColor = Theme.Accent;
             lnkCheck.ActiveLinkColor = Theme.Accent;
             lnkCheck.LinkBehavior = LinkBehavior.HoverUnderline;
-            lnkCheck.SetBounds(300, 514, 80, 20);
+            lnkCheck.SetBounds(300, 534, 80, 20);
             lnkCheck.LinkClicked += delegate { CheckUpdateManual(); };
             Controls.Add(lnkCheck);
 
@@ -335,7 +340,7 @@ namespace Ferry
             c.BackColor = Color.Transparent;
 
             var h = Theme.Text2(hint, Theme.FSmall, Theme.Muted);
-            h.SetBounds(40, y + 22, 370, 18);
+            h.SetBounds(40, y + 22, 384, 34);
             h.Tag = "hint:" + title;
             // 提示挂在同一个父容器上，随 checkbox 一起显示
             c.Tag = h;
