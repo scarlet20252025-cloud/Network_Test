@@ -7,19 +7,15 @@
     这要求管理员权限。没有 manifest 的话，用户得手动「右键 → 以管理员身份运行」，
     而且从桌面快捷方式启动时那个选项不生效 —— 用户体验很差。
 
-  为什么用 requireAdministrator 而不是 highestAvailable：
-    highestAvailable 在管理员账户下不提权（直接用当前 token），
-    而普通账户下提权。这个不一致会导致「同一个 exe，不同机器行为不同」。
-    渡口的核心功能（TUN）必须提权，所以干脆统一要求管理员 ——
-    行为可预测，比「有时能有时不能」好得多。
-
-  代价：
-    · 每次启动都会弹 UAC（除非用户把 UAC 关了，或做了计划任务白名单）
-    · 不能直接双击就静默运行
-
-  为什么接受这个代价：
-    用户明确要求「软件包也在属性里配置成默认使用管理员权限启动」。
-    而且借网这个动作本身就涉及改系统代理、建网卡，提权是合理的。
+  为什么是 asInvoker（0.9.6 起）：
+    0.9.5 之前是 requireAdministrator，代价有三个，每个都真被打到过：
+      · 每次启动弹 UAC
+      · 安装器 [Run] 用 CreateProcess 启动时报「错误代码 740」
+      · 标准用户（没有管理员账户密码）根本用不了，而纯代理模式其实不需要提权
+    改系统代理是写 HKCU、起子进程，都不需要管理员。
+    只有 TUN（建虚拟网卡 + 改路由表）必须提权 —— 那时由客户端自己
+    `runas` 重启一次（见 src/Elevator.cs），用户点一次 UAC 就行。
+    新装默认 useTun=false，所以绝大多数人永远见不到 UAC。
 
   dpiAware / dpiAwareness：
     WinForms 在高 DPI 下不声明就会模糊。PerMonitorV2 是 Win10 1703+ 的标准做法。
@@ -30,7 +26,7 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>

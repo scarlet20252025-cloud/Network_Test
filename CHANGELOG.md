@@ -1,3 +1,59 @@
+## v0.13.3 — 2026-10-26
+
+> 客户端 0.9.6（per-user 安装、按需提权）+ 管理面板改版。
+
+### 安装不再要管理员：per-user + 按需提权
+
+三个地方一起改，缺一个都不成立：
+
+| 位置 | 改动 | 为什么 |
+|---|---|---|
+| `app.manifest` | `requireAdministrator` → `asInvoker` | 改系统代理只是写 HKCU，不需要提权；提权只为了 TUN |
+| `installer/ferry.iss` | `PrivilegesRequired=admin` → `lowest` | admin + `{localappdata}` 会让标准用户装进**管理员账户**的 AppData，用户自己找不到 |
+| 客户端 | 新增 `src/Elevator.cs`，勾了 TUN 且不是管理员时提供「以管理员身份重启」 | 让用户自己右键「以管理员身份运行」不现实 |
+
+`RestartElevated()` 走 `powershell -Verb RunAs`，并且**先等 1.2 秒再启动** ——
+单实例互斥锁还握在旧进程手里时直接启动，新进程会判定「已有实例」然后自杀，
+表现是「点了没反应」。重启前会先把借网停干净，否则新进程起来时代理指着死端口。
+
+顺带：`schtasks /RL HIGHEST` 只在当前进程已是管理员时才加 —— 普通用户建
+「最高权限」任务会被拒绝访问，而纯代理模式用普通权限就够。
+
+### 安装包不再弹语言选择
+
+`[Setup]` 加 `ShowLanguageDialog=no` + `LanguageDetectionMethod=uilanguage`。
+之前安装包资源里除了 chs 还有 Inno 内置的英文条目，第一步就是
+"Select Setup Language" 的英文框，默认还是 English。
+
+### 管理面板：密钥改浮窗，刷新不再重复生成
+
+`/admin/newcode` 原来是 **POST 后直接渲染整页**，地址栏停在 `/admin/newcode`，
+按 F5 浏览器重发 POST —— **每刷新一次多一个密钥**（还会占库存）。
+
+现在：
+- fetch 提交 → 回 JSON → 页内浮窗显示明文 + 一键复制（http 内网下
+  `navigator.clipboard` 不可用时自动退回选中文本）
+- 无 JS / 直接提交 → 302 到 `/admin?new=<code>`，浏览器手里是 GET 地址，刷新安全
+- `GET /admin/newcode` → 404，不再有第二条生成路径
+
+另外做了两处结构性优化（功能一个没少）：
+
+- **分区导航** sticky 在顶部：概览 / 密钥 / 反馈 / 设备 / 事件。
+  五个区块都是长表格，没有它得靠滚轮翻半天。
+- **「新建密钥」折叠**：低频操作不该常驻首屏，点开才展开备注/有效期/档位。
+
+### 验证
+
+| 环境 | 结果 |
+|---|---|
+| 本地 18094 | fetch 生成→JSON、`/admin?new=` 渲染、GET `/admin/newcode` → 404 |
+| 线上 10.13.24.1 | adminnav / sec-* / newcode 折叠 / codeModal / ncForm / bindNewCode 全部命中 |
+| 安装包 | `dist/Ferry-Setup-0.9.6.exe` 17.7 MB，已上传远端，`version.json` → 0.9.6 |
+
+⚠ 本机静默安装测试（`/VERYSILENT`）在本环境失败（进程被取消），
+推测是 DSH 的进程没有可用的交互桌面来接 UAC/安装向导。**没有在真机上验证装完的效果**，
+需要用户实测一次。
+
 ## v0.13.2 — 2026-10-26
 
 > 客户端 0.9.5 + 安装器一处修复。借网链路没动。

@@ -1,4 +1,4 @@
-﻿; ═══════════════════════════════════════════════════════════════════════
+; ═══════════════════════════════════════════════════════════════════════
 ;  渡口 Ferry · Windows 安装程序（Inno Setup 6）
 ;
 ;  架构（v0.8 起）：
@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "0.9.5"
+#define AppVersion "0.9.6"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -58,7 +58,13 @@ UsedUserAreasWarning=no
 DefaultDirName={localappdata}\Ferry
 DisableProgramGroupPage=yes
 DisableDirPage=yes
-; PrivilegesRequired=admin：安装需要管理员。
+; PrivilegesRequired=lowest：per-user 安装，不弹 UAC。
+;
+; 为什么从 admin 改回 lowest（0.9.6）：
+;   admin + {localappdata} 这个组合有坑 —— 标准用户靠另一个管理员账户提权时，
+;   安装目录会落到**那个管理员账户**的 AppData 下，用户自己的账户里找不到，
+;   表现是「装完不见了」。而且客户端从 0.9.6 起是 asInvoker，本来就不用提权。
+;   装到当前用户自己的 %LOCALAPPDATA%\Ferry 才是自洽的。
 ;
 ; 为什么必须提权（实测过才定的，不是想当然）：
 ;   ① 客户端 exe 的 manifest 是 requireAdministrator（TUN 要建虚拟网卡
@@ -70,12 +76,17 @@ DisableDirPage=yes
 ;
 ; 代价：安装时弹一次 UAC。可以接受 —— 装一次而已，
 ;       换来的是一劳永逸的免 UAC 自启。
-PrivilegesRequired=admin
+PrivilegesRequired=lowest
 OutputDir=..\dist
 OutputBaseFilename=Ferry-Setup-{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+; 不弹语言选择框，直接用 [Languages] 里的第一个（chs）。
+; 不写这两行的话，安装包资源里还有 Inno 内置的英文条目，用户第一步会看到
+; "Select Setup Language" 的英文选择框，默认还是 English。
+ShowLanguageDialog=no
+LanguageDetectionMethod=uilanguage
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\{#AppExeName}
 ; 覆盖安装时先让旧版自己退出，否则 exe 被占用写不进去
@@ -86,6 +97,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 
 [Languages]
 Name: "chs"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+
 
 [Tasks]
 Name: "desktopicon";   Description: "创建桌面快捷方式";                 GroupDescription: "快捷方式："; Flags: unchecked
@@ -124,15 +136,10 @@ Name: "{autodesktop}\渡口助手";  Filename: "{app}\{#AppExeName}"; WorkingDir
 [Run]
 ; 只启动程序。开机自启不在这里设 —— 原因见 [Code] 里 ssPostInstall 的注释。
 ;
-; ⚠ 必须带 shellexec：
-;   客户端的 manifest 是 requireAdministrator，而 Inno 默认用 CreateProcess 启动。
-;   实测有用户装完立刻撞到：
-;     无法执行文件：C:\Users\<user>\AppData\Local\Ferry\渡口助手.exe
-;     CreateProcess 失败；错误代码 740。请求的操作需要提升。
-;   看起来像「装坏了」，其实只是安装向导没能替它提权。
-;   加 shellexec 改走 ShellExecute，由系统自己弹 UAC —— 用户点一次「是」就好。
+; 客户端 0.9.6 起是 asInvoker，CreateProcess 直接就能起来，
+; 不再需要 shellexec，也不会再有「错误代码 740」。
 Filename: "{app}\{#AppExeName}"; Description: "立即启动渡口助手"; \
-  Flags: postinstall nowait skipifsilent shellexec
+  Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
 ; 交给程序自己清：还原原代理 → 杀隧道/代理进程 → 删自启（含计划任务）

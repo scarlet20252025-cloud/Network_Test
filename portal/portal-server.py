@@ -2263,6 +2263,34 @@ tr.fb-more>td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accen
 .devlist{margin:0;padding-left:16px;line-height:1.9;font-size:12px;color:var(--fg2)}
 .devlist b{color:var(--fg);font-weight:500}
 
+/* ── 管理面板分区导航 ──
+   sticky 顶部，滚动时一直在。五个区块都是长表格，
+   没有它就得靠滚轮翻半天才能找到「意见反馈」。 */
+.adminnav{position:sticky;top:0;z-index:60;display:flex;gap:6px;flex-wrap:wrap;
+  padding:9px 0;margin:0 0 14px;
+  background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--line)}
+.adminnav a{font-size:12.5px;color:var(--fg2);text-decoration:none;
+  padding:5px 12px;border-radius:99px;border:1px solid var(--line);
+  background:var(--card);transition:color .15s,border-color .15s}
+.adminnav a:hover{color:var(--accent);border-color:var(--accent)}
+/* 锚点跳转时别被 sticky 导航盖住标题 */
+[id^="sec-"]{scroll-margin-top:66px}
+
+/* 新建密钥折叠：低频操作，不占首屏。
+   展开后才看到备注 / 有效期 / 档位那一坨。 */
+.newcode>summary{list-style:none;cursor:pointer;display:inline-flex;
+  align-items:center;gap:6px;font-size:13px;font-weight:600;color:var(--accent);
+  background:color-mix(in srgb,var(--accent) 12%,transparent);
+  border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);
+  padding:7px 14px;border-radius:9px;user-select:none;
+  transition:background .15s}
+.newcode>summary:hover{background:color-mix(in srgb,var(--accent) 20%,transparent)}
+.newcode>summary::-webkit-details-marker{display:none}
+.newcode[open]>summary{margin-bottom:6px}
+.newcode form{margin-top:4px}
+
 /* 授权档位：一排可选按钮，比下拉框少一次点击 */
 .tiers{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 0}
 .tier{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
@@ -2278,7 +2306,7 @@ tr.fb-more>td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accen
 
 LIVE_UI = r'''
 
-<div class="perfpanel">
+<div class="perfpanel" id="sec-live">
   <div class="perf-head">
     <span class="perf-title">流量趋势</span>
     <span class="perf-range">10 分钟</span>
@@ -3176,8 +3204,92 @@ LIVE_UI = r'''
     bindIpCells();
   }
 
+  // ── 生成密钥：fetch + 浮窗 ──
+  var _lastCode = '';
+
+  function closeCodeModal(){
+    var m = document.getElementById('codeModal');
+    if (m) m.classList.remove('open');
+    _lastCode = '';
+  }
+
+  function openCodeModal(d){
+    _lastCode = d.code || '';
+    var m = document.getElementById('codeModal');
+    if (!m) return;
+    var code = document.getElementById('cmCode');
+    var meta = document.getElementById('cmMeta');
+    if (code) code.textContent = _lastCode;
+    if (meta) {
+      var parts = [];
+      if (d.note) parts.push('给 ' + d.note);
+      parts.push(d.hours + ' 小时内必须用掉');
+      parts.push(d.days === 0 ? '激活后永久' : ('激活后 ' + d.days + ' 天'));
+      meta.textContent = parts.join(' · ');
+    }
+    m.classList.add('open');
+  }
+
+  function bindNewCode(){
+    var form = document.getElementById('ncForm');
+    if (!form || form.getAttribute('data-bound') === '1') return;
+    form.setAttribute('data-bound', '1');
+
+    form.addEventListener('submit', function(e){
+      e.preventDefault();
+      var btn = document.getElementById('ncBtn');
+      if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
+      fetch('/admin/newcode', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded',
+                  'X-Requested-With': 'fetch'},
+        body: new URLSearchParams(new FormData(form)).toString()
+      })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (!d || !d.ok) { alert((d && d.error) || '生成失败'); return; }
+          openCodeModal(d);
+        })
+        .catch(function(err){ alert('生成失败：' + err.message); })
+        .then(function(){
+          if (btn) { btn.disabled = false; btn.textContent = '生成密钥'; }
+        });
+    });
+
+    var modal = document.getElementById('codeModal');
+    if (modal) {
+      Array.prototype.forEach.call(modal.querySelectorAll('[data-close]'), function(x){
+        x.addEventListener('click', closeCodeModal);
+      });
+    }
+    document.addEventListener('keydown', function(e){
+      if (e.key === 'Escape') closeCodeModal();
+    });
+
+    var copy = document.getElementById('cmCopy');
+    if (copy) copy.addEventListener('click', function(){
+      if (!_lastCode) return;
+      var done = function(){
+        copy.textContent = '已复制';
+        setTimeout(function(){ copy.textContent = '复制密钥'; }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(_lastCode).then(done, function(){
+          // 非 https 下 clipboard 不可用（内网 http 很常见）—— 退回到选中
+          var el = document.getElementById('cmCode');
+          if (el) { var r = document.createRange(); r.selectNodeContents(el);
+                    var s = window.getSelection(); s.removeAllRanges(); s.addRange(r); }
+        });
+      } else {
+        var el2 = document.getElementById('cmCode');
+        if (el2) { var r2 = document.createRange(); r2.selectNodeContents(el2);
+                   var s2 = window.getSelection(); s2.removeAllRanges(); s2.addRange(r2); }
+      }
+    });
+  }
+
   function bootAll(){
-    bindIpCells(); bindNotes(); bindNetCtl(); bindFeedback();
+    bindIpCells(); bindNotes(); bindNetCtl(); bindFeedback(); bindNewCode();
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', bootAll);
@@ -3348,14 +3460,59 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
 
     return page('渡口门户管理', f"""
 <h1>管理面板</h1>
+
+<!-- 分区导航。五个区块都是长表格，没有它就得靠滚轮翻半天才能找到
+     「意见反馈」；sticky 在顶部，滚到哪儿都能跳。 -->
+<nav class="adminnav">
+  <a href="#sec-live">概览</a>
+  <a href="#sec-keys">密钥</a>
+  <a href="#sec-feedback">反馈</a>
+  <a href="#sec-users">设备</a>
+  <a href="#sec-events">事件</a>
+</nav>
+
 {LIVE_UI}
 <div class="sub">创建临时密钥 · 管理已登录的机器 ·
   <a href="/admin/unlock">查看 / 解除登录锁定</a></div>
 {msgbox}{codebox}
 
-<div class="card">
+<!-- 密钥浮窗。
+     为什么用浮窗而不是「重新渲染一整页」：
+       老做法是 POST 后直接渲染面板，地址栏停在 /admin/newcode，
+       用户按 F5 浏览器就重发 POST —— **每刷新一次多一个密钥**。
+     现在 POST 只回 JSON，明文塞进这个浮窗，页面上再也拿不到第二次。
+     复制走 Clipboard API，失败时退回选中文本，不至于复制不了。 -->
+<div class="modal" id="codeModal" role="dialog" aria-modal="true" aria-labelledby="cmTitle">
+  <div class="modal-bg" data-close="1"></div>
+  <div class="modal-box" style="width:min(420px,100%)">
+    <div class="modal-head">
+      <div class="modal-title" id="cmTitle" style="color:var(--accent)">&#128273; 新密钥</div>
+      <button type="button" class="modal-close" data-close="1" title="关闭">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="big mono" id="cmCode"
+           style="font-size:26px;letter-spacing:2px;text-align:center;
+                  padding:14px 0;background:var(--card2);border-radius:11px;
+                  border:1px solid var(--line2);user-select:all"></div>
+      <div class="hint" id="cmMeta" style="margin-top:10px"></div>
+      <div class="hint" style="margin-top:8px;color:var(--warn)">
+        只显示这一次。服务端只存哈希，关掉浮窗就再也看不到明文。
+      </div>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button type="button" class="btn-main sm" id="cmCopy" style="flex:1;padding:9px">
+          复制密钥
+        </button>
+        <button type="button" class="sm ghost" data-close="1" style="flex:0 0 90px">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card" id="sec-keys">
   <h2 style="margin-top:0">创建临时密钥</h2>
-  <form method="post" action="/admin/newcode">
+  <details class="newcode">
+  <summary>＋ 新建密钥</summary>
+  <form method="post" action="/admin/newcode" id="ncForm">
     {csrf_in}
     <div class="row">
       <div>
@@ -3384,8 +3541,9 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
       · 下面的「激活后可用时长」= 用掉之后账号能借网多久（票的使用期限）<br>
       老密钥没有这个字段，按全局默认 <b>{license_days_txt}</b> 算。
     </div>
-    <button type="submit">生成密钥</button>
+    <button type="submit" id="ncBtn">生成密钥</button>
   </form>
+  </details>
 </div>
 
 <div class="card">
@@ -3396,7 +3554,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   </div>
 </div>
 
-<div class="card">
+<div class="card" id="sec-feedback">
   <h2 style="margin-top:0">意见反馈
     <span class="hint" id="fbNew" style="font-weight:400;margin-left:8px"></span>
   </h2>
@@ -3423,7 +3581,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   </div>
 </div>
 
-<div class="card">
+<div class="card" id="sec-users">
   <h2 style="margin-top:0">已登录的机器</h2>
   <div class="hint" style="margin:-4px 0 10px">
     在线置顶，离线靠下。速率来自客户端每 5 秒一次的心跳；
@@ -3444,7 +3602,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   </div>
 </div>
 
-<div class="card">
+<div class="card" id="sec-traffic">
   <h2 style="margin-top:0">流量统计</h2>
   <div class="listwrap sm">
   <table>
@@ -3463,7 +3621,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   </div>
 </div>
 
-<div class="card">
+<div class="card" id="sec-events">
   <h2 style="margin-top:0">最近事件</h2>
   <div class="listwrap sm">
   <table><thead><tr><th>时间</th><th>类型</th><th>IP</th><th>说明</th></tr></thead>
@@ -5327,7 +5485,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.is_admin():
             self.send_html(admin_login_page(csrf=csrf_set('adminlogin|' + self.client_ip())))
             return
-        self.send_html(admin_page(self.db, csrf=csrf_set('admin|' + self.client_ip())))
+        # ?new=<明文密钥>&h=<小时>&d=<天数>：生成密钥后的落点。
+        # 走 302 过来而不是在 POST 响应里直接渲染 —— 后者会让地址栏停在
+        # /admin/newcode，用户按 F5 时浏览器重发 POST，**刷新一次多一个密钥**。
+        # 这里从 query 读到明文，渲染一次就不再存在（页面本身是 GET，可安全刷新）。
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        ncode = (q.get('new') or [''])[0]
+        try:
+            nhours = int((q.get('h') or ['12'])[0])
+        except ValueError:
+            nhours = 12
+        self.send_html(admin_page(self.db, new_code=(ncode or None), new_hours=nhours,
+                                  csrf=csrf_set('admin|' + self.client_ip())))
 
     def handle_admin_login(self, form):
         src_ip = self.client_ip()
@@ -5387,9 +5556,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             'VALUES (?,?,?,?,?,?)',
             (ch, code[:4] + '****', note, now(), now() + hours * 3600, lic))
         self.db.log('invite_new', self.client_ip(), f'note={note} hours={hours} days={lic}')
-        # 明文只在这一响应里出现一次
-        self.send_html(admin_page(self.db, new_code=code, new_hours=hours,
-                                  csrf=csrf_set('admin|' + self.client_ip())))
+
+        # 两条出路，都不在 POST 响应里渲染整页：
+        #   · 前端用 fetch → 回 JSON，由页面弹浮窗显示（明文只在这里出现一次）
+        #   · 没有 JS / 直接提交 → 302 到 /admin?new=...，浏览器存的是 GET 地址，
+        #     刷新不会重发 POST，也就不会「刷一次多一个密钥」
+        if self.headers.get('X-Requested-With') == 'fetch':
+            self.send_json({'ok': True, 'code': code, 'note': note,
+                            'hours': hours, 'days': lic})
+            return
+        qs = urllib.parse.urlencode({'new': code, 'h': hours, 'd': lic})
+        self.redirect('/admin?' + qs)
 
     def handle_admin_revoke(self, form):
         if not self._require_admin():

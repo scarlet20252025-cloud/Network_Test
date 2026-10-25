@@ -695,6 +695,13 @@ namespace Ferry
                 // 原来保存完什么都不做：正在借网时，隧道还是按旧设置起的，
                 // 界面也不刷新 —— 用户以为「勾了没生效」。
                 // 全局接管变了且正在借网：顺手重启链路；其他改动只刷新界面。
+                // 用户选了「以管理员身份重启」：这是最优先的动作。
+                if (dlg.NeedElevate)
+                {
+                    ElevateNow();
+                    return;
+                }
+
                 if (dlg.TunToggleChanged && _rt != null && _rt.Running && !_busy)
                 {
                     Log("全局接管设置已改，按新设置重启借网链路…");
@@ -719,6 +726,27 @@ namespace Ferry
         ///     做同样的清理，然后删文件、删快捷方式、删注册表卸载项
         /// 两次清理都幂等，重复执行没有副作用。
         /// </summary>
+        /// <summary>
+        /// 以管理员身份重启本程序。
+        /// 先把借网停干净 —— 否则新进程起来时系统代理还指着旧进程的端口，
+        /// 那几秒全网上不去，用户会以为「重启一下就坏了」。
+        /// </summary>
+        void ElevateNow()
+        {
+            try
+            {
+                if (_rt != null)
+                {
+                    FerryCore.RestoreDirect(_cfg, _appDir);
+                    _rt.Stop();
+                    _rt = null;
+                }
+            }
+            catch (Exception) { }
+            Log("以管理员身份重启…");
+            Elevator.RestartElevated();
+        }
+
         void DoUninstall()
         {
             var unins = Path.Combine(_appDir, "unins000.exe");
@@ -993,7 +1021,14 @@ namespace Ferry
             // TUN 状态行。为什么单独一行而不是混在系统代理里：
             // 这两件事是独立的 —— 系统代理可能开着但 TUN 没开（游戏不走），
             // 也可能 TUN 开着但用户手动关了系统代理。分开显示才看得清。
-            if (_cfg.UseTun)
+            if (_cfg.UseTun && !Elevator.IsAdmin())
+            {
+                // 勾了却没提权：不是「故障」，是差一步动作 ——
+                // 所以说清楚差什么、去哪儿点，别只写「未开启」。
+                SetText(_rowTun, "全局接管    已勾选 · 需管理员（设置里点「以管理员身份重启」）", Theme.Bad);
+                _rowTun.Visible = true;
+            }
+            else if (_cfg.UseTun)
             {
                 bool tunUp = rt != null && rt.TunRunning;
                 SetText(_rowTun, "全局接管    " + (tunUp ? "已开启（UDP低延迟模式）" : "未开启"),
