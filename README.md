@@ -6,7 +6,11 @@
 **局域网域名**：`ferry.internal`（`.internal` 是 ICANN 保留给私有网络的 TLD，
 永远不会被公网解析占用）
 
-**当前版本**：客户端 `0.9.2` / 安装包 `Ferry-Setup-0.9.2.exe`（16.9 MB）
+**当前版本**：客户端 `0.9.3`（`dist/渡口助手.exe`）/ 安装包 `Ferry-Setup-0.9.2.exe`（16.9 MB）
+
+> 0.9.3 的客户端 exe 已编译（设置里加了「意见反馈」入口、修掉它和 UDP 低延迟模式的重叠），
+> 但安装包还没重打 —— 本机没装 Inno Setup（`ISCC.exe`），签名私钥密码也不在仓库里。
+> 装好 Inno Setup 后跑 `installer/sign.ps1 -Password <私钥密码>`，把产物放进 `dist/` 即可。
 
 ---
 

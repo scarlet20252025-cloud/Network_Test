@@ -275,6 +275,66 @@ namespace Ferry
         }
 
         /// <summary>
+        /// 提交意见反馈。返回空字符串表示成功，否则是给人看的错误信息。
+        ///
+        /// 为什么走门户而不是直接发邮件/存本地：
+        ///   门户已经有 DB、有限流、有管理面板，反馈直接进同一条链路，
+        ///   管理员在面板里就能看到并改状态。客户端只负责发。
+        ///
+        /// csrf：从 /feedback 页面抓。带上 User-Agent 里的版本号
+        /// 对定位问题帮助极大（「v0.9.2 才出现」vs「一直都有」）。
+        /// </summary>
+        public static string Feedback(Cfg cfg, string kind, string text, string contact)
+        {
+            if (string.IsNullOrEmpty(cfg.PortalUrl)) return "没有配置门户地址";
+            if (string.IsNullOrEmpty(text) || text.Trim().Length < 4) return "描述太短了，至少写 4 个字";
+            try {
+                string baseUrl = cfg.PortalUrl.TrimEnd('/');
+                string csrf = "";
+                // 抓 csrf
+                var g = Make(baseUrl + "/feedback", "GET");
+                string page;
+                using (var resp = g.GetResponse()) page = ReadBody(resp);
+                var m = System.Text.RegularExpressions.Regex.Match(
+                    page, "name=\"csrf\" value=\"([^\"]+)\"");
+                if (m.Success) csrf = m.Groups[1].Value;
+                if (csrf.Length == 0) return "拿不到表单令牌，请刷新页面后重试";
+
+                string body = "csrf=" + Uri.EscapeDataString(csrf)
+                    + "&kind=" + Uri.EscapeDataString(kind ?? "other")
+                    + "&text=" + Uri.EscapeDataString(text.Trim())
+                    + "&contact=" + Uri.EscapeDataString(contact ?? "")
+                    + "&ver=" + Uri.EscapeDataString(ClientVersion);
+                var req = Make(baseUrl + "/feedback", "POST");
+                req.ContentType = "application/x-www-form-urlencoded; charset=utf-8";
+                var bytes = System.Text.Encoding.UTF8.GetBytes(body);
+                req.ContentLength = bytes.Length;
+                using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
+                string respBody;
+                using (var resp = req.GetResponse()) respBody = ReadBody(resp);
+                // 门户把提示渲染进 class="fbmsg err/ok" 里，按关键词判断
+                if (respBody.IndexOf("收到了", StringComparison.Ordinal) >= 0) return "";
+                var em = System.Text.RegularExpressions.Regex.Match(
+                    respBody, "class=\"fbmsg err\">([^<]*)<");
+                if (em.Success && em.Groups[1].Value.Trim().Length > 0)
+                    return em.Groups[1].Value.Trim();
+                return "提交未被接受，请稍后重试";
+            } catch (Exception e) {
+                return "提交失败：" + e.Message;
+            }
+        }
+
+        /// <summary>客户端版本号（反馈时带上，便于定位）。</summary>
+        public static string ClientVersion {
+            get {
+                try {
+                    return System.Reflection.Assembly.GetExecutingAssembly()
+                        .GetName().Version.ToString();
+                } catch (Exception) { return "?"; }
+            }
+        }
+
+        /// <summary>
         /// 版本比较。逐段转整数比、缺的段补 0 ——
         /// 不能用字符串比：Application.ProductVersion 是 "0.8.0.0"（四段），
         /// /version.json 里写的是 "0.8.0"（三段），字符串比会判成"有新版本"，

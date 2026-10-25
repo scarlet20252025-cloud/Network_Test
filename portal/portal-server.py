@@ -150,6 +150,24 @@ CREATE TABLE IF NOT EXISTS traffic (
     updated_at  INTEGER DEFAULT 0
 );
 
+-- 意见反馈。
+--
+-- 为什么不需要用户表：IP 本身就是身份（借网按 IP 限速、按 IP 激活）。
+-- 让用户「不用登录就能反馈」比多一套账号体系重要 ——
+-- 反馈往往来自「还没装好/还没激活」的人，拿登录挡他们等于没这个功能。
+CREATE TABLE IF NOT EXISTS feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    ip          TEXT DEFAULT '',
+    kind        TEXT DEFAULT 'other',      -- bug / feature / perf / ask / other
+    text        TEXT NOT NULL,
+    contact     TEXT DEFAULT '',
+    client_ver  TEXT DEFAULT '',
+    status      INTEGER DEFAULT 0,         -- 0 新  1 处理中  2 已解决  3 暂不做
+    admin_note  TEXT DEFAULT '',
+    handled_at  INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
 """
@@ -311,6 +329,18 @@ RATE_LOCK = 900            # 锁 15 分钟
 
 _ratelimit = {}            # ip -> {'fails': int, 'first': ts, 'locked_until': ts}
 _ratelimit_lock = threading.Lock()
+
+# 每个 IP 上次「成功」提交反馈的 unix 秒，用于冷却。
+#
+# 为什么不用 _ratelimit：那套是给登录失败设计的（记失败次数、锁 15 分钟），
+# 反馈是正常提交，语义不符。这里只要一个时间戳。
+#
+# 冷却默认 60 秒（不是 180）：反馈往往是「刚发现问题想说一句」，
+# 3 分钟太长，误触一次就要干等；1 分钟足够挡连点，又不至于让人以为坏了。
+# 环境变量可覆盖 —— 自动化测试要验证冷却是真的会过期，等 60 秒不现实。
+FB_COOLDOWN = int(os.environ.get('FERRY_FB_COOLDOWN', '60'))
+_fb_last = {}
+_fb_lock = threading.Lock()
 
 
 def _rl_key(scope, ip):
@@ -1158,19 +1188,24 @@ def page(title, body, refresh=None, theme=None, cookie_header=None):
 <body><div class="wrap">{top}{body}{footer()}</div>{THEME_JS}</body></html>"""
 
 
-def get_page(detected_ip=''):
-    """首页 = 获取软件。
+def _nav(active):
+    """页内导航。active: home / download / feedback"""
+    items = [('home', '/', '首页'),
+             ('download', '/download-page', '下载'),
+             ('feedback', '/feedback', '意见反馈')]
+    parts = []
+    for key, href, label in items:
+        cls = ' class="nv on"' if key == active else ' class="nv"'
+        parts.append('<a href="%s"%s>%s</a>' % (href, cls, label))
+    return '<nav class="nav">' + ''.join(parts) + '</nav>'
 
-    为什么把登录表单撤掉：用户明确要求「网页只用来获取软件」。
-    密钥改成软件里的激活码，网页再收一遍只会让人以为要登录两次。
 
-    下载区显示**当前版本号和实际文件大小**（从 dist 里现读，不是写死的常量）——
-    踩过的坑：以前写死「约 2.1 MB」，后来包涨到 16.9 MB（内嵌 mihomo），
-    提示就成了误导，用户按 2.1 MB 去核对下载完整性会以为文件坏了。
+def download_page(detected_ip=''):
+    """下载页。
 
-    下面两个 <details> 默认折叠：历史版本 + 更新日志。
-    为什么默认折叠：普通用户只关心「点这个按钮」；版本历史和更新日志是
-    出问题或想回退时才看的。铺开会让首屏变长，重点反而被埋掉。
+    内容就是原来首页那一整页（当前版本 + 历史版本 + 更新日志 + 三步 +
+    SmartScreen + 密钥规则 + 原理）。介绍页独立出去之后，这里只服务
+    「我已经决定了，给我安装包」的人，所以不需要 hero，直接给按钮。
     """
     ip_txt = html.escape(detected_ip) if detected_ip else '你的IP'
 
@@ -1187,150 +1222,393 @@ def get_page(detected_ip=''):
         latest_ver = installers[0]['ver']
     size_txt = human_size(latest_size) if latest_size else '未知'
 
-    # 历史版本行（不含当前版本）
     older = [x for x in installers if x['ver'] != latest_ver]
     if older:
         rows = []
         for x in older:
             rows.append(
                 '<div style="display:flex;align-items:center;justify-content:space-between;'
-                'padding:8px 0;border-top:1px solid var(--line)">'
-                f'<div><b>v{x["ver"]}</b>'
-                f'<span class="hint" style="margin-left:8px">{human_size(x["size"])}</span></div>'
-                f'<a href="/download/version/{x["ver"]}" style="color:var(--accent);'
-                f'font-size:13px;text-decoration:none">下载</a></div>')
+                'padding:9px 0;border-top:1px solid var(--line)">'
+                '<div><b>v%s</b>'
+                '<span class="hint" style="margin-left:8px">%s</span></div>'
+                '<a href="/download/version/%s" style="color:var(--accent);'
+                'font-size:13px;text-decoration:none">下载</a></div>'
+                % (html.escape(x['ver']), human_size(x['size']), html.escape(x['ver'])))
         older_html = '\n'.join(rows)
     else:
         older_html = '<div class="hint" style="padding:8px 0">还没有更早的版本</div>'
 
     log_html = md_to_html_brief(read_changelog())
 
-    return page('获取渡口 · Ferry', f"""
-<h1>渡口 · Ferry</h1>
-<div class="sub">本机网络受限时，借一台能上网的内网主机中转流量</div>
+    return page('下载渡口 · Ferry', """
+<nav class="nav">
+  <a href="/" class="nv">首页</a>
+  <a href="/download-page" class="nv on">下载</a>
+  <a href="/feedback" class="nv">意见反馈</a>
+</nav>
 
-<div class="card" style="text-align:center;padding:22px 18px">
-  <a class="dl" href="/download"
-     style="display:block;font-size:17px;padding:16px 20px;text-decoration:none">
-    下载 Windows 客户端
-  </a>
-  <div class="hint" style="margin-top:14px;font-size:12.5px">
-    <b>v{html.escape(latest_ver)}</b> · Ferry-Setup-{html.escape(latest_ver)}.exe ·
-    <b>{size_txt}</b> · Windows 10 / 11 · 免安装运行库
+<div class="dlwrap">
+  <div class="dlhero">
+    <h1>下载渡口客户端</h1>
+    <p class="sub">Windows 10 / 11 &#183; 免安装运行库 &#183; 装完就能用</p>
   </div>
-  <div class="hint" style="margin-top:10px;font-size:12px;line-height:1.7;
-       background:var(--warnbg);color:var(--warn);padding:10px 12px;border-radius:8px">
-    下载完成后请确认文件大小约 <b>{size_txt}</b>。<br>
-    如果只有 0 KB，说明下载被中断了 —— 删掉那个文件重新点一次。
-    双击 0 KB 的文件会提示「此应用无法在你的电脑上运行」。
+
+  <div class="dlbox">
+    <a class="btn btn-main" href="/download" style="font-size:15px;padding:13px 30px">
+      &#8595; 下载 Windows 客户端
+    </a>
+    <div class="meta">
+      <span class="chip">版本 <b>vLATEST</b></span>
+      <span class="chip">大小 <b>SIZE</b></span>
+      <span class="chip">Windows 10 / 11</span>
+      <span class="chip">免安装运行库</span>
+    </div>
+    <div class="warnbox">
+      下载完成后请确认文件大小约 <b>SIZE</b>。<br>
+      如果只有 0 KB，说明下载被中断了 &mdash;&mdash; 删掉那个文件重新点一次。
+      双击 0 KB 的文件会提示「此应用无法在你的电脑上运行」。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">三步用起来</h2>
+    <div class="step"><div class="n">1</div><div class="t">
+      <b>下载安装包</b><div class="hint">点上面的按钮。文件名里已经带了你的账号，
+        下载后不要改名（改了也能用，安装时会让你手填 IP）。</div>
+    </div></div>
+    <div class="step"><div class="n">2</div><div class="t">
+      <b>双击安装</b><div class="hint">安装时会弹一次「是否允许更改设备」&mdash;&mdash;
+        这是必需的，TUN 全局接管要建虚拟网卡。向导会问要不要建桌面图标、
+        要不要开机自启，装完可以直接启动。</div>
+    </div></div>
+    <div class="step"><div class="n">3</div><div class="t">
+      <b>在软件里输入密钥</b><div class="hint">打开「渡口助手」，把管理员给你的
+        8 位密钥填进「输入密钥激活」，点激活。之后就不用再输了。</div>
+    </div></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">下载后提示「Windows 已保护你的电脑」？</h2>
+    <div style="font-size:13.5px;line-height:1.8">
+      这是 SmartScreen 对<strong>未经代码签名</strong>的 exe 的例行拦截，不是病毒。
+      三种处理方式，任选一种：
+    </div>
+    <div class="step"><div class="n">1</div><div class="t">
+      <b>用命令行下载（不触发拦截，推荐）</b>
+      <div class="hint">按 Win+R 输入 <code>powershell</code> 回车，粘贴下面这行：</div>
+      <div class="cmdbox">Invoke-WebRequest 'http://10.13.24.1:8080/download' -OutFile "$env:USERPROFILE\\D\\Downloads\\Ferry-Setup.exe"; Start-Process "$env:USERPROFILE\\D\\Downloads\\Ferry-Setup.exe"</div>
+      <div class="hint" style="margin-top:6px">
+        浏览器会给下载的文件打上「来自 Internet」的标记（MOTW），SmartScreen 只查带标记的 exe。
+        用 PowerShell 直接下载不带这个标记，所以不会弹窗。
+      </div>
+    </div></div>
+    <div class="step"><div class="n">2</div><div class="t">
+      <b>已经下载了：解除锁定</b>
+      <div class="hint">右键那个 exe &rarr; 属性 &rarr; 最下面勾选「解除锁定」&rarr; 确定 &rarr; 再双击。</div>
+    </div></div>
+    <div class="step"><div class="n">3</div><div class="t">
+      <b>直接点「更多信息 &rarr; 仍要运行」</b>
+      <div class="hint">SmartScreen 弹窗左下角有「更多信息」，展开后出现「仍要运行」。
+        同一个文件点过一次就不再问。</div>
+    </div></div>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary style="cursor:pointer;font-size:14px;font-weight:600;outline:none">
+        历史版本（OLDER_COUNT 个）
+        <span class="hint" style="font-weight:400;margin-left:6px">新版本有问题时可以装回旧版</span>
+      </summary>
+      <div style="margin-top:6px">OLDER_HTML</div>
+    </details>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary style="cursor:pointer;font-size:14px;font-weight:600;outline:none">
+        更新日志
+        <span class="hint" style="font-weight:400;margin-left:6px">每个版本改了什么</span>
+      </summary>
+      <div style="margin-top:8px;max-height:520px;overflow:auto;
+           font-size:13px;line-height:1.75">LOG_HTML</div>
+    </details>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">密钥规则</h2>
+    <div class="kv"><div class="k">一次性</div><div class="v">
+      激活成功即失效。换机器需要向管理员要新密钥。</div></div>
+    <div class="kv"><div class="k">有效期</div><div class="v">
+      密钥本身 12 小时内必须用掉；激活后的授权时长由管理员设定（默认 30 天）。</div></div>
+    <div class="kv"><div class="k">限速</div><div class="v">
+      连续输错会被临时锁定 15 分钟。</div></div>
+  </div>
+</div>
+""".replace('LATEST', html.escape(latest_ver))
+   .replace('SIZE', html.escape(size_txt))
+   .replace('OLDER_COUNT', str(len(older)))
+   .replace('OLDER_HTML', older_html)
+   .replace('LOG_HTML', log_html))
+
+
+def feedback_page(detected_ip='', msg='', err=''):
+    """意见反馈页。
+
+    不需要登录 —— 用户可能还没激活，不能拿「登录」挡反馈。
+    IP 自动带上（管理员定位要靠它），另外只要一个联系方式。
+    """
+    ip_txt = html.escape(detected_ip) if detected_ip else '未能识别'
+    msgbox = ('<div class="fbmsg ok">%s</div>' % html.escape(msg)) if msg else ''
+    errbox = ('<div class="fbmsg err">%s</div>' % html.escape(err)) if err else ''
+
+    # CSRF：do_POST 对所有 POST 统一校验，不带 token 会被 403 挡掉，
+    # 而用户看到的是「点了提交没反应」，完全无法自查。
+    # key 用 'fb|<ip>'，和登录态分开 —— 反馈不需要登录。
+    fb_key = 'fb|' + (detected_ip or 'anon')
+    fb_csrf = csrf_slot(fb_key)
+    csrf_in = '<input type="hidden" name="csrf" value="%s">' % html.escape(fb_csrf)
+
+    return page('意见反馈 · 渡口 Ferry', """
+<nav class="nav">
+  <a href="/" class="nv">首页</a>
+  <a href="/download-page" class="nv">下载</a>
+  <a href="/feedback" class="nv on">意见反馈</a>
+</nav>
+
+<div class="fbwrap">
+  <div class="fbhero">
+    <h1>意见反馈</h1>
+    <p>用的时候遇到问题、或者有想让它做到的事，都可以说。<br>
+       每一条都会被读到，能修的会修，暂时做不到的也会告诉你为什么。</p>
+  </div>
+
+  <div class="fbform">
+    <form method="post" action="/feedback">
+      CSRF_IN
+      <div class="row2">
+        <div>
+          <label>反馈类型</label>
+          <select name="kind">
+            <option value="bug">出了问题 / 报错</option>
+            <option value="feature">想要新功能</option>
+            <option value="perf">太慢 / 卡顿</option>
+            <option value="ask">使用方法咨询</option>
+            <option value="other">其他</option>
+          </select>
+        </div>
+        <div>
+          <label>联系方式（选填，方便回复你）</label>
+          <input type="text" name="contact" maxlength="60"
+                 placeholder="微信 / QQ / 手机号，随你">
+        </div>
+      </div>
+
+      <label>详细描述</label>
+      <textarea name="text" maxlength="2000" required
+                placeholder="发生了什么？期望的结果是什么？如果能贴上报错文字或截图描述，会更好定位。"></textarea>
+
+      MSGBOX
+      ERRBOX
+
+      <div class="btns">
+        <button class="btn btn-main" type="submit">提交反馈</button>
+        <span class="hint">提交后可以在管理面板看到处理状态</span>
+      </div>
+    </form>
+  </div>
+
+  <div class="fbnote">
+    &#183; 本机 IP（<b>IP_TXT</b>）会一起提交，用于定位是哪台机器 &mdash;&mdash;
+      这也是「不用登录」的原因：IP 本身就是身份。<br>
+    &#183; 请不要在描述里写密钥 / 密码等敏感信息。<br>
+    &#183; 客户端软件里也有这个入口：「设置 &rarr; 意见反馈」。
+  </div>
+</div>
+""".replace('IP_TXT', ip_txt).replace('MSGBOX', msgbox).replace('ERRBOX', errbox)
+   .replace('CSRF_IN', csrf_in))
+
+
+
+def landing_page(online_now=0):
+    """介绍页（新的首页）。
+
+    设计参考成熟开源项目的落地页：hero -> 功能网格 -> 三步 -> FAQ。
+    不引外部资源（零 CDN / 零字体 / 零 JS 库）—— 门户必须能完全离线跑。
+
+    「正在借网」这个数字实时读 live 数据，让页面有「这是活的」的感觉，
+    比写死一句「已稳定运行」更有说服力。
+    """
+    return page('渡口 Ferry · 借网工具', """
+<nav class="nav">
+  <a href="/" class="nv on">首页</a>
+  <a href="/download-page" class="nv">下载</a>
+  <a href="/feedback" class="nv">意见反馈</a>
+</nav>
+
+<div class="hero">
+  <div class="badge">Phase 2 &#183; 稳定版</div>
+  <h1>校园网被限制上网？<br><span class="g">借一台能上网的机器的出口</span></h1>
+  <p class="tag">
+    学校按账号禁用上网权限，但局域网通常还是通的。渡口通过一台能上网的
+    内网主机中转流量 &mdash;&mdash; 你不用改任何网络配置，装一次，
+    断网时点一下就能继续上网。
+  </p>
+  <div class="cta">
+    <a class="btn btn-main" href="/download-page">前往下载</a>
+    <a class="btn btn-ghost" href="/feedback">意见反馈</a>
+  </div>
+  <div class="stats">
+    <div class="stat"><b>1</b><span>个端点，HTTP + SOCKS5 同端口</span></div>
+    <div class="stat"><b>__ONLINE__</b><span>台正在借网</span></div>
+    <div class="stat"><b>10 MB/s</b><span>每台限速（可调）</span></div>
   </div>
 </div>
 
-<div class="card">
+<div class="sec">
+  <div class="ph"><i></i><h2>这些时候最有用</h2></div>
+  <p class="pd">不是日常必备，是「刚好卡住」的那一下 &mdash;&mdash; 三个最常见的场景。</p>
+</div>
+
+<div class="fgrid">
+  <div class="fcard scc">
+    <div class="ico">&#9203;</div>
+    <h3>校园网断网，临时急用</h3>
+    <p>账号被停、限时断网、宿舍网线还没通 &mdash;&mdash; 偏偏要交作业、查资料、赶论文。
+       先借一台能上网的机器顶过去：装一次，之后每次点一下就好，不用等网络中心上班，也不用抱着电脑到处找热点。</p>
+    <span class="tg">&#9679; 一分钟接上</span>
+  </div>
+  <div class="fcard scc">
+    <div class="ico">&#128225;</div>
+    <h3>下载、看视频不吃自己的流量</h3>
+    <p>下载安装包、看视频最费出校流量。让这类流量走公用出口那台机器，
+       自己的账号额度几乎不动 &mdash;&mdash; 月底还差两天的时候很顶用。</p>
+    <span class="tg">&#9679; 不扣自己额度</span>
+  </div>
+  <div class="fcard scc">
+    <div class="ico">&#128421;</div>
+    <h3>只有一台机器能上网</h3>
+    <p>宿舍、实验室常有这种情况：只有一台连着网线，或者只有那台激活了账号。
+       其余机器经它出去，不用挨个去开权限、也不用把网线拔来拔去。</p>
+    <span class="tg">&#9679; 多台共用</span>
+  </div>
+</div>
+
+<div class="sec">
+  <div class="ph"><i></i><h2>它做到了什么</h2></div>
+  <p class="pd">不是「又一个代理工具」&mdash;&mdash; 针对的是校园网按账号禁网这个特定场景。</p>
+</div>
+
+<div class="fgrid">
+  <div class="fcard">
+    <div class="ico">&#8646;</div>
+    <h3>断网时仍能上网</h3>
+    <p>删掉默认路由模拟断网后，直连全部失败，经渡口访问 github / 百度 / b 站 全部正常。实测 20 秒采样 4/4。</p>
+    <span class="tg">&#9679; 已验证</span>
+  </div>
+  <div class="fcard">
+    <div class="ico">&#9889;</div>
+    <h3>国内直连，墙外自动分流</h3>
+    <p>国内站直连最快（实测 0.1 秒）；google / youtube 这类直连不通的，自动改走远端的 Clash 出口，你无需任何设置。</p>
+    <span class="tg">&#9679; 已实测</span>
+  </div>
+  <div class="fcard">
+    <div class="ico">&#9635;</div>
+    <h3>游戏也能用（TUN）</h3>
+    <p>可选开启 TUN 全局接管：建一块虚拟网卡接管全部流量，不认系统代理的游戏客户端、QUIC、视频通话都走同一条路。</p>
+    <span class="tg">&#9679; 需管理员权限</span>
+  </div>
+  <div class="fcard">
+    <div class="ico">&#8595;</div>
+    <h3>UDP低延迟模式</h3>
+    <p>不只是 TCP。DNS 查询、游戏联机、实时语音都走 UDP &mdash;&mdash;
+       经远端中继转发，实测完整链路 5/5 通，平均 10&ndash;15ms。</p>
+    <span class="tg">&#9679; 全协议</span>
+  </div>
+  <div class="fcard">
+    <div class="ico">&#8942;</div>
+    <h3>托盘常驻，一键开关</h3>
+    <p>托盘图标就能借网 / 恢复直连。停止时自动还原你原来的系统代理（比如你的 Clash），不会把网络搞断。</p>
+    <span class="tg">&#9679; 不动你的配置</span>
+  </div>
+  <div class="fcard">
+    <div class="ico">&#8635;</div>
+    <h3>自动更新 + 自动恢复</h3>
+    <p>启动时静默检查新版本，有更新才提示。借网中断自动重连，被管理员停用后 5 秒内自动切回直连。</p>
+    <span class="tg">&#9679; 全自动</span>
+  </div>
+</div>
+
+<div class="sec">
+  <div class="ph"><i></i><h2>三步用起来</h2></div>
+  <p class="pd">不需要配 SSH 密钥、不需要装 Node.js、不需要敲命令。</p>
+</div>
+
+<div class="steps">
+  <div class="step2">
+    <div class="n">1</div>
+    <h3>下载安装包</h3>
+    <p>约 17 MB，内嵌运行库。装完不用额外装任何东西，系统自带的 ssh.exe 就够。</p>
+  </div>
+  <div class="step2">
+    <div class="n">2</div>
+    <h3>双击安装</h3>
+    <p>会弹一次「是否允许更改设备」&mdash;&mdash; TUN 全局接管需要它。不勾 TUN 则完全不需要管理员。</p>
+  </div>
+  <div class="step2">
+    <div class="n">3</div>
+    <h3>填密钥激活</h3>
+    <p>打开渡口助手，把管理员给的 8 位密钥填进「输入密钥激活」，点激活。之后不用再输。</p>
+  </div>
+</div>
+
+<div class="sec">
+  <div class="ph"><i></i><h2>常见问题</h2></div>
+  <p class="pd">都是被真实问过的问题。</p>
+</div>
+
+<div class="faq">
   <details>
-    <summary style="cursor:pointer;font-size:14px;font-weight:600;outline:none">
-      历史版本（{len(older)} 个）
-      <span class="hint" style="font-weight:400;margin-left:6px">
-        新版本有问题时可以装回旧版</span>
-    </summary>
-    <div style="margin-top:6px">
-      {older_html}
-    </div>
+    <summary>会影响我本来用的 Clash / 代理吗？</summary>
+    <div class="ans">不会。借网时渡口只切到自己的端口；停止借网时还原你原来的代理地址，并且会先探测那个代理是否活着 &mdash;&mdash; 探不通就直接关掉系统代理，至少保证你能上网。</div>
+  </details>
+  <details>
+    <summary>不开启 TUN 的话，哪些程序能借网？</summary>
+    <div class="ans">所有「认系统代理」或「能填代理地址」的程序：浏览器、下载工具、git、curl、Steam、各种客户端。不认代理的程序（多数游戏）需要开 TUN。</div>
+  </details>
+  <details>
+    <summary>限速是怎么回事？会被别人挤掉吗？</summary>
+    <div class="ans">每台机器默认 10 MB/s，在远端服务端执行（不是客户端，改本地配置绕不过去）。多台同时用会自动分摊，谁都不会把出口占满。</div>
+  </details>
+  <details>
+    <summary>安全吗？我的流量别人能看到吗？</summary>
+    <div class="ans">默认走远端 SOCKS5，链路上是明文（同一局域网内可嗅探域名和 IP）。需要加密就在客户端设置里关掉「直连模式」，退回 SSH 隧道加密 &mdash;&mdash; 代价是那时服务端无法按机器限速。</div>
+  </details>
+  <details>
+    <summary>换机器怎么办？密钥能重复用吗？</summary>
+    <div class="ans">密钥一次性，激活成功即失效，且绑定激活时那台机器的局域网 IP。换机器找管理员要新密钥。</div>
+  </details>
+  <details>
+    <summary>出问题了怎么反馈？</summary>
+    <div class="ans">网页顶部导航有「意见反馈」，客户端「设置」里也有。提交后管理员能在面板里直接看到并处理。</div>
+  </details>
+  <details>
+    <summary>会不会扣我自己的流量？</summary>
+    <div class="ans">出校流量记在出口那台机器上（也就是公用出口的账号），你自己的额度基本不动。
+       速度上限由服务端按 IP 下发，改本地配置绕不过去。</div>
+  </details>
+  <details>
+    <summary>和 VPN、机场梯子是什么关系？</summary>
+    <div class="ans">VPN 要一台公网服务器，机场要买流量；渡口借的是同一局域网里已经能上网的那台机器 &mdash;&mdash;
+       不需要公网 IP，也不用另外付费。代价是那台机器关机或断网就用不了 &mdash;&mdash;
+       它是补丁，不是替代品。</div>
+  </details>
+  <details>
+    <summary>已经断网了，还能装上吗？</summary>
+    <div class="ans">能。安装包可以提前下好放在本地，装完不联网也能跑；只有第一次激活需要能连到这台服务端
+       （所以最好在网络正常时先装好、先把密钥激活了）。</div>
   </details>
 </div>
-
-<div class="card">
-  <details>
-    <summary style="cursor:pointer;font-size:14px;font-weight:600;outline:none">
-      更新日志
-      <span class="hint" style="font-weight:400;margin-left:6px">
-        每个版本改了什么</span>
-    </summary>
-    <div style="margin-top:8px;max-height:520px;overflow:auto;
-         font-size:13px;line-height:1.75">
-      {log_html}
-    </div>
-  </details>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">三步用起来</h2>
-  <div class="step"><div class="n">1</div><div class="t">
-    <b>下载安装包</b><div class="hint">点上面的按钮。文件名里已经带了你的账号，
-      下载后不要改名（改了也能用，安装时会让你手填 IP）。</div>
-  </div></div>
-  <div class="step"><div class="n">2</div><div class="t">
-    <b>双击安装</b><div class="hint">安装时会弹一次「是否允许更改设备」——
-      这是必需的，TUN 全局接管要建虚拟网卡。向导会问要不要建桌面图标、
-      要不要开机自启，装完可以直接启动。</div>
-  </div></div>
-  <div class="step"><div class="n">3</div><div class="t">
-    <b>在软件里输入密钥</b><div class="hint">打开「渡口助手」，把管理员给你的
-      8 位密钥填进「输入密钥激活」，点激活。之后就不用再输了。</div>
-  </div></div>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">下载后提示「Windows 已保护你的电脑」？</h2>
-  <div style="font-size:13.5px;line-height:1.8">
-    这是 SmartScreen 对<strong>未经代码签名</strong>的 exe 的例行拦截，不是病毒。
-    三种处理方式，任选一种：
-  </div>
-  <div class="step"><div class="n">1</div><div class="t">
-    <b>用命令行下载（不触发拦截，推荐）</b>
-    <div class="hint">按 Win+R 输入 <code>powershell</code> 回车，粘贴下面这行：</div>
-    <div class="mono" style="background:var(--code);color:var(--fg);padding:10px 12px;border-radius:8px;margin-top:8px;
-         font-size:12px;word-break:break-all;user-select:all">
-      Invoke-WebRequest 'http://10.13.24.1:8080/download' -OutFile "$env:USERPROFILE\\Downloads\\Ferry-Setup.exe"; Start-Process "$env:USERPROFILE\\Downloads\\Ferry-Setup.exe"
-    </div>
-    <div class="hint" style="margin-top:6px">
-      浏览器会给下载的文件打上「来自 Internet」的标记（MOTW），SmartScreen 只查带标记的 exe。
-      用 PowerShell 直接下载不带这个标记，所以不会弹窗。
-    </div>
-  </div></div>
-  <div class="step"><div class="n">2</div><div class="t">
-    <b>已经下载了：解除锁定</b>
-    <div class="hint">右键那个 exe → 属性 → 最下面勾选「解除锁定」→ 确定 → 再双击。</div>
-  </div></div>
-  <div class="step"><div class="n">3</div><div class="t">
-    <b>直接点「更多信息 → 仍要运行」</b>
-    <div class="hint">SmartScreen 弹窗左下角有「更多信息」，展开后出现「仍要运行」。
-      同一个文件点过一次就不再问。</div>
-  </div></div>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">密钥在软件里输入，不在网页</h2>
-  <div style="font-size:13.5px;line-height:1.8">
-    网页只负责发软件。密钥是软件里的<strong>激活码</strong> ——
-    填一次就绑定这台机器，以后打开软件直接能用。<br><br>
-    这样做的好处是：安装包本身<strong>不含任何凭据</strong>，
-    转发给别人也用不了；密钥丢了也不会连着账号一起泄露。
-  </div>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">密钥规则</h2>
-  <div class="kv"><div class="k">一次性</div><div class="v">
-    激活成功即失效。换机器需要向管理员要新密钥。</div></div>
-  <div class="kv"><div class="k">有效期</div><div class="v">
-    密钥本身 12 小时内必须用掉；激活后的授权时长由管理员设定（默认 30 天）。</div></div>
-  <div class="kv"><div class="k">限速</div><div class="v">
-    连续输错会被临时锁定 15 分钟。</div></div>
-</div>
-
-<div class="card">
-  <h2 style="margin-top:0">它怎么工作</h2>
-  <div style="font-size:13.5px;line-height:1.8">
-    校园网按<strong>账号</strong>限制上网能力时，局域网内部通常仍然是通的。
-    渡口利用这一点：通过 SSH 隧道把流量交给一台<b>能上网的局域网主机</b>中转，
-    出口在别人家。<br><br>
-    隧道是 <code>ssh -D</code> 动态转发（加密），本地是双协议代理
-    （HTTP + SOCKS5 同端口）—— 因为 Windows 系统代理不认 SOCKS5，
-    这是个很容易踩的坑，干脆做成同一端口两种协议。
-  </div>
-</div>
-""")
+""".replace('__ONLINE__', str(int(online_now or 0))))
 
 
 def login_page(err='', csrf='', detected_ip='', show_ip_field=False):
@@ -1784,6 +2062,173 @@ html[data-theme="light"] .arw.up{color:#d97706}
 .modecell.direct{color:var(--accent)}
 .modecell.ssh{color:var(--fg)}
 
+/* ── 介绍页（首页）──
+   布局参考成熟开源项目的落地页：hero 居中 + 功能网格 + 步骤 + FAQ。
+   不引外部资源：零 CDN / 零字体 / 零 JS 库，门户要能完全离线跑。 */
+.hero{text-align:center;padding:44px 16px 34px;
+  background:radial-gradient(ellipse 70% 100% at 50% 0%,
+    color-mix(in srgb,var(--accent) 10%,transparent),transparent);
+  border-radius:18px;margin-bottom:26px}
+.hero .badge{display:inline-flex;align-items:center;gap:6px;
+  font-size:11.5px;color:var(--accent);background:var(--okbg);
+  border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);
+  padding:3px 11px;border-radius:99px;margin-bottom:16px;letter-spacing:.3px}
+.hero h1{font-size:34px;line-height:1.25;margin:0 0 12px;font-weight:800;
+  letter-spacing:-.3px}
+.hero h1 .g{background:linear-gradient(96deg,var(--accent),
+  color-mix(in srgb,var(--accent) 55%,#4cc9f0));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.hero .tag{font-size:15px;color:var(--fg2);max-width:620px;margin:0 auto 26px;
+  line-height:1.75}
+.hero .cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:7px;
+  padding:11px 22px;border-radius:11px;font-size:14px;font-weight:600;
+  text-decoration:none;border:1px solid transparent;cursor:pointer;
+  transition:transform .12s,box-shadow .12s,background .15s,border-color .15s}
+.btn:active{transform:translateY(1px)}
+.btn-main{background:var(--accent);color:var(--accent-fg);
+  box-shadow:0 4px 14px color-mix(in srgb,var(--accent) 28%,transparent)}
+.btn-main:hover{background:var(--accent-d)}
+.btn-ghost{background:transparent;color:var(--fg);border-color:var(--line2)}
+.btn-ghost:hover{border-color:var(--accent);color:var(--accent)}
+.hero .stats{display:flex;gap:34px;justify-content:center;margin-top:26px;
+  flex-wrap:wrap}
+.hero .stat{text-align:center}
+.hero .stat b{display:block;font-size:22px;font-weight:700;line-height:1;
+  font-family:Consolas,Monaco,monospace}
+.hero .stat span{font-size:11.5px;color:var(--fg2);margin-top:5px;display:block}
+
+/* 章节标题 */
+.sec{margin:34px 0 16px}
+.sec .ph{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.sec .ph i{width:6px;height:6px;border-radius:50%;background:var(--accent);
+  display:inline-block;flex:0 0 auto}
+.sec h2{font-size:19px;margin:0;font-weight:700}
+.sec .pd{font-size:13px;color:var(--fg2);line-height:1.7}
+
+/* 功能网格 */
+.fgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media(max-width:900px){.fgrid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.fgrid{grid-template-columns:1fr}}
+.fcard{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:18px 18px 16px;transition:border-color .16s,transform .16s}
+.fcard:hover{border-color:var(--line2);transform:translateY(-2px)}
+.fcard .ico{width:34px;height:34px;border-radius:10px;
+  background:color-mix(in srgb,var(--accent) 13%,transparent);
+  color:var(--accent);display:flex;align-items:center;justify-content:center;
+  font-size:17px;font-weight:700;margin-bottom:12px;line-height:1}
+.fcard h3{font-size:14.5px;margin:0 0 7px;font-weight:650}
+.fcard p{font-size:12.5px;color:var(--fg2);line-height:1.7;margin:0}
+.fcard .tg{display:inline-flex;align-items:center;gap:4px;margin-top:11px;
+  font-size:11px;color:var(--ok);background:var(--okbg);
+  padding:2px 8px;border-radius:99px}
+
+/* 场景卡（首页「这些时候最有用」）。
+   和技术特性卡同一个网格，用左侧一条强调色 + 略深的底区分：
+   场景是「故事」（什么时候去找它），特性是「参数」（它凭什么做到）。
+   两者混在一排会让人读不出重点，所以分成两个区块。 */
+.fcard.scc{border-left:3px solid color-mix(in srgb,var(--accent) 78%,transparent);
+  background:linear-gradient(180deg,
+    color-mix(in srgb,var(--accent) 6%,var(--card)),var(--card))}
+.fcard.scc .tg{color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.fcard.scc h3{font-size:15px}
+.fcard.scc .ico{background:color-mix(in srgb,var(--accent) 20%,transparent)}
+
+/* 步骤 */
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media(max-width:820px){.steps{grid-template-columns:1fr}}
+.step2{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:18px}
+.step2 .n{width:26px;height:26px;border-radius:8px;background:var(--accent);
+  color:var(--accent-fg);display:flex;align-items:center;justify-content:center;
+  font-size:13px;font-weight:700;margin-bottom:11px}
+.step2 h3{font-size:14px;margin:0 0 6px;font-weight:650}
+.step2 p{font-size:12.5px;color:var(--fg2);line-height:1.7;margin:0}
+
+/* FAQ */
+.faq{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:4px 18px}
+.faq details{border-bottom:1px solid var(--line);padding:13px 0}
+.faq details:last-child{border-bottom:0}
+.faq summary{cursor:pointer;font-size:13.5px;font-weight:600;outline:none;
+  list-style:none;display:flex;align-items:center;gap:8px}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::before{content:'+';color:var(--accent);font-weight:700;
+  width:14px;display:inline-block;flex:0 0 auto;font-size:14px}
+.faq details[open] summary::before{content:'−'}
+.faq .ans{font-size:12.5px;color:var(--fg2);line-height:1.8;
+  padding:9px 0 2px 22px}
+
+/* 下载页 */
+.dlwrap{max-width:760px;margin:0 auto}
+.dlhero{text-align:center;padding:30px 16px 24px}
+.dlhero h1{font-size:27px;margin:0 0 10px;font-weight:800}
+.dlhero .sub{font-size:14px;color:var(--fg2);line-height:1.7;
+  max-width:560px;margin:0 auto 22px}
+.dlbox{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:20px;text-align:center}
+.dlbox .meta{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;
+  margin-top:14px}
+.dlbox .chip{font-size:11.5px;color:var(--fg2);background:var(--card2);
+  border:1px solid var(--line);padding:3px 10px;border-radius:99px}
+.dlbox .chip b{color:var(--fg);font-weight:600}
+.warnbox{margin-top:14px;text-align:left;font-size:12px;line-height:1.8;
+  background:var(--warnbg);color:var(--warn);padding:11px 13px;border-radius:10px}
+.warnbox b{color:var(--warn)}
+.cmdbox{background:var(--code);color:var(--fg);padding:10px 12px;
+  border-radius:8px;margin-top:9px;font-size:11.5px;word-break:break-all;
+  user-select:all;font-family:Consolas,Monaco,monospace;line-height:1.6}
+.nav{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.nav a.nv{font-size:13px;color:var(--fg2);text-decoration:none;
+  padding:5px 2px;border-bottom:1.5px solid transparent;transition:color .15s}
+.nav a.nv:hover{color:var(--fg)}
+.nav a.nv.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+
+/* ── 意见反馈 ── */
+.fbwrap{max-width:680px;margin:0 auto}
+.fbhero{text-align:center;padding:26px 8px 20px}
+.fbhero h1{font-size:24px;margin:0 0 9px;font-weight:800}
+.fbhero p{font-size:13.5px;color:var(--fg2);line-height:1.75;margin:0}
+.fbform{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:20px}
+.fbform label{display:block;font-size:12.5px;color:var(--fg2);margin:14px 0 6px}
+.fbform label:first-child{margin-top:0}
+.fbform input[type=text],.fbform select,.fbform textarea{
+  width:100%;padding:9px 11px;font-size:13px;font-family:inherit;
+  background:var(--card2);border:1px solid var(--line2);border-radius:9px;
+  color:var(--fg);transition:border-color .15s}
+.fbform input[type=text]:focus,.fbform select:focus,.fbform textarea:focus{
+  outline:none;border-color:var(--accent)}
+.fbform textarea{min-height:110px;resize:vertical;line-height:1.7}
+.fbform .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:560px){.fbform .row2{grid-template-columns:1fr}}
+.fbform .btns{display:flex;gap:10px;align-items:center;margin-top:18px}
+.fbmsg{font-size:12.5px;line-height:1.7;padding:10px 12px;border-radius:9px;
+  margin-top:14px;display:none}
+.fbmsg.ok{display:block;background:var(--okbg);color:var(--ok)}
+.fbmsg.err{display:block;background:var(--errbg);color:var(--err)}
+.fbnote{font-size:11.5px;color:var(--fg2);line-height:1.75;margin-top:14px}
+
+/* ── 意见反馈管理 ── */
+.fb-st{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;
+  white-space:nowrap}
+.fb-st-0{background:var(--warnbg);color:var(--warn)}
+.fb-st-1{background:var(--okbg);color:var(--ok)}
+.fb-st-2{background:var(--card2);color:var(--fg2)}
+.fb-st-3{background:var(--errbg);color:var(--err)}
+.fb-text{font-size:12.5px;line-height:1.65;max-width:420px;
+  white-space:pre-wrap;word-break:break-word}
+
+/* 同源折叠的「共 N 条」按钮：做得像链接而不是按钮，
+   因为它属于「来源」那一列的信息，不是主操作。 */
+.fb-fold{background:none;border:0;padding:2px 0 0;cursor:pointer;
+  font-size:11px;color:var(--accent);font-family:inherit;
+  text-decoration:underline dotted;text-underline-offset:3px}
+.fb-fold:hover{text-decoration-style:solid}
+/* 子行（同源的历史反馈）左侧加一道竖线，一眼看出是从属关系 */
+tr.fb-more>td{background:color-mix(in srgb,var(--card2) 45%,transparent)}
+tr.fb-more>td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accent) 40%,transparent)}
+
 /* ── 机器详情弹窗 ──
    点表格里的 IP 打开。用固定定位 + 半透明遮罩，不用 <dialog>（老浏览器兼容）。 */
 .modal{position:fixed;inset:0;z-index:900;display:none;
@@ -2201,6 +2646,149 @@ html[data-theme="light"] .arw.up{color:#d97706}
       });
   }
 
+  // ── 意见反馈管理 ──
+  var FB_ST = {0:'新提交', 1:'处理中', 2:'已解决', 3:'暂不做'};
+  var FB_KIND = {bug:'问题', feature:'功能', perf:'性能', ask:'咨询', other:'其他'};
+  var fbFilter = 'all';
+
+  function fbEsc(s){
+    return String(s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+  function fbTime(ts){
+    if (!ts) return '—';
+    var d = new Date(ts * 1000);
+    function p(x){ return (x < 10 ? '0' : '') + x; }
+    return (d.getMonth()+1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function loadFeedback(){
+    fetch('/api/admin/feedback', {credentials:'same-origin', cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d.ok) return;
+        var c = d.counts || {};
+        var nb = document.getElementById('fbNew');
+        if (nb) nb.textContent = c[0] ? ('· ' + c[0] + ' 条待处理') : '';
+
+        var rows = (d.list || []).filter(function(x){
+          return fbFilter === 'all' ? true : String(x.status) === fbFilter;
+        });
+        var body = document.getElementById('fbBody');
+        if (!body) return;
+        if (!rows.length) {
+          body.innerHTML = '<tr><td colspan="6" class="muted">没有符合条件的反馈</td></tr>';
+          return;
+        }
+        var h = '';
+
+        // ── 相同来源折叠 ──
+        // 同一个 IP 的多条反馈默认只展开最新一条，其余收在「共 N 条」里。
+        // 为什么：一个人连着报五六条（改一版说一次）会把整个面板顶满，
+        // 别人的反馈被挤到看不见 —— 而面板的用途是「别漏掉任何一条」。
+        // 后端不动：list 已按 id DESC 返回，这里只决定谁显示、谁收起。
+        var order = [], groups = {};
+        rows.forEach(function(x){
+          var key = x.ip || '?';
+          if (!groups[key]) { groups[key] = []; order.push(key); }
+          groups[key].push(x);
+        });
+
+        order.forEach(function(key, gi){
+          var g = groups[key];
+          g.forEach(function(x, xi){
+            var kind = FB_KIND[x.kind] || x.kind || '其他';
+            var isMore = xi > 0;
+            h += '<tr data-id="' + x.id + '"'
+              + (isMore ? ' class="fb-more" data-g="' + gi + '" style="display:none"' : '')
+              + '>'
+              + '<td class="nowrap"><span class="fb-st fb-st-' + x.status + '">'
+              + (FB_ST[x.status] || '?') + '</span></td>'
+              + '<td class="nowrap">' + fbEsc(kind) + '</td>'
+              + '<td><div class="fb-text">' + fbEsc(x.text) + '</div>'
+              + (x.contact ? '<div class="hint" style="margin-top:3px">联系: '
+                 + fbEsc(x.contact) + '</div>' : '')
+              + (x.admin_note ? '<div class="hint" style="margin-top:3px">备注: '
+                 + fbEsc(x.admin_note) + '</div>' : '')
+              + '</td>'
+              + '<td class="mono nowrap" style="font-size:11.5px">'
+              + fbEsc(x.ip) + (x.client_ver ? '<div class="hint">v'
+                 + fbEsc(x.client_ver) + '</div>' : '')
+              + (!isMore && g.length > 1
+                 ? '<div><button type="button" class="fb-fold" data-g="' + gi
+                   + '" data-total="' + g.length + '">共 ' + g.length
+                   + ' 条 &#9662;</button></div>'
+                 : '')
+              + '</td>'
+              + '<td class="muted nowrap" style="font-size:11.5px">'
+              + fbTime(x.ts) + '</td>'
+              + '<td class="nowrap">'
+              + '<select class="fb-sel" data-id="' + x.id + '" style="font-size:11.5px;'
+              + 'padding:2px 4px;background:var(--card2);color:var(--fg);'
+              + 'border:1px solid var(--line2);border-radius:5px">'
+              + '<option value="0"' + (x.status === 0 ? ' selected' : '') + '>新提交</option>'
+              + '<option value="1"' + (x.status === 1 ? ' selected' : '') + '>处理中</option>'
+              + '<option value="2"' + (x.status === 2 ? ' selected' : '') + '>已解决</option>'
+              + '<option value="3"' + (x.status === 3 ? ' selected' : '') + '>暂不做</option>'
+              + '</select></td>'
+              + '</tr>';
+          });
+        });
+        body.innerHTML = h;
+
+        // 折叠按钮：整组子行一起显示/收起。
+        Array.prototype.forEach.call(body.querySelectorAll('.fb-fold'), function(btn){
+          btn.addEventListener('click', function(){
+            var g = btn.getAttribute('data-g');
+            var open = btn.getAttribute('data-open') === '1';
+            Array.prototype.forEach.call(
+              body.querySelectorAll('tr.fb-more[data-g="' + g + '"]'),
+              function(tr){ tr.style.display = open ? 'none' : ''; });
+            btn.setAttribute('data-open', open ? '0' : '1');
+            btn.innerHTML = open
+              ? ('共 ' + btn.getAttribute('data-total') + ' 条 &#9662;')
+              : '收起 &#9652;';
+          });
+        });
+
+        Array.prototype.forEach.call(body.querySelectorAll('.fb-sel'), function(sel){
+          sel.addEventListener('change', function(){
+            var id = sel.getAttribute('data-id');
+            var st = parseInt(sel.value, 10);
+            var csrfEl = document.querySelector('input[name="csrf"]');
+            var body2 = new URLSearchParams();
+            body2.append('id', id);
+            body2.append('status', st);
+            if (csrfEl) body2.append('csrf', csrfEl.value);
+            fetch('/api/admin/feedback', {
+              method: 'POST', credentials: 'same-origin',
+              headers: {'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'fetch'},
+              body: body2.toString()
+            }).then(function(){ loadFeedback(); }).catch(function(){});
+          });
+        });
+      })
+      .catch(function(){});
+  }
+
+  function bindFeedback(){
+    Array.prototype.forEach.call(document.querySelectorAll('.fb-filter'), function(b){
+      b.addEventListener('click', function(){
+        fbFilter = b.getAttribute('data-st');
+        Array.prototype.forEach.call(document.querySelectorAll('.fb-filter'), function(x){
+          x.style.borderColor = '';
+          x.style.color = '';
+        });
+        b.style.borderColor = 'var(--accent)';
+        b.style.color = 'var(--accent)';
+        loadFeedback();
+      });
+    });
+    loadFeedback();
+  }
+
   function bindNetCtl(){
     var btn = document.getElementById('ncApply');
     if (!btn || btn.getAttribute('data-bound') === '1') return;
@@ -2581,10 +3169,13 @@ html[data-theme="light"] .arw.up{color:#d97706}
     bindIpCells();
   }
 
+  function bootAll(){
+    bindIpCells(); bindNotes(); bindNetCtl(); bindFeedback();
+  }
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', bindNetCtl);
+    document.addEventListener('DOMContentLoaded', bootAll);
   } else {
-    bindNetCtl();
+    bootAll();
   }
 
   function tick(){
@@ -2795,6 +3386,33 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   <div class="listwrap sm">
   <table><thead><tr><th>密钥前缀</th><th>备注</th><th>可用时长</th><th>状态</th><th>使用方</th><th>创建</th><th></th></tr></thead>
   <tbody>{inv_rows or '<tr><td colspan="7" class="muted">还没有密钥</td></tr>'}</tbody></table>
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">意见反馈
+    <span class="hint" id="fbNew" style="font-weight:400;margin-left:8px"></span>
+  </h2>
+  <div class="hint" style="margin:-4px 0 10px">
+    来自网页 <code>/feedback</code> 和客户端「设置 → 意见反馈」。
+    按 IP 定位，所以用户不用登录也能反馈。
+  </div>
+  <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px" id="fbFilters">
+    <button type="button" class="sm ghost fb-filter" data-st="all">全部</button>
+    <button type="button" class="sm ghost fb-filter" data-st="0">新提交</button>
+    <button type="button" class="sm ghost fb-filter" data-st="1">处理中</button>
+    <button type="button" class="sm ghost fb-filter" data-st="2">已解决</button>
+    <button type="button" class="sm ghost fb-filter" data-st="3">暂不做</button>
+  </div>
+  <div class="listwrap" style="max-height:460px;overflow-y:auto">
+    <table>
+      <thead><tr>
+        <th>状态</th><th>类型</th><th>内容</th><th>来源</th><th>时间</th><th>操作</th>
+      </tr></thead>
+      <tbody id="fbBody">
+        <tr><td colspan="6" class="muted">加载中…</td></tr>
+      </tbody>
+    </table>
   </div>
 </div>
 
@@ -3687,10 +4305,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def read_form(self):
+        """读 POST body，按 Content-Type 分流。
+
+        urlencoded -> parse_qs
+        json       -> json.loads（前端 fetch 常用这种）
+
+        为什么必须支持 json：只认 urlencoded 的话，前端用
+        fetch(..., {body: JSON.stringify(...)}) 发过来的 csrf 字段
+        解析不出来，do_POST 直接 403 —— 而页面上完全看不出原因。
+        """
         n = int(self.headers.get('Content-Length') or 0)
         if n <= 0 or n > 65536:
             return {}
         raw = self.rfile.read(n).decode('utf-8', 'replace')
+        ctype = (self.headers.get('Content-Type') or '').lower()
+        if 'json' in ctype:
+            try:
+                obj = json.loads(raw or '{}')
+                if isinstance(obj, dict):
+                    return {k: (v if isinstance(v, str) else json.dumps(v))
+                            for k, v in obj.items()}
+                return {}
+            except Exception:
+                return {}
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
 
     def get_cookie(self, name):
@@ -3738,9 +4375,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         try:
             if path == '/':
-                # 首页只发软件，不再收密钥（用户要求：网页只用来获取软件）
+                # 首页 = 产品介绍（hero + 功能网格 + FAQ）。
+                # 「正在借网」实时读，让页面有活着的感觉。
                 ip0 = self.client_ip()
-                self.send_html(get_page(detected_ip=ip0 if PRIVATE_IP_RE.match(ip0) else ''))
+                online = 0
+                try:
+                    _lv = sample_live(self.db)
+                    online = int(_lv.get('onlineCount') or 0)
+                except Exception:
+                    online = 0
+                self.send_html(landing_page(online_now=online))
+            elif path == '/download-page':
+                ip1 = self.client_ip()
+                self.send_html(download_page(
+                    detected_ip=ip1 if PRIVATE_IP_RE.match(ip1) else ''))
+            elif path == '/feedback':
+                ip2 = self.client_ip()
+                self.send_html(feedback_page(
+                    detected_ip=ip2 if PRIVATE_IP_RE.match(ip2) else ''))
             elif path == '/login':
                 # 老的登录入口作废，直接回首页
                 self.redirect('/')
@@ -3760,6 +4412,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_api_admin_live()
             elif path == '/api/admin/net':
                 self.handle_api_admin_net()
+            elif path == '/api/admin/feedback':
+                self.handle_api_admin_feedback()
             elif path == '/api/admin/client':
                 self.handle_api_admin_client(
                     urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
@@ -3855,6 +4509,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 key = 'login|' + self.client_ip()
             elif path == '/admin/login':
                 key = 'adminlogin|' + self.client_ip()
+            elif path == '/feedback':
+                key = 'fb|' + self.client_ip()
             else:
                 key = 'admin|' + self.client_ip()
             if not csrf_check(key, form.get('csrf', '')):
@@ -3864,7 +4520,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     '页面已过期，请重新打开。若反复出现，检查是否有人跨站提交。</div>'), 403)
                 return
 
-            if path == '/login':
+            if path == '/feedback':
+                self.handle_feedback_post(form)
+            elif path == '/login':
                 self.handle_login(form)
             elif path == '/admin/login':
                 self.handle_admin_login(form)
@@ -3878,6 +4536,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_admin_setnote(form)
             elif path == '/api/admin/net':
                 self.handle_api_admin_net(form)
+            elif path == '/api/admin/feedback':
+                self.handle_api_admin_feedback(form)
             elif path == '/admin/unlock':
                 self.handle_unlock(form)
             else:
@@ -4734,6 +5394,133 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.db.x('UPDATE invites SET revoked = 1 WHERE id = ?', (iid,))
         self.db.log('invite_revoke', self.client_ip(), f'id={iid}')
         self.send_html(admin_page(self.db, msg='已撤销', csrf=csrf_set('admin|' + self.client_ip())))
+
+    def handle_feedback_post(self, form):
+        """提交意见反馈。
+
+        不需要登录：IP 本身就是身份（借网按 IP 限速、按 IP 激活）。
+        挡登录会把「还没装好的人」挡在外面，而那正是最需要反馈的人群。
+
+        限流：同一 IP 每 60 秒 1 条（FB_COOLDOWN）。
+
+        顺序很重要：**先校验，再判冷却**。
+        踩过的坑：以前先把时间戳写进 _fb_last 再校验，于是「描述太短」这种
+        手滑一次也要等满整个冷却窗口才能重交，用户看到的是「提交太频繁」，
+        以为功能坏了 —— 而真正的原因是自己刚打错一个字。
+        现在只有校验通过、并且真的写进库，才占用冷却。
+        """
+        ip = self.client_ip()
+
+        kind = (form.get('kind') or 'other').strip()[:16]
+        text = (form.get('text') or '').strip()
+        contact = (form.get('contact') or '').strip()[:60]
+        ver = (form.get('ver') or '').strip()[:24]
+
+        if not kind:
+            kind = 'other'
+        # 允许的反馈类型白名单，别让任意字符串进库
+        if kind not in ('bug', 'feature', 'perf', 'ask', 'other'):
+            kind = 'other'
+
+        # ── 1. 校验（不占用冷却）──
+        if len(text) < 4:
+            self.send_html(feedback_page(ip, err='描述太短了，至少写 4 个字'))
+            return
+        if len(text) > 2000:
+            text = text[:2000]
+
+        # ── 2. 冷却 ──
+        now_ts = now()
+        with _fb_lock:
+            last = _fb_last.get(ip, 0)
+            wait_s = FB_COOLDOWN - (now_ts - last) if last else 0
+        if wait_s > 0:
+            self.send_html(feedback_page(
+                ip, err='提交太频繁，请 %d 秒后再试' % wait_s))
+            return
+
+        # ── 3. 落库，成功之后才计时 ──
+        try:
+            self.db.x('INSERT INTO feedback (ts, ip, kind, text, contact, client_ver) '
+                      'VALUES (?,?,?,?,?,?)',
+                      (now(), ip, kind, text, contact, ver))
+            self.db.log('feedback', ip, '%s: %s' % (kind, text[:60]))
+        except Exception as e:
+            sys.stderr.write('[feedback] insert failed: %s\n' % e)
+            self.send_html(feedback_page(ip, err='提交失败，请稍后重试'))
+            return
+
+        with _fb_lock:
+            _fb_last[ip] = now_ts
+
+        self.send_html(feedback_page(
+            ip, msg='收到了，谢谢反馈。管理员能看到并在这里跟进处理状态。'))
+
+    def handle_api_admin_feedback(self, form=None):
+        """意见反馈的管理接口。
+
+        GET  -> 列表（含按状态分组的计数）
+        POST -> 改状态 / 加备注
+        """
+        if not self._require_admin():
+            return
+
+        if self.command == 'POST':
+            # 用 do_POST 传进来的 form，不要再读 rfile ——
+            # body 已经被 do_POST 读掉了，再读会挂住（实测 20s 超时）。
+            body = {}
+            if form:
+                body = {k: (v[0] if isinstance(v, list) else v)
+                        for k, v in form.items()}
+            # fetch 发的是 urlencoded，字段都是字符串，够用
+
+            fid = body.get('id')
+            try:
+                fid = int(fid)
+            except (TypeError, ValueError):
+                self.send_json({'ok': False, 'error': 'bad id'}, 400)
+                return
+
+            row = self.db.q1('SELECT * FROM feedback WHERE id = ?', (fid,))
+            if not row:
+                self.send_json({'ok': False, 'error': 'not found'}, 404)
+                return
+
+            status = body.get('status')
+            note = body.get('note')
+            sets = []
+            args = []
+            if status is not None:
+                try:
+                    st = int(status)
+                    if st in (0, 1, 2, 3):
+                        sets.append('status = ?')
+                        args.append(st)
+                        sets.append('handled_at = ?')
+                        args.append(now())
+                except (TypeError, ValueError):
+                    pass
+            if note is not None:
+                sets.append('admin_note = ?')
+                args.append(str(note)[:500])
+            if sets:
+                args.append(fid)
+                self.db.x('UPDATE feedback SET %s WHERE id = ?' % ', '.join(sets), args)
+            self.db.log('feedback_handle', self.client_ip(), 'id=%d' % fid)
+            self.send_json({'ok': True})
+            return
+
+        rows = self.db.q('SELECT * FROM feedback ORDER BY id DESC LIMIT 200')
+        counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        for r in rows:
+            st = int(r['status'] or 0)
+            counts[st] = counts.get(st, 0) + 1
+        self.send_json({
+            'ok': True,
+            'total': len(rows),
+            'counts': counts,
+            'list': [dict(r) for r in rows],
+        })
 
     def handle_admin_setnote(self, form):
         """改某台机器的备注。

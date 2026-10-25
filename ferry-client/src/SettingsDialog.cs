@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -174,7 +175,7 @@ namespace Ferry
         void BuildUi()
         {
             Text = "设置";
-            ClientSize = new Size(470, 566);
+            ClientSize = new Size(470, 622);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = false;
@@ -191,7 +192,7 @@ namespace Ferry
             Controls.Add(sub);
 
             var card = Theme.Card(14);
-            card.SetBounds(20, 74, 430, 274);
+            card.SetBounds(20, 74, 430, 330);
             Controls.Add(card);
 
             _chkAutoStart = MakeCheck("开机自动启动",
@@ -214,17 +215,36 @@ namespace Ferry
             _chkReconnect.Checked = _cfg.AutoReconnect;
             card.Controls.Add(_chkReconnect);
 
+            // 意见反馈入口。
+            // 放在设置里而不是主界面：反馈是低频操作，主界面要留给
+            // 「借网/停止」这个高频动作。但入口必须好找 ——
+            // 所以做成一个带说明的按钮，而不是藏在二级菜单里。
+            var fbBtn = new Button();
+            fbBtn.Text = "💬 意见反馈";
+            fbBtn.SetBounds(20, 224, 440, 40);
+            fbBtn.FlatStyle = FlatStyle.Flat;
+            fbBtn.FlatAppearance.BorderColor = Theme.Line;
+            fbBtn.FlatAppearance.BorderSize = 1;
+            fbBtn.BackColor = Theme.CardBg;
+            fbBtn.ForeColor = Theme.Text;
+            fbBtn.Font = Theme.FBody;
+            fbBtn.TextAlign = ContentAlignment.MiddleLeft;
+            fbBtn.Padding = new Padding(12, 0, 0, 0);
+            fbBtn.Cursor = Cursors.Hand;
+            fbBtn.Click += delegate { OpenFeedback(); };
+            card.Controls.Add(fbBtn);
+
             // TUN：让不认系统代理的程序也走渡口，并且让 UDP 走低延迟链路。
             // 需要管理员权限 —— 客户端的 manifest 已声明 requireAdministrator，
             // 但用户可能是从旧快捷方式/命令行起的，所以运行时还要再判一次。
             _chkTun = MakeCheck("UDP低延迟模式（全局接管）",
                 "在网络层截获全部流量，不认代理的程序也走渡口，UDP 走低延迟链路。" +
-                "需要管理员权限；开启后短暂断网属正常（路由表重建）", 224);
+                "需要管理员权限；开启后短暂断网属正常（路由表重建）", 272);
             _chkTun.Checked = _cfg.UseTun;
             card.Controls.Add(_chkTun);
 
             var lblIv = Theme.Text2("断网检测间隔", Theme.FSmall, Theme.Text);
-            lblIv.SetBounds(24, 368, 130, 20);
+            lblIv.SetBounds(24, 424, 130, 20);
             Controls.Add(lblIv);
 
             _numInterval = new NumericUpDown();
@@ -232,25 +252,25 @@ namespace Ferry
             _numInterval.Maximum = 300;
             _numInterval.Increment = 5;
             _numInterval.Value = Math.Max(10, Math.Min(300, _cfg.NetCheckSec));
-            _numInterval.SetBounds(166, 366, 90, 26);
+            _numInterval.SetBounds(166, 422, 90, 26);
             Controls.Add(_numInterval);
 
             var lblSec = Theme.Text2("秒", Theme.FSmall, Theme.Muted);
-            lblSec.SetBounds(264, 368, 30, 20);
+            lblSec.SetBounds(264, 424, 30, 20);
             Controls.Add(lblSec);
 
             _lblHint = Theme.Text2("间隔越短越灵敏，但每次检测要发一次 DNS 查询；" + Environment.NewLine +
                                    "断网后大约一个间隔内会自动开始借网。", Theme.FSmall, Theme.Muted);
-            _lblHint.SetBounds(24, 400, 424, 34);
+            _lblHint.SetBounds(24, 456, 424, 34);
             Controls.Add(_lblHint);
 
             var ok = Theme.FlatButton("保存", true);
-            ok.SetBounds(238, 512, 104, 34);
+            ok.SetBounds(238, 568, 104, 34);
             ok.Click += delegate { SaveAll(); };
             Controls.Add(ok);
 
             var cancel = Theme.FlatButton("取消", false);
-            cancel.SetBounds(350, 512, 104, 34);
+            cancel.SetBounds(350, 568, 104, 34);
             cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
             Controls.Add(cancel);
 
@@ -262,7 +282,7 @@ namespace Ferry
             lnkUninstall.LinkColor = Theme.Muted;
             lnkUninstall.ActiveLinkColor = Theme.Bad;
             lnkUninstall.LinkBehavior = LinkBehavior.HoverUnderline;
-            lnkUninstall.SetBounds(24, 458, 110, 20);
+            lnkUninstall.SetBounds(24, 514, 110, 20);
             lnkUninstall.LinkClicked += delegate
             {
                 if (_onUninstall == null) return;
@@ -279,7 +299,7 @@ namespace Ferry
             _lblVer.Font = Theme.FSmall;
             _lblVer.ForeColor = Theme.Muted;
             _lblVer.AutoSize = true;
-            _lblVer.SetBounds(142, 459, 150, 18);
+            _lblVer.SetBounds(142, 515, 150, 18);
             Controls.Add(_lblVer);
 
             var lnkCheck = new LinkLabel();
@@ -288,7 +308,7 @@ namespace Ferry
             lnkCheck.LinkColor = Theme.Accent;
             lnkCheck.ActiveLinkColor = Theme.Accent;
             lnkCheck.LinkBehavior = LinkBehavior.HoverUnderline;
-            lnkCheck.SetBounds(300, 458, 80, 20);
+            lnkCheck.SetBounds(300, 514, 80, 20);
             lnkCheck.LinkClicked += delegate { CheckUpdateManual(); };
             Controls.Add(lnkCheck);
 
@@ -391,6 +411,167 @@ namespace Ferry
                 Cursor = Cursors.Default;
                 MessageBox.Show(this, "下载失败：" + e.Message, "更新",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        /// <summary>
+        /// 打开意见反馈窗体。
+        ///
+        /// 做成模态子窗体而不是弹 MessageBox：要填的内容有三项
+        /// （类型 / 联系方式 / 描述），MessageBox 装不下。
+        /// </summary>
+        void OpenFeedback()
+        {
+            using (var f = new Form())
+            {
+                f.Text = "意见反馈";
+                f.ClientSize = new Size(460, 430);
+                f.StartPosition = FormStartPosition.CenterParent;
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.MaximizeBox = false;
+                f.MinimizeBox = false;
+                f.BackColor = Theme.Bg;
+                f.Font = Theme.FBody;
+
+                var title = Theme.Text2("遇到问题，或者有想让它做到的事？", Theme.FBody, Theme.Text);
+                title.SetBounds(20, 16, 420, 24);
+                f.Controls.Add(title);
+
+                var sub = new Label();
+                sub.Text = "每一条都会被读到。能修的会修，暂时做不到的也会告诉你为什么。";
+                sub.SetBounds(20, 44, 420, 20);
+                sub.ForeColor = Theme.Muted;
+                sub.Font = Theme.FSmall;
+                f.Controls.Add(sub);
+
+                var l1 = new Label();
+                l1.Text = "反馈类型";
+                l1.SetBounds(20, 82, 420, 18);
+                l1.ForeColor = Theme.Muted;
+                l1.Font = Theme.FSmall;
+                f.Controls.Add(l1);
+
+                var cmb = new ComboBox();
+                cmb.DropDownStyle = ComboBoxStyle.DropDownList;
+                cmb.Items.AddRange(new object[] { "出了问题 / 报错", "想要新功能", "太慢 / 卡顿", "使用方法咨询", "其他" });
+                cmb.SelectedIndex = 0;
+                cmb.SetBounds(20, 104, 420, 26);
+                f.Controls.Add(cmb);
+
+                var l2 = new Label();
+                l2.Text = "联系方式（选填，方便回复你）";
+                l2.SetBounds(20, 140, 420, 18);
+                l2.ForeColor = Theme.Muted;
+                l2.Font = Theme.FSmall;
+                f.Controls.Add(l2);
+
+                var txtContact = new TextBox();
+                txtContact.SetBounds(20, 162, 420, 26);
+                f.Controls.Add(txtContact);
+
+                var l3 = new Label();
+                l3.Text = "详细描述";
+                l3.SetBounds(20, 198, 420, 18);
+                l3.ForeColor = Theme.Muted;
+                l3.Font = Theme.FSmall;
+                f.Controls.Add(l3);
+
+                var txt = new TextBox();
+                txt.Multiline = true;
+                txt.ScrollBars = ScrollBars.Vertical;
+                txt.SetBounds(20, 220, 420, 120);
+                f.Controls.Add(txt);
+
+                var msg = new Label();
+                msg.SetBounds(20, 348, 420, 20);
+                msg.ForeColor = Theme.Muted;
+                msg.Font = Theme.FSmall;
+                f.Controls.Add(msg);
+
+                var btnSend = new Button();
+                btnSend.Text = "提交反馈";
+                btnSend.SetBounds(20, 376, 200, 36);
+                btnSend.FlatStyle = FlatStyle.Flat;
+                btnSend.FlatAppearance.BorderSize = 0;
+                btnSend.BackColor = Theme.Accent;
+                btnSend.ForeColor = Color.White;
+                btnSend.Font = Theme.FBody;
+                btnSend.Cursor = Cursors.Hand;
+                f.Controls.Add(btnSend);
+
+                var btnCancel = new Button();
+                btnCancel.Text = "取消";
+                btnCancel.SetBounds(240, 376, 200, 36);
+                btnCancel.FlatStyle = FlatStyle.Flat;
+                btnCancel.FlatAppearance.BorderColor = Theme.Line;
+                btnCancel.FlatAppearance.BorderSize = 1;
+                btnCancel.BackColor = Theme.CardBg;
+                btnCancel.ForeColor = Theme.Text;
+                btnCancel.Font = Theme.FBody;
+                btnCancel.Cursor = Cursors.Hand;
+                btnCancel.DialogResult = DialogResult.Cancel;
+                f.Controls.Add(btnCancel);
+                f.CancelButton = btnCancel;
+
+                // 提交。放线程池里，避免门户不通时界面卡住。
+                btnSend.Click += delegate
+                {
+                    string kind = "other";
+                    switch (cmb.SelectedIndex)
+                    {
+                        case 0: kind = "bug"; break;
+                        case 1: kind = "feature"; break;
+                        case 2: kind = "perf"; break;
+                        case 3: kind = "ask"; break;
+                    }
+                    string body = txt.Text;
+                    string contact = txtContact.Text;
+
+                    if (body.Trim().Length < 4)
+                    {
+                        msg.ForeColor = Theme.Bad;
+                        msg.Text = "描述太短了，至少写 4 个字";
+                        return;
+                    }
+
+                    btnSend.Enabled = false;
+                    btnSend.Text = "提交中…";
+                    msg.ForeColor = Theme.Muted;
+                    msg.Text = "";
+
+                    ThreadPool.QueueUserWorkItem(delegate
+                    {
+                        string err = "";
+                        try { err = Api.Feedback(_cfg, kind, body, contact); }
+                        catch (Exception ex) { err = "提交失败：" + ex.Message; }
+
+                        try
+                        {
+                            f.BeginInvoke(new Action(delegate
+                            {
+                                btnSend.Enabled = true;
+                                btnSend.Text = "提交反馈";
+                                if (err.Length == 0)
+                                {
+                                    msg.ForeColor = Theme.Good;
+                                    msg.Text = "已收到，谢谢反馈";
+                                    var t = new System.Windows.Forms.Timer();
+                                    t.Interval = 1200;
+                                    t.Tick += delegate { t.Stop(); try { f.Close(); } catch (Exception) { } };
+                                    t.Start();
+                                }
+                                else
+                                {
+                                    msg.ForeColor = Theme.Bad;
+                                    msg.Text = err;
+                                }
+                            }));
+                        }
+                        catch (Exception) { }
+                    });
+                };
+
+                f.ShowDialog(this);
             }
         }
 
