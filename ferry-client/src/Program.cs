@@ -35,6 +35,30 @@ namespace Ferry
             var appDir = AppDomain.CurrentDomain.BaseDirectory;
             var cfgPath = Path.Combine(appDir, "config.json");
 
+            // 兜底：当前目录没有 config.json，但标准安装目录里有 —— 用安装目录那份。
+            //
+            // 为什么需要：分发过「单个 exe」让人拷到桌面覆盖更新，用户很可能
+            // 直接双击了桌面上那个 exe。那时 BaseDirectory 是桌面，配置一个都
+            // 读不到，界面显示「未激活」+ 弹「配置里没有门户地址」——
+            // 看起来像激活信息被更新搞丢了（实际安装目录里的 config.json 完好）。
+            // 与其解释，不如让它自己找到正确的配置。
+            if (!File.Exists(cfgPath))
+            {
+                try
+                {
+                    var installed = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "Ferry");
+                    var icfg = Path.Combine(installed, "config.json");
+                    if (File.Exists(icfg))
+                    {
+                        appDir = installed.TrimEnd('\\') + "\\";
+                        cfgPath = icfg;
+                    }
+                }
+                catch (Exception) { }
+            }
+
             // 静默卸载：给 Inno Setup 的 [UninstallRun] 用。
             // 必须走本程序而不是让安装器直接删文件 —— 卸载器不懂得
             // 要把系统代理还原、要杀掉还活着的 ssh/node。

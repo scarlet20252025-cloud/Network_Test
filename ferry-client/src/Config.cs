@@ -80,10 +80,10 @@ namespace Ferry
         public static Cfg Load(string path)
         {
             var c = new Cfg();
-            if (!File.Exists(path)) return c;
+            var text = ReadWithBackup(path);
+            if (text == null) return c;
             try
             {
-                var text = File.ReadAllText(path, Encoding.UTF8);
                 var d = MiniJson.ParseObject(text);
                 c.RemoteHost = MiniJson.Str(d, "remoteHost", "10.13.24.1");
                 c.AccountIp = MiniJson.Str(d, "accountIp", "");
@@ -143,10 +143,42 @@ namespace Ferry
             sb.Append("  \"relayPort\": ").Append(RelayPort).Append("\n");
             sb.Append("}\n");
             var tmp = path + ".tmp";
-            File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));
+            var body = sb.ToString();
+            File.WriteAllText(tmp, body, new UTF8Encoding(false));
             // 先写临时文件再换名：写到一半被关机，旧配置还在。
             if (File.Exists(path)) File.Delete(path);
             File.Move(tmp, path);
+
+            // 再存一份备份。为什么：config.json 里是**激活令牌**，丢了用户就得
+            // 重新找管理员要密钥（真实发生过一次，用户直接炸了）。
+            // 备份只在「保存成功」时刷新，所以它永远是至少能用一次的那份。
+            try
+            {
+                File.WriteAllText(path + ".bak", body, new UTF8Encoding(false));
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// 读配置：主文件坏了/没了就退回 .bak。
+        /// 返回 null 表示两份都不可用（调用方用默认值）。
+        /// </summary>
+        static string ReadWithBackup(string path)
+        {
+            var candidates = new string[] { path, path + ".bak" };
+            foreach (var f in candidates)
+            {
+                try
+                {
+                    if (!File.Exists(f)) continue;
+                    var t = File.ReadAllText(f, Encoding.UTF8);
+                    // 粗校验：至少要有 token/portalUrl 这类字段，防止读到半截文件
+                    if (t.IndexOf('{') < 0 || t.IndexOf('}') < 0) continue;
+                    return t;
+                }
+                catch (Exception) { }
+            }
+            return null;
         }
 
         static string Quote(string s)

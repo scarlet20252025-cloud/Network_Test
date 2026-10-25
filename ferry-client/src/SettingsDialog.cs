@@ -129,15 +129,19 @@ namespace Ferry
                 var exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "渡口助手.exe");
                 if (!File.Exists(exe)) return;
 
-                // /SC ONLOGON = 登录时触发；/F = 已存在就覆盖。
+                // 计划任务只在**已经是管理员**时才尝试。
                 //
-                // /RL HIGHEST 只在当前进程已经是管理员时才加：
-                // 普通用户建「最高权限」任务会被拒绝访问（schtasks 返回非 0）。
-                // 0.9.6 起客户端是 asInvoker，纯代理模式普通权限就够。
-                var rl = Elevator.IsAdmin() ? " /RL HIGHEST" : "";
-                var args = "/Create /TN \"" + TaskName + "\" /TR \"\\\"" + exe + "\\\"\" " +
-                           "/SC ONLOGON" + rl + " /F";
-                var code = RunHidden("schtasks.exe", args);
+                // 为什么：普通用户建 /SC ONLOGON 的任务会被拒绝（要「作为批处理
+                // 作业登录」之类的权限，实测 schtasks 直接返回非 0），
+                // 而 0.9.6 起客户端是 asInvoker —— 启动文件夹里的快捷方式
+                // **不会再弹 UAC**，反而比计划任务更适合普通用户。
+                var code = 1;
+                if (Elevator.IsAdmin())
+                {
+                    var args = "/Create /TN \"" + TaskName + "\" /TR \"\\\"" + exe + "\\\"\" " +
+                               "/SC ONLOGON /RL HIGHEST /F";
+                    code = RunHidden("schtasks.exe", args);
+                }
 
                 if (code != 0)
                 {
@@ -155,13 +159,15 @@ namespace Ferry
                         sc.WindowStyle = 7;
                         sc.Save();
                     }
-                    MessageBox.Show(
-                        "无法创建计划任务（可能被组策略禁用），已退回启动文件夹方式。\r\n\r\n" +
-                        "区别：启动文件夹方式每次开机都会弹一次「是否允许此应用更改你的设备」，" +
-                        "需要你点「是」才能就绪。\r\n\r\n" +
-                        "如果不想每次点，可以在「设置 → 是否开启全局接管」里关掉 TUN，\r\n" +
-                        "改用普通权限运行本程序（此时不需要管理员，也不会弹窗）。",
-                        "渡口", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    // 普通用户走启动文件夹是**预期路径**，不是故障，不该弹框打扰；
+                    // 只有「已经是管理员却建任务失败」（组策略禁用任务计划）才提示一次。
+                    if (Elevator.IsAdmin())
+                    {
+                        MessageBox.Show(
+                            "无法创建计划任务（可能被组策略禁用），已退回启动文件夹方式。\r\n\r\n" +
+                            "开机时可能会弹一次 UAC。",
+                            "渡口", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
                 }
             }
             catch (Exception) { }

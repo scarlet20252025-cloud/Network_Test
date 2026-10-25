@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "0.9.7"
+#define AppVersion "0.9.8"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -138,8 +138,13 @@ Name: "{autodesktop}\渡口助手";  Filename: "{app}\{#AppExeName}"; WorkingDir
 ;
 ; 客户端 0.9.6 起是 asInvoker，CreateProcess 直接就能起来，
 ; 不再需要 shellexec，也不会再有「错误代码 740」。
+;
+; ⚠ 绝对不能加 skipifsilent：
+;   自动更新调的是 `Ferry-Setup-x.y.z.exe /SILENT /NORESTART /CLOSEAPPLICATIONS`，
+;   skipifsilent 会把这条 [Run] 正好跳过 —— 客户端先退出了、安装包又不启动它，
+;   表现就是「更新完就没了」。
 Filename: "{app}\{#AppExeName}"; Description: "立即启动渡口助手"; \
-  Flags: postinstall nowait skipifsilent
+  Flags: postinstall nowait
 
 [UninstallRun]
 ; 交给程序自己清：还原原代理 → 杀隧道/代理进程 → 删自启（含计划任务）
