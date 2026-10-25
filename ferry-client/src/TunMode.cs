@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using Microsoft.Win32;
 
 namespace Ferry
 {
@@ -157,6 +158,73 @@ namespace Ferry
         ///   预置配置里的端口一旦不对，TUN 就会把所有流量导进一个死端口 ——
         ///   表现是「开了 TUN 之后彻底断网」，比不开还糟。
         /// </summary>
+        // ── Windows「已连接但无 Internet」检测 ──
+        //
+        // 现象：开了全局接管、实际能上网，但 Windows 网络图标还挂着「无法访问
+        // Internet」，部分软件（自己的连通性检测跟的是系统状态 API）也跟着报断网。
+        //
+        // 为什么：系统的 NCSI（Network Connectivity Status Indicator）会去请求
+        // www.msftconnecttest.com；但 NCSI 是 **NlaSvc 服务** 发的，它按物理网卡
+        // 的 NLA 判定走，不一定进 TUN —— 校园网物理链路本来就没有外网，
+        // 探测必然失败，于是系统判「无 Internet」（而流量其实都从 TUN 走了）。
+        // 实测：经客户端代理访问同一个 URL 是 200「Microsoft Connect Test」。
+        //
+        // 做法：TUN 期间把主动探测关掉（EnableActiveProbing=0），停止时恢复原值。
+        // 原值同时写进 ncsi.bak —— 客户端被强杀时下次启动还能恢复，不会永久关闭。
+        // 副作用要说清楚：关掉之后，**任何**网络都不再显示「无 Internet」，
+        // 所以客户端自己的状态行才是唯一线索。
+        const string NcsiKey = @"SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet";
+        const string NcsiVal = "EnableActiveProbing";
+
+        static string NcsiBakPath(string appDir)
+        {
+            return Path.Combine(appDir, "ncsi.bak");
+        }
+
+        public static void MuteNcsiProbing(string appDir)
+        {
+            try
+            {
+                using (var k = Registry.LocalMachine.OpenSubKey(NcsiKey, true))
+                {
+                    if (k == null) return;
+                    var cur = k.GetValue(NcsiVal);
+                    // 已经是 0 说明被人改过（可能是上次没恢复）—— 不覆盖备份
+                    if (cur != null && Convert.ToInt32(cur) == 0)
+                    {
+                        if (!File.Exists(NcsiBakPath(appDir))) return;
+                    }
+                    else
+                    {
+                        File.WriteAllText(NcsiBakPath(appDir),
+                            cur == null ? "" : Convert.ToString(cur));
+                    }
+                    k.SetValue(NcsiVal, 0, RegistryValueKind.DWord);
+                }
+            }
+            catch (Exception) { }
+        }
+
+        public static void RestoreNcsiProbing(string appDir)
+        {
+            var bak = NcsiBakPath(appDir);
+            try
+            {
+                if (!File.Exists(bak)) return;
+                var raw = File.ReadAllText(bak).Trim();
+                using (var k = Registry.LocalMachine.OpenSubKey(NcsiKey, true))
+                {
+                    if (k != null)
+                    {
+                        if (raw.Length == 0) k.DeleteValue(NcsiVal, false);
+                        else k.SetValue(NcsiVal, int.Parse(raw), RegistryValueKind.DWord);
+                    }
+                }
+                File.Delete(bak);
+            }
+            catch (Exception) { }
+        }
+
         string BuildConfig(int socksPort, string udpHost, int udpPort)
         {
             var sb = new StringBuilder();
@@ -368,7 +436,12 @@ namespace Ferry
                     return "TUN 建网卡失败：" + _fatalError +
                            "。多半是上次残留的 FerryTun 网卡没清掉，重启一次电脑或手动删除网卡即可。";
                 }
-                if (AdapterExists("FerryTun")) { _running = true; return ""; }
+                if (AdapterExists("FerryTun"))
+                {
+                    _running = true;
+                    MuteNcsiProbing(_appDir);
+                    return "";
+                }
             }
 
             Stop();
@@ -377,6 +450,7 @@ namespace Ferry
 
         public void Stop()
         {
+            RestoreNcsiProbing(_appDir);
             _running = false;
             var p = _proc;
             _proc = null;

@@ -1,3 +1,44 @@
+## v0.13.4 — 2026-10-26
+
+> 客户端 0.9.7。修「全局接管开着、实际能上网，但系统和软件都说断网」。
+
+### 现象与根因
+
+开 TUN 之后，Windows 网络图标挂着「无法访问 Internet」，部分软件
+（跟着系统 Connectivity API 走的那些）也报断网 —— 但网页、下载都正常。
+
+实测定位（同一时刻、同一台机）：
+
+| 路径 | 结果 |
+|---|---|
+| 经客户端代理 `http://127.0.0.1:10801` 访问 `www.msftconnecttest.com/connecttest.txt` | **200 `Microsoft Connect Test`** |
+| 直连同一 URL | 000（8 秒超时） |
+| `Get-NetConnectionProfile` | `FerryTun` / `ferry-wg` / WLAN 全部 "无 Internet" |
+
+所以链路是通的，问题在 **NCSI（Network Connectivity Status Indicator）**：
+探测由 `NlaSvc` 服务发起，按物理网卡的 NLA 判定走，不一定进 TUN ——
+校园网物理链路本来就没有外网，探测必然失败，于是系统判「无 Internet」。
+
+### 做法
+
+TUN 起来后把主动探测关掉（`HKLM\...\NlaSvc\Parameters\Internet\EnableActiveProbing = 0`），
+停止 TUN 时恢复原值：
+
+- 原值写进 `%LOCALAPPDATA%\Ferry\ncsi.bak`，客户端被强杀也能在下次启动时恢复
+  （`Program.Main` 里会先调一次 `RestoreNcsiProbing`）
+- 已经是 0（别人改过）就不覆盖备份值
+- 只在 TUN 成功起来之后才改；TUN 启动失败不碰注册表
+
+**副作用必须说清楚**：关掉之后，任何网络都不会再显示「无 Internet」——
+真断网时系统不提示了。所以客户端的「无网络」状态行成了唯一线索。
+这是取舍：比起「明明能上却到处报断网」，宁可少一个系统提示。
+
+### 同批
+
+- 客户端 0.9.7 / 安装包 `Ferry-Setup-0.9.7.exe`（17.7 MB）已上传远端，
+  `version.json` → 0.9.7
+- 安装包改为 per-user（`PrivilegesRequired=lowest`）+ 不再弹语言选择
+
 ## v0.13.3 — 2026-10-26
 
 > 客户端 0.9.6（per-user 安装、按需提权）+ 管理面板改版。

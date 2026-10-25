@@ -144,6 +144,10 @@ namespace Ferry
                 }
                 catch (Exception) { }
 
+                // 上次可能因为崩溃没来得及恢复 NCSI 探测开关（TUN 期间被静音）。
+                // 启动时先恢复原状：真要开 TUN，Start() 会重新静音。
+                try { TunMode.RestoreNcsiProbing(appDir); } catch (Exception) { }
+
                 var form = new MainForm(cfgPath, appDir);
                 form.StartBorrowOnLoad = HasArg(args, "/start") || HasArg(args, "-start");
                 Application.Run(form);
