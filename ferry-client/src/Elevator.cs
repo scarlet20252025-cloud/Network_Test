@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Text;
 using System.Windows.Forms;
 
 namespace Ferry
@@ -31,38 +32,69 @@ namespace Ferry
         ///   让 powershell 等 1.2 秒再起，旧进程那时已经退干净。
         ///   不用 cmd /c start，因为它没法带 UAC 提权。
         /// </summary>
+        /// <summary>
+        /// 以管理员身份重启本程序，然后退出当前进程。
+        ///
+        /// 为什么不能直接 Process.Start(Verb = runas)：
+        ///   本进程在一个 Job Object 里（JobKeeper 建的，带
+        ///   JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 且没有 BREAKAWAY_OK）。
+        ///   在 Job 上下文里，ShellExecute 的提权请求会**静默失败并回退成
+        ///   普通权限启动** —— 新实例确实起来了，但 IsAdmin() 仍是 false，
+        ///   报「TUN 需要管理员权限」。（实测日志：提权重启后新实例仍无权限）
+        ///
+        /// 所以这里改用 WMI 的 Win32_Process.Create 启动一个 powershell：
+        ///   · 它的父进程是 WmiPrvSE.exe，**完全不在我们的 Job 里**
+        ///   · 再由它 Start-Process -Verb RunAs，提权才真的生效
+        ///   · 整个过程中转进程和 GUI 无关，加 -WindowStyle Hidden 不闪窗
+        /// </summary>
         public static void RestartElevated(string extraArgs)
         {
             string exe = Application.ExecutablePath;
-            var psi = new ProcessStartInfo(exe, extraArgs);
-            // ⚠ UseShellExecute = true 是这里的**关键**，不是随手写的：
-            //   · false 时 CreateProcess 启动的 powershell/子进程会进本进程的
-            //     Job Object（JobKeeper 把 ssh / mihomo 都放进去），而我们一退出
-            //     Windows 就把整个 Job 杀掉 —— 那个"延迟 1.2 秒再启动"的
-            //     powershell 也被一起毙了，结果就是「点了重启，程序只是退出了」。
-            //     （真实踩到：用户反馈"重启还是只是退出了没重启成功"）
-            //   · true 走 ShellExecute，新进程的父是 explorer，完全独立；
-            //     同时 Verb=runas 才能触发 UAC 提权。
-            psi.UseShellExecute = true;
-            psi.Verb = "runas";
-            try { psi.WorkingDirectory = System.IO.Path.GetDirectoryName(exe); }
-            catch (Exception) { }
+            string ps = "Start-Sleep -Milliseconds 700; " +
+                        "Start-Process -FilePath '" + exe + "'" +
+                        " -ArgumentList '" + extraArgs + "' -Verb RunAs";
+            string cmdLine = "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command \"" + ps + "\"";
 
+            bool ok = false;
             try
             {
-                Process.Start(psi);
+                using (var mc = new System.Management.ManagementClass("Win32_Process"))
+                {
+                    var inParams = mc.GetMethodParameters("Create");
+                    inParams["CommandLine"] = cmdLine;
+                    var outParams = mc.InvokeMethod("Create", inParams, null);
+                    var rc = outParams != null ? Convert.ToInt32(outParams["ReturnValue"]) : -1;
+                    ok = (rc == 0);
+                }
             }
-            catch (Exception e)
+            catch (Exception) { ok = false; }
+
+            if (!ok)
             {
-                // 用户在 UAC 上点了"否"：别退出，继续用普通模式，
-                // 并且把原因说清楚（不然又是一次"点了没反应"）。
+                // WMI 被禁用（精简版系统偶见）：退回 explorer 启动一个 .cmd，
+                // explorer 同样不在我们的 Job 里。
+                try
+                {
+                    var bat = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                                                     "ferry-elevate.cmd");
+                    System.IO.File.WriteAllText(bat,
+                        "@echo off\r\ntimeout /t 1 /nobreak >nul\r\n" +
+                        "powershell -NoProfile -WindowStyle Hidden -Command \"" +
+                        ps.Replace("'", "''") + "\"\r\n", Encoding.Default);
+                    Process.Start("explorer.exe", "\"" + bat + "\"");
+                    ok = true;
+                }
+                catch (Exception) { }
+            }
+
+            if (!ok)
+            {
                 MessageBox.Show(
-                    "以管理员身份重启失败（多半是 UAC 上点了「否」）：\r\n" + e.Message +
-                    "\r\n\r\n可以手动右键程序 →「以管理员身份运行」。",
+                    "没法自动以管理员身份重启（系统不允许创建外部进程）。\r\n\r\n" +
+                    "请手动：关闭程序 → 右键「以管理员身份运行」。",
                     "渡口", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            // 已经拉起新进程，旧的必须立刻走 —— 否则单实例锁会把它挡在门外。
             Environment.Exit(0);
         }
     }
