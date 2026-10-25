@@ -1248,119 +1248,111 @@ def download_page(detected_ip=''):
 </nav>
 
 <div class="dlwrap">
-  <div class="dlhero">
-    <h1>下载渡口客户端</h1>
-    <p class="sub">Windows 10 / 11 &#183; 免安装运行库 &#183; 装完就能用</p>
-  </div>
 
-  <div class="dlbox">
-    <!-- 主按钮走 /download-cmd：返回一个十几行的 .cmd，它用 WebClient 把安装包
-         拉到本地再启动。程序化下载**不会打 MOTW**，所以全程不触发 SmartScreen。
-         直接下载 exe 的按钮保留在下面 —— 有人就想拿到文件本身。 -->
-    <a class="btn btn-main" href="/download-cmd" style="font-size:15px;padding:13px 30px">
-      &#9889; 一键安装（推荐）
-    </a>
-    <div class="hint" style="margin-top:10px">
-      下载一个十几行的 <code>.cmd</code>，双击它就会自动下载并打开安装程序 &mdash;&mdash;
-      <b>不会出现「Windows 已保护你的电脑」</b>。脚本可以右键「编辑」看清每一行。
-    </div>
-    <div style="margin-top:12px;font-size:12.5px">
-      或者
-      <a href="/download" style="color:var(--fg2)">直接下载安装包</a>
-      <span class="hint">（会触发 SmartScreen，下面有说明）</span>
-    </div>
-    <div class="meta">
-      <span class="chip">版本 <b>vLATEST</b></span>
-      <span class="chip">大小 <b>SIZE</b></span>
-      <span class="chip">Windows 10 / 11</span>
-      <span class="chip">免安装运行库</span>
-    </div>
-    <div class="warnbox">
-      下载完成后请确认文件大小约 <b>SIZE</b>。<br>
-      如果只有 0 KB，说明下载被中断了 &mdash;&mdash; 删掉那个文件重新点一次。
-      双击 0 KB 的文件会提示「此应用无法在你的电脑上运行」。
-    </div>
-  </div>
-
-  <div class="card">
-    <h2 style="margin-top:0">三步用起来</h2>
-    <div class="step"><div class="n">1</div><div class="t">
-      <b>下载安装包</b><div class="hint">点「一键安装」那个按钮最省事。
-        安装包文件名里已经带了你的账号，下载后不要改名（改了也能用，安装时会让你手填 IP）。</div>
-    </div></div>
-    <div class="step"><div class="n">2</div><div class="t">
-      <b>双击安装</b><div class="hint">全程不需要管理员权限，也不会弹 UAC &mdash;&mdash;
-        装到你自己的用户目录，装完直接启动。向导会问要不要建桌面图标、
-        要不要开机自启。</div>
-    </div></div>
-    <div class="step"><div class="n">3</div><div class="t">
-      <b>在软件里输入密钥</b><div class="hint">打开「渡口助手」，把管理员给你的
-        8 位密钥填进「输入密钥激活」，点激活。之后就不用再输了。</div>
-    </div></div>
-  </div>
-
-  <div class="card">
-    <h2 style="margin-top:0">下载后提示「Windows 已保护你的电脑」？</h2>
-    <div style="font-size:13.5px;line-height:1.8">
-      这是 SmartScreen 对<strong>未经代码签名</strong>的 exe 的例行拦截，不是病毒。
-      三种处理方式，任选一种：
-    </div>
-    <div class="step"><div class="n">1</div><div class="t">
-      <b>用命令行下载（不触发拦截，推荐）</b>
-      <div class="hint">按 Win+R 输入 <code>powershell</code> 回车，粘贴下面这行：</div>
-      <div class="cmdbox">Invoke-WebRequest 'http://10.13.24.1:8080/download' -OutFile "$env:USERPROFILE\\D\\Downloads\\Ferry-Setup.exe"; Start-Process "$env:USERPROFILE\\D\\Downloads\\Ferry-Setup.exe"</div>
-      <div class="hint" style="margin-top:6px">
-        浏览器会给下载的文件打上「来自 Internet」的标记（MOTW），SmartScreen 只查带标记的 exe。
-        用 PowerShell 直接下载不带这个标记，所以不会弹窗。
+  <div class="dl-hero">
+    <div class="dl-hero-l">
+      <h1>下载渡口客户端</h1>
+      <p>校园网被限制上网时，借一台能上网的机器的出口。<br>
+         装一次，之后点一下就能接通 &mdash;&mdash; 不用改任何网络配置。</p>
+      <div class="dl-actions">
+        <a class="btn btn-main" href="/download-cmd">&#9889; 一键安装</a>
+        <a class="btn btn-ghost" href="/download">直接下载 .exe</a>
       </div>
-    </div></div>
-    <div class="step"><div class="n">2</div><div class="t">
-      <b>已经下载了：解除锁定</b>
-      <div class="hint">右键那个 exe &rarr; 属性 &rarr; 最下面勾选「解除锁定」&rarr; 确定 &rarr; 再双击。</div>
-    </div></div>
-    <div class="step"><div class="n">3</div><div class="t">
-      <b>直接点「更多信息 &rarr; 仍要运行」</b>
-      <div class="hint">SmartScreen 弹窗左下角有「更多信息」，展开后出现「仍要运行」。
-        同一个文件点过一次就不再问。</div>
-    </div></div>
+      <div class="dl-trust">
+        <span>不需要管理员权限</span>
+        <span>不弹 UAC</span>
+        <span>升级不丢激活</span>
+      </div>
+    </div>
+
+    <div class="dl-card">
+      <div class="dl-row"><span>当前版本</span><b>vLATEST</b></div>
+      <div class="dl-row"><span>安装包大小</span><b>SIZE</b></div>
+      <div class="dl-row"><span>系统要求</span><b>Win10 / 11 x64</b></div>
+      <div class="dl-row"><span>安装位置</span><b>当前用户目录</b></div>
+      <div class="dl-tip">
+        <b>推荐点「一键安装」</b>：下载一个十几行的脚本，双击它会自动拉取安装包并启动
+        &mdash;&mdash; 全程<b>不会出现「Windows 已保护你的电脑」</b>。脚本可以右键「编辑」看清每一行。
+      </div>
+    </div>
   </div>
 
-  <div class="card">
-    <details>
-      <summary style="cursor:pointer;font-size:14px;font-weight:600;outline:none">
-        历史版本（OLDER_COUNT 个）
-        <span class="hint" style="font-weight:400;margin-left:6px">新版本有问题时可以装回旧版</span>
-      </summary>
-      <div style="margin-top:6px">OLDER_HTML</div>
+  <div class="dl-steps">
+    <div class="dl-step">
+      <i>1</i><b>点「一键安装」</b>
+      <p>拿到一个 <code>.cmd</code> 脚本，双击它就会自动下载安装包并打开安装程序。</p>
+    </div>
+    <div class="dl-step">
+      <i>2</i><b>跟着向导走</b>
+      <p>不需要管理员，不会弹 UAC。可以顺手勾上桌面图标和开机自启。</p>
+    </div>
+    <div class="dl-step">
+      <i>3</i><b>输入密钥</b>
+      <p>打开「渡口助手」，把管理员给的 8 位密钥填进去激活，之后就不用再输。</p>
+    </div>
+  </div>
+
+  <div class="dl-folds">
+
+    <details class="dl-fold">
+      <summary>下载后提示「Windows 已保护你的电脑」？<span class="hint">三种解法，其实一键安装已经绕过了</span></summary>
+      <div class="inner">
+        这是 SmartScreen 对<strong>未经代码签名</strong>的 exe 的例行拦截，不是病毒。
+        只有在「直接下载 .exe」时才会遇到；一键安装不受影响。三种处理方式任选：
+        <div class="step"><div class="n">1</div><div class="t">
+          <b>用命令行下载（不触发拦截）</b>
+          <div class="hint">按 Win+R 输入 <code>powershell</code> 回车，粘贴这行：</div>
+          <div class="cmdbox">Invoke-WebRequest 'http://10.13.24.1:8080/download' -OutFile "$env:TEMP\Ferry-Setup.exe"; Start-Process "$env:TEMP\Ferry-Setup.exe"</div>
+          <div class="hint" style="margin-top:6px">
+            浏览器下载会给文件打上「来自 Internet」的标记（MOTW），SmartScreen 只查带标记的 exe。
+            PowerShell 直接下载不带这个标记。
+          </div>
+        </div></div>
+        <div class="step"><div class="n">2</div><div class="t">
+          <b>已经下载了：解除锁定</b>
+          <div class="hint">右键那个 exe &rarr; 属性 &rarr; 最下面勾「解除锁定」&rarr; 确定 &rarr; 再双击。</div>
+        </div></div>
+        <div class="step"><div class="n">3</div><div class="t">
+          <b>点「更多信息 &rarr; 仍要运行」</b>
+          <div class="hint">弹窗左下角有「更多信息」，展开后出现「仍要运行」。同一个文件点过一次就不再问。</div>
+        </div></div>
+      </div>
     </details>
-  </div>
 
-  <div class="card">
-    <details>
-      <summary style="cursor:pointer;font-size:14px;font-weight:600;outline:none">
-        更新日志
-        <span class="hint" style="font-weight:400;margin-left:6px">每个版本改了什么</span>
-      </summary>
-      <div style="margin-top:8px;max-height:520px;overflow:auto;
-           font-size:13px;line-height:1.75">LOG_HTML</div>
+    <details class="dl-fold">
+      <summary>密钥规则<span class="hint">一次性 · 12 小时内用掉 · 输错锁定</span></summary>
+      <div class="inner">
+        <div class="kv"><div class="k">一次性</div><div class="v">激活成功即失效，换机器要找管理员要新密钥。</div></div>
+        <div class="kv"><div class="k">有效期</div><div class="v">密钥本身 12 小时内必须用掉；激活后的授权时长由管理员设定（默认 30 天）。</div></div>
+        <div class="kv"><div class="k">限速</div><div class="v">每台机器默认 10 MB/s，由服务端执行；连续输错密钥会被临时锁定 15 分钟。</div></div>
+      </div>
     </details>
-  </div>
 
-  <div class="card">
-    <h2 style="margin-top:0">密钥规则</h2>
-    <div class="kv"><div class="k">一次性</div><div class="v">
-      激活成功即失效。换机器需要向管理员要新密钥。</div></div>
-    <div class="kv"><div class="k">有效期</div><div class="v">
-      密钥本身 12 小时内必须用掉；激活后的授权时长由管理员设定（默认 30 天）。</div></div>
-    <div class="kv"><div class="k">限速</div><div class="v">
-      连续输错会被临时锁定 15 分钟。</div></div>
+    <details class="dl-fold">
+      <summary>历史版本（OLDER_COUNT 个）<span class="hint">新版本有问题时可以装回旧版</span></summary>
+      <div class="inner">OLDER_HTML</div>
+    </details>
+
+    <details class="dl-fold">
+      <summary>更新日志<span class="hint">每个版本改了什么</span></summary>
+      <div class="inner" style="max-height:560px;overflow:auto">LOG_HTML</div>
+    </details>
+
+    <details class="dl-fold">
+      <summary>下载中断 / 文件大小不对<span class="hint">0 KB 或明显偏小怎么办</span></summary>
+      <div class="inner">
+        下载完成后确认文件大小约 <b>SIZE</b>。如果只有 0 KB，说明下载被中断了 &mdash;&mdash;
+        删掉那个文件重新点一次。双击 0 KB 的文件会提示「此应用无法在你的电脑上运行」。
+      </div>
+    </details>
+
   </div>
 </div>
 """.replace('LATEST', html.escape(latest_ver))
    .replace('SIZE', html.escape(size_txt))
    .replace('OLDER_COUNT', str(len(older)))
    .replace('OLDER_HTML', older_html)
-   .replace('LOG_HTML', log_html))
+   .replace('LOG_HTML', log_html)) 
 
 
 def feedback_page(detected_ip='', msg='', err=''):
@@ -2305,6 +2297,61 @@ tr.fb-more>td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accen
 .newcode>summary::-webkit-details-marker{display:none}
 .newcode[open]>summary{margin-bottom:6px}
 .newcode form{margin-top:4px}
+
+/* ── 下载页（v0.9.12 改版）──
+   原来是「居中标题 + 一摞同宽卡片」，三段 SmartScreen 说明 + 三步 + 密钥规则
+   全平铺，一屏塞不下重点也看不出来。改成双栏 hero（左文案右版本卡）+
+   三列步骤 + 其余全部折叠。 */
+.dlwrap{max-width:900px;margin:0 auto}
+.dl-hero{display:grid;grid-template-columns:1.3fr .7fr;gap:26px;align-items:start;
+  padding:14px 0 4px}
+@media(max-width:820px){.dl-hero{grid-template-columns:1fr;gap:18px}}
+.dl-hero-l h1{font-size:31px;line-height:1.25;margin:0 0 12px;font-weight:800;
+  letter-spacing:-.4px}
+.dl-hero-l p{font-size:14px;color:var(--fg2);line-height:1.8;margin:0;max-width:460px}
+.dl-actions{display:flex;gap:10px;flex-wrap:wrap;margin:24px 0 18px}
+.dl-trust{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--fg2)}
+.dl-trust span{display:inline-flex;align-items:center;gap:5px}
+.dl-trust span::before{content:'\2713';color:var(--accent);font-weight:700}
+
+.dl-card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:18px 20px;box-shadow:var(--shadow)}
+.dl-row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;
+  padding:10px 0;border-bottom:1px dashed var(--line);font-size:13px}
+.dl-row:last-of-type{border-bottom:0}
+.dl-row span{color:var(--fg2);font-size:12px}
+.dl-row b{font-family:Consolas,Monaco,monospace;font-weight:700;font-size:13.5px}
+.dl-tip{margin-top:14px;font-size:11.5px;color:var(--fg2);line-height:1.75;
+  background:var(--card2);border:1px solid var(--line);border-radius:10px;
+  padding:11px 12px}
+.dl-tip b{color:var(--accent)}
+
+.dl-steps{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:22px 0 16px}
+@media(max-width:760px){.dl-steps{grid-template-columns:1fr}}
+.dl-step{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:16px;transition:border-color .15s}
+.dl-step:hover{border-color:var(--line2)}
+.dl-step i{display:inline-flex;width:24px;height:24px;border-radius:8px;
+  background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent);
+  font-style:normal;font-weight:700;font-size:12px;align-items:center;justify-content:center}
+.dl-step b{display:block;margin:11px 0 6px;font-size:13.5px}
+.dl-step p{margin:0;font-size:12.5px;color:var(--fg2);line-height:1.7}
+
+.dl-folds{display:flex;flex-direction:column;gap:10px;margin-top:4px}
+.dl-fold{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:0 18px}
+.dl-fold>summary{cursor:pointer;list-style:none;padding:15px 0;font-size:13.5px;
+  font-weight:600;display:flex;align-items:center;gap:9px;outline:none;
+  user-select:none}
+.dl-fold>summary::-webkit-details-marker{display:none}
+.dl-fold>summary::before{content:'+';color:var(--accent);font-weight:700;
+  width:13px;flex:0 0 auto;font-size:15px;line-height:1}
+.dl-fold[open]>summary::before{content:'\2212'}
+.dl-fold[open]>summary{border-bottom:1px solid var(--line);margin-bottom:12px}
+.dl-fold>summary .hint{font-weight:400;margin-left:2px}
+.dl-fold .inner{padding:0 0 16px;font-size:13px;line-height:1.8}
+.dl-fold .inner .step{margin:12px 0 0}
+.dl-fold .inner .step .n{width:22px;height:22px;line-height:22px;font-size:11px}
 
 /* 授权档位：一排可选按钮，比下拉框少一次点击 */
 .tiers{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 0}

@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "0.9.12"
+#define AppVersion "0.9.13"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -319,6 +319,66 @@ begin
   begin
     Exec(OldExe, '/stop', '', SW_HIDE, ewWaitUntilTerminated, R);
     Sleep(900);
+  end;
+end;
+
+{ 旧版（requireAdministrator 时代）的进程是**管理员**进程，
+  而本安装器是普通权限 —— 杀不掉它，文件也就替换不了。
+  用户看到的是 Inno 的原始错误：
+      DeleteFile 失败；错误代码 5。拒绝访问。
+  三个技术选项（重试/跳过/取消）没人看得懂。实测 0.9.2 的用户就撞在这里。
+
+  这里在真正开始安装前再确认一次，并给出两条可执行的路。 }
+function ProcessStillRunning(): Boolean;
+var
+  R, N: Integer;
+  Tmp, S: string;
+  Raw: AnsiString;
+begin
+  Result := False;
+  Tmp := ExpandConstant('{tmp}\ferry_proc.txt');
+  DeleteFile(Tmp);
+  Exec('powershell.exe',
+    '-NoProfile -NonInteractive -Command "' +
+    '$c=@(Get-Process -Name ''渡口助手'' -ErrorAction SilentlyContinue).Count; ' +
+    'Set-Content -Path ''' + Tmp + ''' -Value $c -Encoding ASCII"',
+    '', SW_HIDE, ewWaitUntilTerminated, R);
+  if FileExists(Tmp) then
+  begin
+    Raw := '';
+    if LoadStringFromFile(Tmp, Raw) then
+    begin
+      S := Trim(string(Raw));
+      N := StrToIntDef(S, 0);
+      Result := N > 0;
+    end;
+    DeleteFile(Tmp);
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  R: Integer;
+  OldExe: string;
+begin
+  Result := '';
+  OldExe := ExpandConstant('{localappdata}\Ferry\{#AppExeName}');
+
+  { 最后再试一次让它自己退：新版认识 /stop，会先还原系统代理再退出。 }
+  if FileExists(OldExe) then
+  begin
+    Exec(OldExe, '/stop', '', SW_HIDE, ewWaitUntilTerminated, R);
+    Sleep(800);
+  end;
+
+  if ProcessStillRunning() then
+  begin
+    Result :=
+      '「渡口助手」还在运行，安装程序没法替换它的文件。' + #13#10 + #13#10 +
+      '如果它是以管理员身份启动的旧版本，普通权限的安装程序关不掉它。' + #13#10 + #13#10 +
+      '请任选一种，然后重新安装：' + #13#10 +
+      '  1) 在右下角托盘图标上右键 → 退出' + #13#10 +
+      '  2) 取消安装，右键这个安装包 →「以管理员身份运行」';
   end;
 end;
 
