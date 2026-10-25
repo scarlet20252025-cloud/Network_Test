@@ -4874,7 +4874,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         lines = [
             '@echo off',
-            'chcp 65001 >nul 2>&1',
+            # 文件是 GBK（下面 encode('gbk')），所以代码页也必须是 936。
+            # 原来写的是 chcp 65001（UTF-8）—— 两者一错位，中文全变乱码。
+            'chcp 936 >nul 2>&1',
             'setlocal',
             'title 渡口 · 安装',
             'echo.',
