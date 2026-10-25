@@ -1254,9 +1254,21 @@ def download_page(detected_ip=''):
   </div>
 
   <div class="dlbox">
-    <a class="btn btn-main" href="/download" style="font-size:15px;padding:13px 30px">
-      &#8595; 下载 Windows 客户端
+    <!-- 主按钮走 /download-cmd：返回一个十几行的 .cmd，它用 WebClient 把安装包
+         拉到本地再启动。程序化下载**不会打 MOTW**，所以全程不触发 SmartScreen。
+         直接下载 exe 的按钮保留在下面 —— 有人就想拿到文件本身。 -->
+    <a class="btn btn-main" href="/download-cmd" style="font-size:15px;padding:13px 30px">
+      &#9889; 一键安装（推荐）
     </a>
+    <div class="hint" style="margin-top:10px">
+      下载一个十几行的 <code>.cmd</code>，双击它就会自动下载并打开安装程序 &mdash;&mdash;
+      <b>不会出现「Windows 已保护你的电脑」</b>。脚本可以右键「编辑」看清每一行。
+    </div>
+    <div style="margin-top:12px;font-size:12.5px">
+      或者
+      <a href="/download" style="color:var(--fg2)">直接下载安装包</a>
+      <span class="hint">（会触发 SmartScreen，下面有说明）</span>
+    </div>
     <div class="meta">
       <span class="chip">版本 <b>vLATEST</b></span>
       <span class="chip">大小 <b>SIZE</b></span>
@@ -1273,13 +1285,13 @@ def download_page(detected_ip=''):
   <div class="card">
     <h2 style="margin-top:0">三步用起来</h2>
     <div class="step"><div class="n">1</div><div class="t">
-      <b>下载安装包</b><div class="hint">点上面的按钮。文件名里已经带了你的账号，
-        下载后不要改名（改了也能用，安装时会让你手填 IP）。</div>
+      <b>下载安装包</b><div class="hint">点「一键安装」那个按钮最省事。
+        安装包文件名里已经带了你的账号，下载后不要改名（改了也能用，安装时会让你手填 IP）。</div>
     </div></div>
     <div class="step"><div class="n">2</div><div class="t">
-      <b>双击安装</b><div class="hint">安装时会弹一次「是否允许更改设备」&mdash;&mdash;
-        这是必需的，TUN 全局接管要建虚拟网卡。向导会问要不要建桌面图标、
-        要不要开机自启，装完可以直接启动。</div>
+      <b>双击安装</b><div class="hint">全程不需要管理员权限，也不会弹 UAC &mdash;&mdash;
+        装到你自己的用户目录，装完直接启动。向导会问要不要建桌面图标、
+        要不要开机自启。</div>
     </div></div>
     <div class="step"><div class="n">3</div><div class="t">
       <b>在软件里输入密钥</b><div class="hint">打开「渡口助手」，把管理员给你的

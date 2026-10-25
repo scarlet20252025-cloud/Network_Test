@@ -1,4 +1,4 @@
-﻿; ═══════════════════════════════════════════════════════════════════════
+; ═══════════════════════════════════════════════════════════════════════
 ;  渡口 Ferry · Windows 安装程序（Inno Setup 6）
 ;
 ;  架构（v0.8 起）：
@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "0.9.9"
+#define AppVersion "0.9.10"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -132,6 +132,16 @@ Name: "{autodesktop}\渡口助手";  Filename: "{app}\{#AppExeName}"; WorkingDir
 ; 会导致每次开机弹一个 UAC 窗口，必须点「是」才能用 —— 跟「便捷」相反。
 ; 改由 [Run] 里调客户端的 /install-autostart 参数，让它自己建一个
 ; RunLevel=HighestAvailable 的计划任务（不弹 UAC）。见 [Code] 段。
+
+[InstallDelete]
+; 升级时清掉旧交付方式留下的垃圾：
+;   .bak  —— 覆盖更新脚本手工备份的旧 exe
+;   .new  —— 覆盖脚本先放旁边等待替换的那份
+;   *.tmp —— 配置原子写的中转文件（断电可能留下）
+; 不清的话安装目录会越积越多，用户还会看到好几个「渡口助手」。
+Type: files; Name: "{app}\渡口助手.exe.bak"
+Type: files; Name: "{app}\渡口助手.exe.new"
+Type: files; Name: "{app}\*.tmp"
 
 [Run]
 ; 只启动程序。开机自启不在这里设 —— 原因见 [Code] 里 ssPostInstall 的注释。
@@ -291,6 +301,27 @@ end;
     · 枚举网卡在多网卡 / 虚拟网卡 / VPN 环境下很容易挑错那块
   文件名解析保留为兜底 —— 覆盖「装到另一台机器上」的场景。
 }
+{ 升级前先让旧客户端**自己**退出。
+  为什么不用 taskkill：强杀会跳过它的清理 —— 系统代理还指着 127.0.0.1:10801，
+  而那个端口已经没了，用户装完就「整个网都上不去」。
+  /stop 分支会先 RestoreDirect() 还原原代理，再收干净隧道和子进程。
+  为什么不用 CloseApplications：它走 Restart Manager 发关闭消息，而托盘程序
+  在 OnFormClosing 里 cancel（缩到托盘），结果是卡在「请关闭以下程序」。 }
+function InitializeSetup(): Boolean;
+var
+  R: Integer;
+  OldExe: string;
+begin
+  Result := True;
+  { 不用 app 常量：InitializeSetup 阶段它还没定下来，按 DefaultDirName 的拼法构造。 }
+  OldExe := ExpandConstant('{localappdata}\Ferry\{#AppExeName}');
+  if FileExists(OldExe) then
+  begin
+    Exec(OldExe, '/stop', '', SW_HIDE, ewWaitUntilTerminated, R);
+    Sleep(900);
+  end;
+end;
+
 procedure InitializeWizard;
 begin
   AccountIP := '';
@@ -352,6 +383,10 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
+    { 0.9.2 的安装器在公共桌面留过一个「渡口助手」快捷方式，和现在
+      用户桌面那个重复，图标还带着 requireAdministrator 时代的盾牌，
+      用户会以为是两个不同的程序。普通权限删可能被拒，删不掉就算了。 }
+    DeleteFile(ExpandConstant('{commondesktop}\渡口助手.lnk'));
     { 开机自启：写一个标记文件，让客户端启动后自己去建计划任务。
 
       为什么不在 [Run] 里直接调 `渡口助手.exe /install-autostart`：
