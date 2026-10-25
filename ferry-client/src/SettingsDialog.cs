@@ -45,8 +45,7 @@ namespace Ferry
             _onUninstall = onUninstall;
             // 同上：不声明 Dpi 缩放，高 DPI 下文字会被裁（设置页最明显，
             // 因为每个勾选项下面还有一行 8.5pt 的说明）。
-            AutoScaleMode = AutoScaleMode.Dpi;
-            AutoScaleDimensions = new SizeF(96F, 96F);
+            AutoScaleMode = AutoScaleMode.None;
             BuildUi();
             Load += delegate { Theme.FitToScreen(this); };
         }
@@ -450,8 +449,7 @@ namespace Ferry
                 f.MinimizeBox = false;
                 f.BackColor = Theme.Bg;
                 f.Font = Theme.FBody;
-                f.AutoScaleMode = AutoScaleMode.Dpi;
-                f.AutoScaleDimensions = new SizeF(96F, 96F);
+                f.AutoScaleMode = AutoScaleMode.None;
 
                 var title = Theme.Text2("遇到问题，或者有想让它做到的事？", Theme.FBody, Theme.Text);
                 title.SetBounds(20, 16, 420, 24);

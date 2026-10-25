@@ -1,3 +1,35 @@
+## v0.13.8 — 2026-10-26
+
+> 客户端 0.9.14。DPI 换了实现方式，文字不再被裁。
+
+### per-monitor 下 WinForms 的 AutoScale 其实没生效
+
+上一版我加的是 `AutoScaleMode.Dpi + AutoScaleDimensions(96,96)`，但真机截图显示
+文字照样溢出（状态行被按钮压住、底部署名被咬掉半行）。
+
+原因：per-monitor 模式下，Form 在 `PerformAutoScale()` 时还没确定自己落在哪个
+显示器上，`CurrentAutoScaleDimensions` 拿不到正确的 DPI → 缩放因子算成 1.0 →
+控件保持 96 DPI 的像素尺寸，而字体已经按系统 DPI（125%/150%）渲染。
+**字体比控件大**，于是溢出一路到隔壁控件和窗口边缘。
+
+### 改成 System DPI aware
+
+manifest 从 `true/pm + permonitorv2` 退回 `true + system`，由 Windows 把**整个窗口**
+按比例位图放大：
+
+- 布局比例完全不变 → 绝不会裁字
+- 代价：125%/150% 这类非整数缩放下字会略微发虚（位图放大）
+- `FitToScreen` 也改成按物理像素判断（`DeviceDpi / 96`），超出工作区就缩小 + 开滚动
+
+`AutoScaleMode` 相应改成 `None`（系统已经缩放过整窗，WinForms 再算一次会翻倍）。
+
+### 为什么不能做到「清晰又不出界」
+
+WinForms 用的是 GDI+，要做对 per-monitor 得每个控件都用 AutoSize / TableLayoutPanel，
+或者自己处理 `WM_DPICHANGED` 重排 —— 那是把整个界面重写一遍的量级。
+绝大多数老 Win32 程序都停在 System aware 这一档，这是「清晰度」和「不出错」
+之间实际的取舍。真要做到完美，得迁到 WPF 或 .NET 8 的 WinForms（大工程，另议）。
+
 ## v0.13.7 — 2026-10-26
 
 > 客户端 0.9.11 → 0.9.13，管理面板两个真 bug，下载页改版。

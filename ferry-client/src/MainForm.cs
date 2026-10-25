@@ -58,8 +58,9 @@ namespace Ferry
             // 于是控件高度还是 96 DPI 的像素值 —— 文字被裁掉半行。
             // 所以同一个 exe 在 100% 缩放下正常、125% / 150% 的机器上就被挤压，
             // 用户看到的是「有些人窗口尺寸和文字高度都不对」。
-            AutoScaleMode = AutoScaleMode.Dpi;
-            AutoScaleDimensions = new SizeF(96F, 96F);
+            // 缩放交给 Windows（manifest 是 system DPI aware），这里不要叠加，
+            // 否则会「系统放大一次 + WinForms 再算一次」导致尺寸翻倍或错位。
+            AutoScaleMode = AutoScaleMode.None;
             BuildUi();
             Load += delegate
             {
@@ -142,7 +143,7 @@ namespace Ferry
             // 第四行：TUN 状态。默认隐藏（只在设置里勾了全局接管时才显示），
             // 避免普通用户看到一行「未开启」以为是故障。
             _rowTun = Row(_card, 180);
-            _rowTun.SetBounds(24, 180, 320, 18);
+            _rowTun.SetBounds(24, 180, 352, 18);
             _rowTun.Visible = true;
 
             // 全局模式的开关摆在「全局模式」这一行右边 —— 状态和动作在同一处。
@@ -1090,12 +1091,12 @@ namespace Ferry
                 bool tunUp = rt != null && rt.TunRunning;
                 if (tunUp)
                 {
-                    SetText(_rowTun, "全局模式    已开启 · UDP / 游戏 / 语音都走渡口", Theme.Good);
+                    SetText(_rowTun, "全局模式    已开启（UDP / 游戏都走渡口）", Theme.Good);
                     SetText(_btnGlobal, "关闭", Theme.Muted);
                 }
                 else if (_cfg.UseTun && !Elevator.IsAdmin())
                 {
-                    SetText(_rowTun, "全局模式    待管理员（点「开启」会提权重启）", Theme.Bad);
+                    SetText(_rowTun, "全局模式    待管理员授权", Theme.Bad);
                     SetText(_btnGlobal, "开启", Theme.Text);
                 }
                 else if (_cfg.UseTun && runtimeUp)
@@ -1105,7 +1106,7 @@ namespace Ferry
                 }
                 else
                 {
-                    SetText(_rowTun, "全局模式    未开启 · 只有认代理的程序走渡口", Theme.Muted);
+                    SetText(_rowTun, "全局模式    未开启", Theme.Muted);
                     SetText(_btnGlobal, "开启", Theme.Text);
                 }
                 _rowTun.Visible = true;

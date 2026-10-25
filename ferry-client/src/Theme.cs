@@ -34,14 +34,19 @@ namespace Ferry
         /// </summary>
         public static void FitToScreen(Form f)
         {
+            float scale = 1f;
+            try { scale = f.DeviceDpi / 96f; } catch (Exception) { }
+            if (scale <= 0.1f) scale = 1f;
+
             var wa = Screen.FromControl(f).WorkingArea;
-            int w = Math.Min(f.Width, wa.Width - 24);
-            int h = Math.Min(f.Height, wa.Height - 24);
-            if (w == f.Width && h == f.Height) return;
+            int wPhys = (int)(f.Width * scale);
+            int hPhys = (int)(f.Height * scale);
+            if (wPhys <= wa.Width && hPhys <= wa.Height) return;
+
             f.AutoScroll = true;
-            f.Size = new Size(w, h);
-            f.Location = new Point(wa.Left + (wa.Width - w) / 2,
-                                   wa.Top + (wa.Height - h) / 2);
+            f.Size = new Size((int)((wa.Width - 24) / scale),
+                              (int)((wa.Height - 24) / scale));
+            f.Location = new Point(wa.Left + 12, wa.Top + 8);
         }
 
         public static readonly Font FTitle = new Font("Microsoft YaHei", 13f, FontStyle.Bold);
