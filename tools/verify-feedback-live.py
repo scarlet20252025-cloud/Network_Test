@@ -44,7 +44,7 @@ opener = urllib.request.build_opener(
 
 
 def get(p):
-    return opener.open(BASE + p, timeout=15).read().decode('utf-8', 'replace')
+    return opener.open(BASE + p, timeout=60).read().decode('utf-8', 'replace')
 
 
 def post(p, data):
@@ -52,7 +52,7 @@ def post(p, data):
     req = urllib.request.Request(
         BASE + p, body, {'Content-Type': 'application/x-www-form-urlencoded'})
     try:
-        return opener.open(req, timeout=20).read().decode('utf-8', 'replace')
+        return opener.open(req, timeout=60).read().decode('utf-8', 'replace')
     except urllib.error.HTTPError as e:
         return 'HTTP%d' % e.code
 

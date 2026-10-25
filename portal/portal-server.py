@@ -1184,7 +1184,7 @@ def page(title, body, refresh=None, theme=None, cookie_header=None):
     return f"""<!doctype html><html lang="zh-CN" data-theme="{cur}"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark light">
-{meta}<title>{html.escape(title)}</title><style>{BASE_CSS}</style></head>
+{meta}<title>{html.escape(title)}</title><style>{BASE_CSS}</style>{EXTRA_CSS}</head>
 <body><div class="wrap">{top}{body}{footer()}</div>{THEME_JS}</body></html>"""
 
 
@@ -1758,8 +1758,13 @@ def portal_page(client, invite_note=''):
 </div>""")
 
 
-LIVE_UI = r'''
-<style>
+# 全站附加样式（介绍页 / 下载页 / 反馈页 / 管理面板共用）。
+#
+# 踩过的坑：这些规则原来只跟在 LIVE_UI 里、被插进管理面板 —— 于是首页
+# 和反馈页拿到的是裸 HTML：没有卡片、没有网格，卡片竖着排成一列。
+# 结构测试（数 class 出现次数）全过，所以一直没暴露；截一张图就露馅。
+# 现在拆成独立常量，由 page() 统一注入每一页。
+EXTRA_CSS = r'''<style>
 /* 实时监控区：四个指标卡 + 在线列表。
    全部用主题变量，切深色/浅色/护眼都不用改这里。 */
 .livegrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:0 0 18px}
@@ -2269,7 +2274,9 @@ tr.fb-more>td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accen
 .tier:has(input:checked){border-color:var(--accent);
   background:color-mix(in srgb, var(--accent) 12%, transparent)}
 .tier:has(input:checked) span{color:var(--accent);font-weight:600}
-</style>
+</style>'''
+
+LIVE_UI = r'''
 
 <div class="perfpanel">
   <div class="perf-head">
