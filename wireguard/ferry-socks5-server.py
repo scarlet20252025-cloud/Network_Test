@@ -177,8 +177,37 @@ _rate_conf_mtime = -1.0
 #   "if direct works, Clash works too; if direct fails, only Clash works".
 #   Racing costs domestic sites nothing and covers blocked sites for free.
 CLASH_PROXY = None              # (host, port) or None (disabled)
-CLASH_FALLBACK_TIMEOUT = 1.2    # direct attempt timeout
-DIRECT_HEAD_START = 0.35        # how long direct may win exclusively
+CLASH_FALLBACK_TIMEOUT = 0.9    # direct attempt timeout
+DIRECT_HEAD_START = 0.20        # how long direct may win exclusively
+
+# Timing budget (measured on the real link):
+#   domestic sites complete the TCP connect in ~100ms -> 0.20s head start
+#     is still a comfortable win for them.
+#   blocked sites fail the direct attempt within ~0.9s (either no route or
+#     RST), so a 0.9s cap costs nothing but keeps the worst case near 1.1s
+#     instead of the 2.0s that 0.35+1.2 produced.
+#
+# Two separate timeouts, because the two phases are fundamentally different
+# (this was measured -- using one value for both caused an 8s stall):
+#   * connect to local Clash + SOCKS5 handshake = pure loopback, milliseconds.
+#     Giving it a long timeout means a dead-but-listening Clash stalls us.
+#   * waiting for the CONNECT reply = Clash has to actually reach the target,
+#     which can take seconds on a slow node.
+# TCP connect to the local proxy. Loopback either accepts in <5ms or the
+# listener is gone; measured: connecting to a dead local port on Windows
+# does NOT return RST immediately, it burns the whole timeout. So this value
+# IS the failure latency -- keep it tight (0.8s = 160x margin over 5ms).
+CLASH_TCP_TIMEOUT = 0.8
+# Waiting for the SOCKS5 greeting reply. A real Clash under load may take a
+# moment; this one can be generous because we only reach it after TCP is up.
+CLASH_HANDSHAKE_TIMEOUT = 2.0
+# Waiting for Clash to actually reach the target (slow nodes need seconds).
+CLASH_CONNECT_TIMEOUT = 8.0
+
+# Direct-only timeout when the bypass is disabled. 10s feels broken to users;
+# domestic sites answer within ~100ms, so 3s is plenty to call it dead.
+DIRECT_ONLY_TIMEOUT = 3.0
+
 _clash_ok_cache = {'v': None, 'at': 0.0}
 
 
@@ -229,13 +258,13 @@ async def _open_via_clash(host, port):
     chost, cport = CLASH_PROXY
     try:
         r, w = await asyncio.wait_for(
-            asyncio.open_connection(chost, cport), timeout=8)
+            asyncio.open_connection(chost, cport), timeout=CLASH_TCP_TIMEOUT)
     except Exception:
         return None
     try:
         w.write(b'\x05\x01\x00')
         await w.drain()
-        resp = await asyncio.wait_for(r.readexactly(2), timeout=8)
+        resp = await asyncio.wait_for(r.readexactly(2), timeout=CLASH_HANDSHAKE_TIMEOUT)
         if resp[0] != 5 or resp[1] != 0:
             w.close()
             return None
@@ -267,18 +296,18 @@ async def _open_via_clash(host, port):
         w.write(bytes(req))
         await w.drain()
 
-        head = await asyncio.wait_for(r.readexactly(4), timeout=8)
+        head = await asyncio.wait_for(r.readexactly(4), timeout=CLASH_CONNECT_TIMEOUT)
         if head[1] != 0:
             w.close()
             return None
         atyp = head[3]
         if atyp == 1:
-            await asyncio.wait_for(r.readexactly(6), timeout=5)
+            await asyncio.wait_for(r.readexactly(6), timeout=CLASH_HANDSHAKE_TIMEOUT)
         elif atyp == 3:
-            ln = (await asyncio.wait_for(r.readexactly(1), timeout=5))[0]
-            await asyncio.wait_for(r.readexactly(ln + 2), timeout=5)
+            ln = (await asyncio.wait_for(r.readexactly(1), timeout=CLASH_HANDSHAKE_TIMEOUT))[0]
+            await asyncio.wait_for(r.readexactly(ln + 2), timeout=CLASH_HANDSHAKE_TIMEOUT)
         elif atyp == 4:
-            await asyncio.wait_for(r.readexactly(18), timeout=5)
+            await asyncio.wait_for(r.readexactly(18), timeout=CLASH_HANDSHAKE_TIMEOUT)
         else:
             w.close()
             return None
@@ -314,7 +343,7 @@ async def _open_upstream(host, port, peer_ip):
     """
     if not CLASH_PROXY:
         r, w = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=10)
+            asyncio.open_connection(host, port), timeout=DIRECT_ONLY_TIMEOUT)
         return r, w, 'direct'
 
     async def try_direct():
