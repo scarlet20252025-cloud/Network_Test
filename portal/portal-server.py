@@ -2013,8 +2013,11 @@ html[data-theme="light"] .arw.up{color:#d97706}
   justify-content:center;box-shadow:-3px 0 12px rgba(0,0,0,.25)}
 .netctl-handle.show{display:flex}
 
-@media(max-width:1279px){
-  /* 窄屏：浮层会真的压到内容，改成静态块放在最上面 */
+@media(max-width:1399px){
+  /* 窄屏：浮层会真的压到内容，改成静态块放在最上面。
+     断点从 1279 提到 1399：内容区 max-width 是 860，1280 视口下右边留白
+     只有 (1280-860)/2 ≈ 210px，而侧边栏 320px —— 会实实在在盖住表格右列
+     （实测截图里「操作」列被遮）。1400 以上留白才够。 */
   .netctl{position:static;width:auto;border:1px solid var(--line);
     border-radius:14px;margin:0 0 16px;box-shadow:none;
     transform:none;max-width:640px}
