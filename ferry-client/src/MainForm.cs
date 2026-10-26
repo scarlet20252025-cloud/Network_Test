@@ -1093,32 +1093,47 @@ namespace Ferry
                         throw;
                     }
 
-                    // ③ 起新进程（WMI，脱离本进程的 Job）
-                    UpdateLog("启动新进程");
-                    bool started = Elevator.StartDetached(
-                        "cmd.exe /c start \"\" \"" + exe + "\"");
-                    UpdateLog("WMI 启动结果 = " + started);
-                    if (!started)
-                    {
-                        var psi = new ProcessStartInfo(exe);
-                        psi.UseShellExecute = true;
-                        psi.WorkingDirectory = _appDir;
-                        Process.Start(psi);
-                        UpdateLog("已用 ShellExecute 兜底启动");
-                    }
-
                     try { File.Delete(tmp); } catch (Exception) { }
 
-                    UpdateLog("更新完成，退出旧进程");
-                    Thread.Sleep(400);
-
-                    // 直接退，不走 RealQuit —— 它会在借网时弹确认框，
-                    // 而那时 exe 已经换好了，程序留在原地反而更奇怪。
+                    // ③ 先把自己收拾干净、**退出**，再让新进程起来。
+                    //
+                    // ⚠ 顺序不能反 —— 这是「点更新后程序消失不再出现」的真正原因：
+                    //   原来先 StartDetached 再 Exit，新进程在我们还活着时就启动了，
+                    //   抢 `Local\FerryClient` 互斥锁失败 → 它以为「已有实例在跑」
+                    //   → 前置旧窗口后自己退出 → 紧接着旧进程 Exit → 两个都没了。
+                    //
+                    //   借网状态下更容易复现：RestoreDirect + Stop 要几百毫秒，
+                    //   旧进程活得更久，新进程输掉这个竞态的概率更高。
+                    //
+                    //   现在改成：先还原代理、停运行时，然后交给一个脱离 Job 的
+                    //   延迟启动器（等 1.2 秒再拉 exe），最后自己退出。
+                    UpdateLog("还原代理并退出，稍后由延迟启动器拉起新版本");
                     try
                     {
                         if (_rt != null) { FerryCore.RestoreDirect(_cfg, _appDir); _rt.Stop(); _rt = null; }
                     }
                     catch (Exception) { }
+
+                    // 用一个 .cmd 做延迟启动 —— 比在命令行里嵌套引号可靠得多，
+                    // 而且能看到它有没有跑（失败时留着文件便于排查）。
+                    var relaunch = Path.Combine(Path.GetTempPath(), "ferry-relaunch.cmd");
+                    try
+                    {
+                        var sb2 = new StringBuilder();
+                        sb2.AppendLine("@echo off");
+                        sb2.AppendLine("timeout /t 2 /nobreak >nul");
+                        sb2.Append("start \"\" \"").Append(exe).Append("\" /allow-wait").AppendLine();
+                        File.WriteAllText(relaunch, sb2.ToString(), Encoding.Default);
+                    }
+                    catch (Exception e2) { UpdateLog("写延迟启动脚本失败：" + e2.Message); }
+
+                    // cmd /c 起脚本（WMI，脱离本进程的 Job，不会被一起回收）
+                    bool started = Elevator.StartDetached(
+                        "cmd.exe /c \"" + relaunch + "\"");
+                    UpdateLog("延迟启动器 = " + started + " (" + relaunch + ")");
+
+                    // 留一点时间让 cmd 起来（它自己会等 2 秒再拉 exe）
+                    Thread.Sleep(300);
                     Environment.Exit(0);
                 }
                 catch (Exception e)
