@@ -1,3 +1,56 @@
+## v0.13.22 — 2026-10-26
+
+> 客户端 0.9.32：**按钮文字消失**的根因 —— `MinimumSize` 压制了 AutoSize。
+
+### 现象
+
+「全局模式」那一行的按钮只剩一个浅色边框，**文字不见了**。同一时刻
+状态卡里的多行提示也压住了下面几行。
+
+### 根因：`MinimumSize` 会让 AutoSize 的高度失效
+
+为了限制 Label 的宽度，`Theme.Place` 里同时设了：
+
+```csharp
+l.MinimumSize = new Size(w, 0);   // ← 这一行是元凶
+l.MaximumSize = new Size(w, 0);
+```
+
+在 WinForms 里，`MinimumSize` 会**压制 AutoSize 的高度自适应**：
+宽度被锁死了，但高度也一起被锁在「设 MinimumSize 那一刻」的值上。
+
+诊断数据（用户那个状态）：
+
+```
+_lblDesc.Text   = [系统代理指向渡口，但本地代理端口没响应。点「停止并恢复直连」再重新开始。]
+_lblDesc.Bounds = {X=0, Y=54, Width=477, Height=19}    ← 47 个字，只有 19px 高
+```
+
+这段文字实际需要 **4 行（76px）**，但控件只有 19px —— 文字画出边界、
+盖住下面的「剩余 27 天」「本地代理」等行，最后把按钮也盖住了。
+
+`LayoutCard()` 按 19px 算间距，于是整张卡的布局全部错位。
+
+### 修法：自己算高度，不依赖 AutoSize
+
+新增 `Theme.AutoLabel`（Label 子类）：
+
+- `OnTextChanged` / `OnSizeChanged` 时用临时 Label 量出真实高度再设回去
+- 临时 Label 用 `AutoSize = true` + `MaximumSize`，和真实渲染的排版逻辑完全一致
+- `Place()` 里**不再设 MinimumSize**
+
+另外修了一个连带问题：`LayoutCard` 的 `PlaceRow` 忘了设宽度，导致
+AutoLabel 按上一次的宽度（100px）算成 6 行 114px 高，把卡片撑爆。
+
+### 验证
+
+```
+修复前：_lblDesc = 100x114（宽度没设 + MinimumSize 压制）
+       卡片 179px，按钮 y=150 压在文字上
+修复后：_lblDesc = 430x38（4 行，正确）
+       卡片 198px，按钮 y=169，文字完整、按钮可见
+```
+
 ## v0.13.21 — 2026-10-26
 
 > 客户端 0.9.31：**更新后程序消失**的根因 —— 新进程抢不到单实例锁。

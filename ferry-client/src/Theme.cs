@@ -162,62 +162,101 @@ namespace Ferry
         }
 
         /// <summary>
-        /// 建一个文字 Label，**高度由 WinForms 自己算**。
+        /// 自动算高度的 Label。
         ///
-        /// 踩过的坑（反复改 DPI 模式都没解决，最后靠实测定位）：
-        ///   Label 是 AutoSize=false + SetBounds 写死 18px 高，而字体是 pt
-        ///   单位、随系统 DPI 放大 —— 125% 下 8.5pt 中文单行就要 20px，
-        ///   于是每行字的下沿被裁 2px。各人缩放不同，裁掉的像素也不同，
-        ///   看起来就是「文字下面一半被遮挡」。
+        /// 为什么不用 `AutoSize = true`：实测它会失效。
+        /// 为了限制宽度，我们设了 `MinimumSize = (w, 0)`，而 WinForms 里
+        /// MinimumSize 会**压制** AutoSize 的高度自适应 —— 结果文字有 4 行，
+        /// 控件高度却只有 1 行（19px），文字溢出边界盖住下面的控件。
+        /// 用户看到的就是「文字被压住 / 按钮文字消失」。
         ///
-        /// 为什么不用 TextRenderer.MeasureText 自己算：
-        ///   试过，**中文长句算不准**。WordBreak 依赖空格断行，中文没有空格，
-        ///   MeasureText 会认为一行放得下，返回单行高度；而 Label 实际渲染时
-        ///   会按字符折行。结果就是「按测量值给高度」依然被裁。
+        /// 所以改成自己算：文字一变，用临时 Label 量出真实高度再设回去。
+        /// 临时 Label 用的是和真实渲染完全相同的排版逻辑，中英文都准。
+        /// </summary>
+        public class AutoLabel : Label
+        {
+            bool _refitting;
+
+            public AutoLabel()
+            {
+                AutoSize = false;
+                BackColor = Color.Transparent;
+                UseMnemonic = false;
+            }
+
+            protected override void OnTextChanged(EventArgs e)
+            {
+                base.OnTextChanged(e);
+                Refit();
+            }
+
+            protected override void OnSizeChanged(EventArgs e)
+            {
+                base.OnSizeChanged(e);
+                // 宽度变了要重新换行（但别在自己的赋值里递归）
+                if (!_refitting) Refit();
+            }
+
+            /// <summary>按当前宽度重算高度。外部改完宽度也可以手动调。</summary>
+            public void Refit()
+            {
+                if (_refitting) return;
+                _refitting = true;
+                try
+                {
+                    int w = Width;
+                    if (w <= 8) return;
+                    int need = MeasureHeight(Text, Font, w);
+                    if (need != Height) Height = need;
+                }
+                finally { _refitting = false; }
+            }
+        }
+
+        /// <summary>
+        /// 建一个文字 Label，高度自动跟着内容走。
         ///
-        /// 所以交给 Label 自己：AutoSize=true + MaximumSize 限定宽度，
-        /// 它会用和渲染完全相同的排版逻辑算高度，中英文都准。
-        /// 代价是必须在设完 Text 之后再读 Height（见 Place）。
+        /// 用法：`var l = Theme.Text2("...", font, color); Theme.Place(l, x, y, w);`
+        /// 之后改 `l.Text` 会自动重算高度，不需要手动调。
         /// </summary>
         public static Label Text2(string text, Font f, Color c)
         {
-            var l = new Label();
-            l.Text = text;
+            var l = new AutoLabel();
             l.Font = f;
             l.ForeColor = c;
-            l.BackColor = Color.Transparent;
-            l.AutoSize = true;
-            // 默认给个宽松的上限，真正的位置/宽度由 Place() 定
+            l.Text = text;
             l.MaximumSize = new Size(480, 0);
-            l.UseMnemonic = false;   // 文字里的 & 原样显示，不当快捷键
             return l;
         }
 
         /// <summary>
         /// 把 Label 放到 (x, y)，宽度 w，**高度自动**。
         ///
-        /// 用法替换原来的 l.SetBounds(x, y, w, h)：高度不再由调用方猜。
+        /// ⚠ 不要在这里设 MinimumSize —— 它会压制高度自适应（见 AutoLabel 注释）。
         /// </summary>
         public static void Place(Label l, int x, int y, int w)
         {
-            l.MaximumSize = new Size(w, 0);
-            l.MinimumSize = new Size(w, 0);
             l.Location = new Point(x, y);
             l.Width = w;
-            // AutoSize 的 Label 在改 Text 后高度会变，这里强制重算一次
-            l.PerformLayout();
+            var al = l as AutoLabel;
+            if (al != null) al.Refit();
+            else l.Height = MeasureHeight(l.Text, l.Font, w);
         }
 
-        /// <summary>文字变了之后重新量高度（状态行这种会变的）。</summary>
+        /// <summary>文字变了之后重新量高度。</summary>
         public static void Refit(Label l)
         {
-            if (l == null || !l.AutoSize) return;
-            l.PerformLayout();
+            var al = l as AutoLabel;
+            if (al != null) { al.Refit(); return; }
+            if (l != null) l.Height = MeasureHeight(l.Text, l.Font, l.Width);
         }
 
         /// <summary>
-        /// 量一段文字需要多高 —— 只在需要「预留空间」时用（比如给下面的控件定位）。
-        /// 内部靠一个临时 Label，保证和真实渲染一致。
+        /// 量一段文字在给定字体、给定宽度下需要多高。
+        ///
+        /// 用一个临时 Label 而不是 `TextRenderer.MeasureText` ——
+        /// 后者对中文长句算不准：`WordBreak` 依赖空格断行，中文没有空格，
+        /// 它会认为一行放得下、返回单行高度，而 Label 实际渲染按字符折行。
         /// </summary>
         public static int MeasureHeight(string text, Font f, int width)
         {
@@ -225,7 +264,6 @@ namespace Ferry
             {
                 probe.AutoSize = true;
                 probe.MaximumSize = new Size(Math.Max(16, width), 0);
-                probe.MinimumSize = new Size(Math.Max(16, width), 0);
                 probe.Font = f;
                 probe.Text = string.IsNullOrEmpty(text) ? "国" : text;
                 return probe.PreferredHeight;

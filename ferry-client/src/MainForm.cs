@@ -284,10 +284,11 @@ namespace Ferry
             PlaceRow(_rowBridge, ref y, 6);
             PlaceRow(_rowProxy, ref y, 6);
 
-            _rowTun.Location = new Point(24, y);
             _rowTun.Width = 352;
+            _rowTun.Location = new Point(24, y);
+            Theme.Refit(_rowTun);
             if (_btnGlobal != null) _btnGlobal.Top = y - 2;
-            y += Math.Max(_rowTun.PreferredHeight, 17) + 10;
+            y += Math.Max(_rowTun.Height, 17) + 10;
 
             _card.Height = y;
 
@@ -307,12 +308,20 @@ namespace Ferry
             }
         }
 
-        /// <summary>把一行放到 y，然后把 y 推进它自己的高度 + gap。</summary>
+        /// <summary>
+        /// 把一行放到 y（**宽度固定 430**），然后把 y 推进它自己的高度 + gap。
+        ///
+        /// ⚠ 必须在这里设宽度：AutoLabel 的高度是「按当前宽度换行算出来的」，
+        /// 不设宽度它会用上一次的宽度（甚至 100px）→ 算成 6 行 114px 高。
+        /// 实测踩到：宽度没设，_lblDesc 变成 100x114，把整张卡撑爆。
+        /// </summary>
         static void PlaceRow(Label l, ref int y, int gap)
         {
             if (l == null) return;
-            l.Location = new Point(l.Left, y);
-            y += Math.Max(l.PreferredHeight, 17) + gap;
+            l.Width = 430;
+            l.Location = new Point(24, y);
+            Theme.Refit(l);
+            y += Math.Max(l.Height, 17) + gap;
         }
 
         static Label Row(Panel parent, int y)
