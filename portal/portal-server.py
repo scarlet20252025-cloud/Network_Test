@@ -1252,7 +1252,7 @@ def download_page(detected_ip=''):
   <div class="dl-hero">
     <div class="dl-hero-l">
       <h1>下载渡口客户端</h1>
-      <p>校园网被限制上网时，借一台能上网的机器的出口。<br>
+      <p>内网里某台机器出不去时，借一台能出网的主机做应急出口。<br>
          装一次，之后点一下就能接通 &mdash;&mdash; 不用改任何网络配置。</p>
       <div class="dl-actions">
         <a class="btn btn-main" href="/download-cmd">&#9889; 一键安装</a>
@@ -1451,11 +1451,11 @@ def landing_page(online_now=0):
 
 <div class="hero">
   <div class="badge">Phase 2 &#183; 稳定版</div>
-  <h1>校园网被限制上网？<br><span class="g">借一台能上网的机器的出口</span></h1>
+  <h1>内网里有机器出不去？<br><span class="g">借一台能上网的主机做出口</span></h1>
   <p class="tag">
-    学校按账号禁用上网权限，但局域网通常还是通的。渡口通过一台能上网的
-    内网主机中转流量 &mdash;&mdash; 你不用改任何网络配置，装一次，
-    断网时点一下就能继续上网。
+    账号外网权限受限、校园网临时故障、机房只开了一台机器 &mdash;&mdash;
+    只要局域网还通，就能借一台能出网的主机做应急出口：装一次，
+    点一下接通，不用改任何网络配置。
   </p>
   <div class="cta">
     <a class="btn btn-main" href="/download-page">前往下载</a>
@@ -1476,9 +1476,9 @@ def landing_page(online_now=0):
 <div class="fgrid">
   <div class="fcard scc">
     <div class="ico">&#9203;</div>
-    <h3>校园网断网，临时急用</h3>
-    <p>账号被停、限时断网、宿舍网线还没通 &mdash;&mdash; 偏偏要交作业、查资料、赶论文。
-       先借一台能上网的机器顶过去：装一次，之后每次点一下就好，不用等网络中心上班，也不用抱着电脑到处找热点。</p>
+    <h3>临时出不去，急着用网</h3>
+    <p>账号权限到期、网络临时故障、宿舍网线还没通 &mdash;&mdash; 偏偏要交作业、查资料、赶论文。
+       先借一台能出网的主机顶过去：装一次，之后每次点一下就好，也不用抱着电脑到处找热点。</p>
     <span class="tg">&#9679; 一分钟接上</span>
   </div>
   <div class="fcard scc">
@@ -1499,7 +1499,7 @@ def landing_page(online_now=0):
 
 <div class="sec">
   <div class="ph"><i></i><h2>它做到了什么</h2></div>
-  <p class="pd">不是「又一个代理工具」&mdash;&mdash; 针对的是校园网按账号禁网这个特定场景。</p>
+  <p class="pd">不是「又一个代理工具」&mdash;&mdash; 针对的是「内网里只有部分主机能出网」这个具体场景。</p>
 </div>
 
 <div class="fgrid">

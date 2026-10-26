@@ -1,3 +1,5 @@
+import re
+import io
 """端到端验证：管理面板的备注编辑。
 
 流程：登录 → 抓设备列表里的 IP → 提交新备注 → 重新读页面确认 + 查库确认。
@@ -9,7 +11,19 @@ import urllib.parse
 import urllib.request
 
 BASE = 'http://10.13.24.1:8080'
-PW = 'REDACTED-ADMIN-PW'
+# 管理密码：从环境变量或 portal-admin.txt 读，绝不硬编码。
+# 这个值曾经写死在代码里并且仓库是公开的 —— 已经轮换过，不要再犯。
+import os as _os
+PW = _os.environ.get('FERRY_ADMIN_PW', '')
+if not PW:
+    _f = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                       'portal', 'portal-admin.txt')
+    if _os.path.exists(_f):
+        for _line in io.open(_f, encoding='utf-8'):
+            _m = re.match(r'^([A-Za-z0-9_\-]{8,})$', _line.strip())
+            if _m:
+                PW = _m.group(1)
+                break
 
 cj = http.cookiejar.CookieJar()
 op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))

@@ -1584,10 +1584,10 @@ else if (string.IsNullOrEmpty(res.Error))
 ```
 POST /api/activate  {"code":"ECX7BWY2"}
 → 200
-{"ok": true, "token": "REDACTED-TOKEN", "ip": "10.141.59.235",
+{"ok": true, "token": "sngsb4-****-****-****", "ip": "10.141.59.235",
  "expiresAt": 1795361481, "daysLeft": 30, "portalUrl": "http://10.13.24.1:8080"}
 
-GET /api/license?ip=10.141.59.235&token=sngsb4-...
+GET /api/license?ip=10.141.59.235&token=sngsb4-****…
 → {"ok": true, "enabled": true, "expiresAt": 1795361481, "daysLeft": 30,
    "hoursLeft": 720, "expired": false, "suspended": false}
 ```
