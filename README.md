@@ -6,11 +6,14 @@
 **局域网域名**：`ferry.internal`（`.internal` 是 ICANN 保留给私有网络的 TLD，
 永远不会被公网解析占用）
 
-**当前版本**：客户端 `0.9.32`（`dist/渡口助手.exe`）/ 安装包 `Ferry-Setup-0.9.2.exe`（16.9 MB）
+**当前版本**：客户端 `1.0.1`（WPF 版，`dist/渡口助手.exe`）/ 安装包 `Ferry-Setup-1.0.1.exe`（17.7 MB）
 
-> 0.9.4 的客户端 exe 已编译（意见反馈入口、高 DPI 适配、设置保存即生效），
-> 但安装包还没重打 —— 本机没装 Inno Setup（`ISCC.exe`），签名私钥密码也不在仓库里。
-> 装好 Inno Setup 后跑 `installer/sign.ps1 -Password <私钥密码>`，把产物放进 `dist/` 即可。
+> 1.0.x 把界面从 WinForms 重写成了 **WPF**。原因不是「想换技术」：
+> 「文字下半截被遮挡」这个 bug 在 WinForms 下修了七轮（裁字 → 重叠 →
+> 按钮文字消失 → `MinimumSize` 压制 AutoSize），每轮判断都对、换个缩放比例又复发。
+> 病根是布局模型 —— WinForms 要求坐标和高度都由代码写死，而字体是 pt 随 DPI 放大。
+> WPF 的「测量 → 排列」两阶段布局用 DIP，100% / 125% / 150% 都不需要特殊处理。
+> 业务逻辑（借网、代理、TUN、授权、更新、托盘）原样复用，只换了「怎么画」。
 
 ---
 

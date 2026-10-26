@@ -20,7 +20,8 @@
 └──────────────────┘   HTTP    └────────────────────────┘
 ```
 
-- **客户端**：C# WinForms（.NET Framework 4.8，csc 直接编译，无 NuGet）
+- **客户端**：C# **WPF**（.NET Framework 4.8，csc 直接编译，无 NuGet / 无 XAML）
+  - 1.0.x 起从 WinForms 迁到 WPF。**别再退回 WinForms**，理由见第五节第 9 条。
 - **门户**：Python 3 单文件 `portal/portal-server.py`（标准库，无第三方依赖）
 - **远端**：Windows Server，Python + 计划任务
 
@@ -28,12 +29,16 @@
 
 | 路径 | 是什么 | 改它的时机 |
 |---|---|---|
-| `ferry-client/src/` | 客户端全部源码（约 6000 行） | 界面、借网逻辑、TUN |
+| `ferry-client/src/` | 客户端源码：业务逻辑 + WPF 界面（约 6000 行） | 界面、借网逻辑、TUN |
+| `ferry-client/src-winforms/` | **旧 WinForms 界面，只作对照，不参与编译** | 想不起旧版怎么写的 |
+| `ferry-client/build-wpf.ps1` | 编客户端（wpf，当前唯一构建方式） | 改编译参数 |
+| `ferry-client/build.ps1` | 旧的 WinForms 构建脚本，**已不再使用** | 仅历史参考 |
 | `portal/portal-server.py` | 门户 + 管理面板 + 分发（约 6000 行） | 网页、API、密钥、反馈 |
 | `installer/ferry.iss` | Inno Setup 安装脚本 | 安装流程、升级清理 |
 | `mihomo/` | clash 内核 + TUN 配置模板 | 分流规则、TUN |
 | `wireguard/` | UDP 中继与 wg 相关 | UDP 通路 |
 | `tools/` | 验证脚本（大多可独立跑） | 加验证、排查 |
+| `tools/render-ui.ps1` | **界面截图**（送到 10.113.66.6 渲染再拉回） | 改了界面之后 |
 | `docs/` | 原理与踩坑（**先读**） | 每次踩新坑 |
 
 ## 三、本地怎么跑
@@ -41,8 +46,12 @@
 ```powershell
 # 客户端：编译（不需要 dotnet SDK，用系统自带 csc）
 cd ferry-client
-powershell -ExecutionPolicy Bypass -File build.ps1 -Version 0.9.15
+powershell -ExecutionPolicy Bypass -File build-wpf.ps1 -Version 1.0.1
 # → ..\dist\渡口助手.exe
+
+# 界面截图（在远端测试机上渲染，别在用户自己电脑上弹窗）
+powershell -ExecutionPolicy Bypass -File tools\render-ui.ps1
+# → %TEMP%\ferry-ui-shots\shot-main.png / shot-settings.png / shot-feedback.png
 
 # 门户：本地起一个独立实例（不碰线上库）
 cd portal
@@ -57,30 +66,41 @@ PORTAL_BASE=http://127.0.0.1:18090 python tools/verify-portal-pages.py
 FERRY_ADMIN_PW=<线上密码> python tools/verify-feedback-live.py
 ```
 
-客户端没有单元测试，靠 `tools/verify-*.py` + 离屏渲染（`DrawToBitmap`）核对界面。
+客户端没有单元测试，靠 `tools/verify-*.py` + `tools/render-ui.ps1`（WPF 离屏渲染）核对界面。
 
 ## 四、发版流程（照做，别自创）
 
 ```powershell
 # 1. 改版本号
 #    installer/ferry.iss 的 #define AppVersion
-#    build.ps1 的 -Version 参数会写进 AssemblyInfo
+#    build-wpf.ps1 的 -Version 参数会写进 AssemblyInfo
 
-# 2. 编译客户端
+# 2. 编译客户端（WPF）
 cd ferry-client
-powershell -ExecutionPolicy Bypass -File build.ps1 -Version 0.9.x
+powershell -ExecutionPolicy Bypass -File build-wpf.ps1 -Version 1.0.x
+# → ..\dist\渡口助手.exe
 
 # 3. 打安装包（Inno Setup 6；本机装在 %LOCALAPPDATA%\Programs\Inno Setup 6）
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\ferry.iss
-# → dist\Ferry-Setup-0.9.x.exe
+# → dist\Ferry-Setup-1.0.x.exe
 
-# 4. 上门户，并同步 CHANGELOG（否则网页「更新日志」是空的）
-scp dist\Ferry-Setup-0.9.x.exe pcs:C:/ferry-portal/dist/
-scp CHANGELOG.md               pcs:C:/ferry-portal/CHANGELOG.md
+# 4. 上门户 —— 两个文件都要传！
+#    Ferry-Setup-*.exe 决定 version.json 里的版本号（首页「下载」用）
+#    渡口助手.exe      是 /download-client 发的东西（自动更新真正下载的）
+#    少传第二个的表现：版本号显示新版，但自动更新下下来的还是旧 exe。
+scp dist\Ferry-Setup-1.0.x.exe pcs:C:/ferry-portal/dist/
+scp "dist\渡口助手.exe"         "pcs:C:/ferry-portal/dist/渡口助手.exe"
+scp CHANGELOG.md                pcs:C:/ferry-portal/CHANGELOG.md
 
 # 5. 部署服务端改动（会重启服务，几秒）
 scp portal\portal-server.py pcs:C:/ferry-portal/portal-server.py.new
 ssh pcs powershell -ExecutionPolicy Bypass -File C:\ferry-portal\_deploy_remote.ps1
+
+# 6. 验收自动更新（必须在测试机上跑真实链路，别手工覆盖）
+#    见 docs/踩坑记录.md 第 54 条
+scp dist\渡口助手.exe xt:C:/ferry-test/  # 或让测试机自己编一个旧版本
+ssh xt 'C:\ferry-update-test\渡口助手.exe /update'
+# → 看 C:\ferry-update-test\update-selftest.log 每一步都在，且版本号真的变了
 ```
 
 `version.json` 不用手写：门户会从 `dist/Ferry-Setup-*.exe` 里推出最新版本。
@@ -136,25 +156,26 @@ ssh pcs powershell -ExecutionPolicy Bypass -File C:\ferry-portal\_deploy_remote.
    它跑完整链路并写 `update-selftest.log`。
    → 踩坑 54
 
-### 三、界面与 DPI
+### 三、界面（WPF，1.0.x 起）
 
-9. **控件高度绝对不能写死**。这是「文字下面一半被遮挡」的真正原因，
-   反复改 `dpiAware` / `AutoScaleMode` 都修不好 —— 因为病根不在缩放模式，
-   而在 `AutoSize = false` + `SetBounds(..., 18)`：字体是 pt 单位随 DPI 放大，
-   125% 下 8.5pt 中文单行就要 20px，18px 的框必然裁掉 2px。
-   **正确做法**：Label / CheckBox 一律 `AutoSize = true` + `MaximumSize` 限宽，
-   高度交给 WinForms 自己算。
-   → 踩坑 55
+9. **别再退回 WinForms**。这个 bug 修了七轮（裁字 → 重叠 → 按钮文字消失 →
+   `MinimumSize` 压制 AutoSize → `AutoLabel` 量高度），每轮判断都是真的，
+   但换个缩放比例又复发。病根在布局模型：WinForms 要求「坐标 + 高度都由代码
+   写死」，而字体是 pt 随 DPI 放大，两者天然冲突。
+   WPF 是「测量 → 排列」两阶段、尺寸全是 DIP，100%/125%/150% 都不用特殊处理。
+   **界面代码只在 `src/*Window.cs` 里**，业务逻辑（借网/代理/TUN/授权/更新）与界面无关。
+   → 踩坑 55 / 56（历史），CHANGELOG `v0.14.0`
 
-10. **不要用 `TextRenderer.MeasureText` 自己算中文高度**。`WordBreak`
-    依赖空格断行，中文没有空格 → 它认为一行放得下、返回单行高度，
-    而 Label 实际渲染会按字符折行。结果「按测量值给高度」依然被裁。
-    要量高度就用一个临时 Label 的 `PreferredHeight`。
-    → 踩坑 55
+10. **界面改动必须真渲染一次**。`tools/render-ui.ps1` 会把源码送到
+    10.113.66.6 编译 + `RenderTargetBitmap` 离屏渲染三个窗口，再拉回 PNG。
+    结构断言全过 ≠ 显示正常（WinForms 时代就有「按钮文字被卡片圆角裁掉、
+    元素树里查不到」的先例）。
+    → 踩坑 48 / 57
 
-11. **AutoSize 的控件在还没有父容器时 `Height` 是 0**。读它来算间距会得到
-    0，导致相邻控件重叠。要么先 Add 到容器再读，要么用探针 Label 另量。
-    → 踩坑 56
+11. **不要在用户自己的电脑上弹窗做验证**。他明确要求过：验证一律在
+    10.113.66.6 上做（那台机器随便跑，Session 0 也能离屏渲染）。
+    要截本机的真实窗口就用 `PrintWindow(hwnd, hdc, 2)` 离屏抓，别激活/前置窗口。
+    → 见 `tools/render-ui.ps1` 与 `docs/踩坑记录.md` 第 60 条
 
 ### 四、前端与文档
 

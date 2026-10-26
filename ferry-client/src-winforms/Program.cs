@@ -271,6 +271,7 @@ namespace Ferry
 
                 var form = new MainForm(cfgPath, appDir);
                 form.StartBorrowOnLoad = HasArg(args, "/start") || HasArg(args, "-start");
+                form.AutoUpdateOnLoad = HasArg(args, "/auto-update") || HasArg(args, "-auto-update");
                 Application.Run(form);
             }
             finally

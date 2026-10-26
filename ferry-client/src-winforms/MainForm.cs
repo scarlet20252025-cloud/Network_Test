@@ -92,11 +92,57 @@ namespace Ferry
                 {
                     BeginInvoke(new Action(delegate { DoStart(); }));
                 }
+
+                // 测试用：**等借网真正成功**再触发真实更新。
+                // 固定延迟不行 —— 借网要 3~10 秒，而且可能失败重试。
+                if (AutoUpdateOnLoad)
+                {
+                    var t = new System.Windows.Forms.Timer();
+                    t.Interval = 3000;
+                    int tries = 0;
+                    t.Tick += delegate
+                    {
+                        tries++;
+                        bool borrowing = _rt != null && _rt.Running && _rt.ProxyAlive;
+                        if (!borrowing && tries < 20)
+                        {
+                            UpdateLog("等待借网就绪（第 " + tries + " 次）…");
+                            return;
+                        }
+                        t.Stop();
+                        UpdateLog("自动触发（/auto-update）：借网=" + borrowing + "，先查版本");
+                        ThreadPool.QueueUserWorkItem(delegate
+                        {
+                            var v = Api.Version(_cfg.PortalUrl);
+                            if (!v.Ok) { UpdateLog("查版本失败，放弃"); return; }
+                            BeginInvoke(new Action(delegate
+                            {
+                                UpdateLog("服务端 " + v.Latest + "，当前 " + Application.ProductVersion);
+                                if (Api.CompareVer(v.Latest, Application.ProductVersion) <= 0)
+                                {
+                                    UpdateLog("已是最新，不更新");
+                                    return;
+                                }
+                                DoUpdate(v.Latest);
+                            }));
+                        });
+                    };
+                    t.Start();
+                }
             };
         }
 
         /// <summary>启动后立即借网（由 Program 解析 /start 参数设置）。</summary>
         public bool StartBorrowOnLoad = false;
+
+        /// <summary>
+        /// 启动后延迟几秒自动走一次**真实的**更新流程（`/auto-update` 参数）。
+        ///
+        /// 为什么需要：`/update` 那个自检入口不持有单实例锁，测不出
+        /// 「新进程抢锁失败」这类竞态。只有走 DoUpdate 才是真实路径。
+        /// 这个开关让自动化能覆盖它。
+        /// </summary>
+        public bool AutoUpdateOnLoad = false;
 
         // ── 界面 ────────────────────────────────────────────────
 
@@ -181,9 +227,24 @@ namespace Ferry
             _rowTun.Visible = true;
 
             // 全局模式的开关摆在「全局模式」这一行右边 —— 状态和动作在同一处。
-            _btnGlobal = Theme.FlatButton("开启", false);
-            _btnGlobal.SetBounds(390, 0, 70, 26);
+            //
+            // ⚠ 不用 Theme.FlatButton：它内部调 RoundControl() 设了圆角 Region，
+            //   而嵌套的 Region 裁剪在真实渲染下会把**文字一起裁掉**
+            //   （DrawToBitmap 走 WM_PRINT 不经过 Region，所以自检看不出来）。
+            //   实测：按钮只剩两条边框线，文字完全没有。
+            //
+            //   改用普通 Button + 主色背景，靠颜色而不是圆角来表达「可点击」。
+            //   顺便满足「要显眼」的要求：青绿实心 + 白字，和「开始借网」同一套。
+            _btnGlobal = new Button();
+            _btnGlobal.Text = "开启全局模式";
+            _btnGlobal.FlatStyle = FlatStyle.Flat;
+            _btnGlobal.FlatAppearance.BorderSize = 0;
+            _btnGlobal.BackColor = Theme.Accent;
+            _btnGlobal.ForeColor = Color.White;
             _btnGlobal.Font = Theme.FSmall;
+            _btnGlobal.Cursor = Cursors.Hand;
+            _btnGlobal.UseVisualStyleBackColor = false;
+            _btnGlobal.SetBounds(354, 0, 106, 28);
             _btnGlobal.Click += delegate { OnGlobalClicked(); };
             _card.Controls.Add(_btnGlobal);
 
@@ -284,7 +345,7 @@ namespace Ferry
             PlaceRow(_rowBridge, ref y, 6);
             PlaceRow(_rowProxy, ref y, 6);
 
-            _rowTun.Width = 352;
+            _rowTun.Width = 320;
             _rowTun.Location = new Point(24, y);
             Theme.Refit(_rowTun);
             if (_btnGlobal != null) _btnGlobal.Top = y - 2;
@@ -1363,22 +1424,24 @@ namespace Ferry
                 if (tunUp)
                 {
                     SetText(_rowTun, "全局模式    已开启（UDP / 游戏都走渡口）", Theme.Good);
-                    SetText(_btnGlobal, "关闭", Theme.Muted);
+                    SetText(_btnGlobal, "关闭全局模式", Color.White);
+                    _btnGlobal.BackColor = Theme.Idle;
                 }
                 else if (_cfg.UseTun && !Elevator.IsAdmin())
                 {
                     SetText(_rowTun, "全局模式    待管理员授权", Theme.Warn);
-                    SetText(_btnGlobal, "开启", Theme.Text);
+                    SetText(_btnGlobal, "开启全局模式", Color.White);
                 }
                 else if (_cfg.UseTun && runtimeUp)
                 {
                     SetText(_rowTun, "全局模式    正在启用…", Theme.Muted);
-                    SetText(_btnGlobal, "关闭", Theme.Muted);
+                    SetText(_btnGlobal, "关闭全局模式", Color.White);
                 }
                 else
                 {
                     SetText(_rowTun, "全局模式    未开启", Theme.Muted);
-                    SetText(_btnGlobal, "开启", Theme.Text);
+                    SetText(_btnGlobal, "开启全局模式", Color.White);
+                    _btnGlobal.BackColor = Theme.Accent;
                 }
                 _rowTun.Visible = true;
                 _btnGlobal.Visible = true;
