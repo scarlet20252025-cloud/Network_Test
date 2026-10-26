@@ -71,10 +71,17 @@ $MiExe = 'D:\Clash Verge\verge-mihomo.exe'
 # SSH 隧道端口候选（按优先级）。探测时会跳过没在听的。
 $SshPortCandidates = @(10800, 10801, 10808, 10809)
 
-# 远端 UDP 中继（pcs 上的 ferry-socks5-server.py --udp）。
-# 这是整条链路唯一能承载 UDP 的线路，详见 config.template.yaml 里的注释。
-$UdpHost = '10.13.24.1'
-$UdpPort = 1080
+# UDP 线路：走**本地**代理（客户端自己的 SOCKS，10800/10801）。
+#
+# 以前这里写的是 10.13.24.1:1080，实际一直是坏的：远端 ferry-socks5-server
+# 并不在 1080 监听 UDP —— 它按 RFC 1928，每建立一条 ASSOCIATE 就新开一个
+# 随机 UDP socket，端口放在回复的 BND 里。直接往 1080 发报文只会收到
+# ICMP port unreachable（2026-10-27 实测确认）。
+#
+# 现在客户端本地 SOCKS 补上了 UDP ASSOCIATE（1.0.8），所以 mihomo 只要把 UDP
+# 交给 127.0.0.1:<本地端口>，由客户端去和上游协商真实端口即可。
+$UdpHost = '127.0.0.1'
+$UdpPort = 0   # 渲染时换成探测到的本地 SOCKS 端口，见 Build-Config
 
 # SSH 隧道目标。pcs 在 ~/.ssh/config 里有别名，但这里写全参数更明确 ——
 # 自启时环境变量/配置目录可能不完整，别名解析失败会得到「Could not resolve」。
@@ -253,11 +260,11 @@ function Build-Config {
     Replace('__API_PORT__', [string]$ApiPort).
     Replace('__SSH_PORT__', [string]$sshPort).
     Replace('__UDP_HOST__', $UdpHost).
-    Replace('__UDP_PORT__', [string]$UdpPort).
+    Replace('__UDP_PORT__', [string]$(if ($UdpPort -gt 0) { $UdpPort } else { $sshPort })).
     Replace('__TUN_ENABLE__', $(if ($script:TunEnabled) { 'true' } else { 'false' }))
   # mihomo 要求 UTF-8 无 BOM（带 BOM 会报 yaml 解析错）
   [IO.File]::WriteAllText($ConfigPath, $out, (New-Object Text.UTF8Encoding $false))
-  Write-KLog "配置已渲染: SSH=$sshPort mixed=$MixedPort api=$ApiPort UDP=$UdpHost`:$UdpPort TUN=$($script:TunEnabled)"
+  Write-KLog "配置已渲染: SSH=$sshPort mixed=$MixedPort api=$ApiPort UDP=$UdpHost`:$([string]$(if ($UdpPort -gt 0) { $UdpPort } else { $sshPort })) TUN=$($script:TunEnabled)"
   return $sshPort
 }
 

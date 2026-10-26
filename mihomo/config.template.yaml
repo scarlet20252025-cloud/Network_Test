@@ -129,7 +129,7 @@ proxies:
     port: 1080
     udp: false
 
-  # 上游三：pcs 上的 UDP 中继（**唯一支持 UDP 的线路**）
+  # UDP 线路：本地客户端代理（它再和远端协商 UDP 端口，见 keeper 的注释）
   #
   # 这是 ferry-socks5-server.py v2 新增的 UDP ASSOCIATE 能力。
   # 走的是校园网直连（不是 WG、不是 SSH），实测 UDP 往返 6.8ms。
