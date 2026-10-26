@@ -936,7 +936,11 @@ async def main():
                     help='启用 UDP ASSOCIATE（默认关闭，因为它是可选的暴露面）')
     ap.add_argument('--rate-mb', type=float, default=10.0,
                     help='per-IP bandwidth cap in MB/s. 0 = unlimited. Default 10')
-    ap.add_argument('--clash-proxy', default='auto',
+    # 默认 **off**：渡口只做「借一台能上网的校内主机」这一个用途，
+    # 不做翻墙出口。历史默认是 auto —— 直连失败就把流量交给本机 Clash 竞速，
+    # 等于任何被墙的站点都能借这条路出去，这正是 2026-10-27 用户要求取消的。
+    # 需要时可以用 --clash-proxy auto 显式开回来。
+    ap.add_argument('--clash-proxy', default='off',
                     help='local proxy used when direct fails, e.g. 127.0.0.1:7890. '
                          'auto (default) = probe common ports; off = disable')
     args = ap.parse_args()
