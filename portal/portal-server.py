@@ -140,6 +140,25 @@ CREATE TABLE IF NOT EXISTS events (
 -- 为什么单独存一张表而不是只留内存：_hourly 只保留最近 24 小时，
 -- 进程一重启就清空。「这台机器一共用了多少流量」这种问题必须跨重启可信，
 -- 否则详情窗里那个数字每次重启都归零，等于没有。
+-- 流量时间桶：**持久化**的多粒度统计基础。
+--
+-- 为什么不用内存里的 _hourly：那个只留 24 小时，进程一重启就没了。
+-- 要做「250 小时 / 100 小时 / 50 小时」这种跨度，必须落库。
+--
+-- 粒度选 5 分钟：250 小时 = 3000 个桶，单表几十万行以内，SQLite 毫无压力；
+-- 再细（1 分钟）就没必要 —— 图表上一个点不到 1 像素。
+CREATE TABLE IF NOT EXISTS traffic_bucket (
+    bucket_ts   INTEGER NOT NULL,   -- 对齐到 300 秒
+    ip          TEXT NOT NULL,
+    rx          INTEGER DEFAULT 0,  -- 本桶内下行字节增量
+    tx          INTEGER DEFAULT 0,
+    peak_rx     INTEGER DEFAULT 0,  -- 本桶内峰值速率（字节/秒）
+    peak_tx     INTEGER DEFAULT 0,
+    PRIMARY KEY (bucket_ts, ip)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bucket_ts ON traffic_bucket(bucket_ts DESC);
+
 CREATE TABLE IF NOT EXISTS traffic (
     ip          TEXT PRIMARY KEY,
     total_rx    INTEGER DEFAULT 0,
@@ -940,6 +959,11 @@ _totals = {}          # ip -> {'rx','tx','peakRx','peakTx','first'}
 _totals_last_flush = 0.0
 TOTAL_FLUSH_SEC = 60
 
+# 统计桶：5 分钟一个，保留 250 小时（≈10.4 天）。
+# 250 小时 = 3000 桶，单设备 3000 行，10 台设备 3 万行 —— SQLite 毫无压力。
+STATS_BUCKET_SEC = 300
+STATS_KEEP_HOURS = 250
+
 
 def note_totals(ip, d_rx, d_tx, rx_bps, tx_bps):
     """把这次心跳的增量累到内存。"""
@@ -966,6 +990,7 @@ def flush_totals(db, force=False):
         return
     items = list(_totals.items())
     _totals_last_flush = now_t
+    bucket = int(now_t // STATS_BUCKET_SEC) * STATS_BUCKET_SEC
     for ip, t in items:
         try:
             db.x(
@@ -979,6 +1004,16 @@ def flush_totals(db, force=False):
                 '  updated_at = excluded.updated_at',
                 (ip, t['rx'], t['tx'], t['peakRx'], t['peakTx'],
                  t['first'], int(now_t)))
+            # 同时写时间桶。没有增量就不写，避免空桶把表撑大。
+            if t['rx'] or t['tx'] or t['peakRx'] or t['peakTx']:
+                db.x(
+                    'INSERT INTO traffic_bucket (bucket_ts, ip, rx, tx, peak_rx, peak_tx) '
+                    'VALUES (?,?,?,?,?,?) '
+                    'ON CONFLICT(bucket_ts, ip) DO UPDATE SET '
+                    '  rx = rx + excluded.rx, tx = tx + excluded.tx,'
+                    '  peak_rx = MAX(peak_rx, excluded.peak_rx),'
+                    '  peak_tx = MAX(peak_tx, excluded.peak_tx)',
+                    (bucket, ip, t['rx'], t['tx'], t['peakRx'], t['peakTx']))
         except Exception as e:
             sys.stderr.write('[traffic] flush %s failed: %s\n' % (ip, e))
     # 已经写进 DB 的部分清零，避免下一轮重复累加
@@ -987,6 +1022,187 @@ def flush_totals(db, force=False):
             _totals[ip]['rx'] = 0
             _totals[ip]['tx'] = 0
             _totals[ip]['first'] = int(now_t)
+
+
+# ── 多维度统计 ────────────────────────────────────────────────
+#
+# 窗口 → 显示粒度。思路和异星工厂的产量统计一样：选的时间跨度越大，
+# 曲线上的点越粗，但**总量永远准确**（桶是可加的，聚合只是求和）。
+#
+# 粒度不能太小：250 小时如果按 5 分钟画就是 3000 个点，一个点不到半像素，
+# 既看不出趋势又拖慢浏览器。所以按窗口给一个「点数在 60~300 之间」的粒度。
+STATS_WINDOWS = [
+    # key,      标签,      秒,            粒度(秒),   点数
+    ('10m',  '10 分钟',   600,            60,        '分'),
+    ('1h',   '1 小时',    3600,           60,        '分'),
+    ('5h',   '5 小时',    5 * 3600,       300,       '5 分'),
+    ('10h',  '10 小时',   10 * 3600,      300,       '5 分'),
+    ('50h',  '50 小时',   50 * 3600,      1800,      '30 分'),
+    ('100h', '100 小时',  100 * 3600,     3600,      '时'),
+    ('250h', '250 小时',  250 * 3600,     7200,      '2 时'),
+    ('all',  '总览',      0,              86400,     '天'),
+]
+
+
+def _stats_window(key):
+    for w in STATS_WINDOWS:
+        if w[0] == key:
+            return w
+    return STATS_WINDOWS[1]
+
+
+def stats_series(db, key, ip=None):
+    """返回某窗口的时间序列。
+
+    ip=None 表示全站合计（把同一时刻各设备的桶相加）。
+    每项：{t, rx, tx, rxBps, txBps}，t 是桶起点（unix 秒）。
+    """
+    win = _stats_window(key)
+    span = win[2]
+    step = win[3]
+
+    now_t = int(time.time())
+    if span:
+        start = now_t - span
+    else:
+        # 总览：从最早一条记录开始
+        row = db.q1('SELECT MIN(bucket_ts) AS m FROM traffic_bucket')
+        start = (row['m'] if row and row['m'] else now_t) - step
+
+    where = 'WHERE bucket_ts >= ?'
+    args = [start]
+    if ip:
+        where += ' AND ip = ?'
+        args.append(ip)
+
+    rows = db.q('SELECT bucket_ts, SUM(rx) AS rx, SUM(tx) AS tx, '
+                'MAX(peak_rx) AS prx, MAX(peak_tx) AS ptx '
+                'FROM traffic_bucket ' + where + ' '
+                'GROUP BY bucket_ts ORDER BY bucket_ts', tuple(args))
+
+    # 按显示粒度归并
+    agg = {}
+    for r in rows:
+        b = (int(r['bucket_ts']) // step) * step
+        a = agg.get(b)
+        if a is None:
+            a = agg[b] = {'rx': 0, 'tx': 0, 'prx': 0, 'ptx': 0}
+        a['rx'] += int(r['rx'] or 0)
+        a['tx'] += int(r['tx'] or 0)
+        a['prx'] = max(a['prx'], int(r['prx'] or 0))
+        a['ptx'] = max(a['ptx'], int(r['ptx'] or 0))
+
+    out = []
+    for b in sorted(agg.keys()):
+        a = agg[b]
+        out.append({
+            't': b,
+            'rx': a['rx'],
+            'tx': a['tx'],
+            # 桶内平均速率（字节/秒）：总量 / 桶宽
+            'rxBps': int(a['rx'] / step),
+            'txBps': int(a['tx'] / step),
+            # 桶内峰值速率
+            'peakRx': a['prx'],
+            'peakTx': a['ptx'],
+        })
+    return {'key': key, 'label': win[1], 'unit': win[4],
+            'step': step, 'span': span, 'points': out}
+
+
+def stats_summary(db, key, ip=None):
+    """窗口汇总：总量、峰值、均值、活跃设备数、覆盖时段。"""
+    win = _stats_window(key)
+    span = win[2]
+    now_t = int(time.time())
+
+    where = ''
+    args = []
+    if span:
+        where = 'WHERE bucket_ts >= ?'
+        args.append(now_t - span)
+    if ip:
+        where += (' AND ' if where else 'WHERE ') + 'ip = ?'
+        args.append(ip)
+
+    row = db.q1('SELECT COUNT(*) AS n, SUM(rx) AS rx, SUM(tx) AS tx, '
+                'MAX(peak_rx) AS prx, MAX(peak_tx) AS ptx, '
+                'MIN(bucket_ts) AS t0, MAX(bucket_ts) AS t1, '
+                'COUNT(DISTINCT ip) AS hosts '
+                'FROM traffic_bucket ' + where, tuple(args))
+
+    n = int((row['n'] if row else 0) or 0)
+    rx = int((row['rx'] if row else 0) or 0)
+    tx = int((row['tx'] if row else 0) or 0)
+    prx = int((row['prx'] if row else 0) or 0)
+    ptx = int((row['ptx'] if row else 0) or 0)
+    hosts = int((row['hosts'] if row else 0) or 0)
+
+    # 实际覆盖的时长用「桶数 × 桶宽」，不用 span ——
+    # 刚装好时只有几个桶，按 span 算平均速率会低得毫无意义。
+    covered = n * STATS_BUCKET_SEC
+    if covered < 1:
+        covered = 1
+
+    return {
+        'key': key,
+        'label': win[1],
+        'buckets': n,
+        'hosts': hosts,
+        'rx': rx,
+        'tx': tx,
+        'total': rx + tx,
+        # 平均速率（字节/秒）
+        'avgRxBps': int(rx / covered),
+        'avgTxBps': int(tx / covered),
+        # 峰值速率（字节/秒）
+        'peakRx': prx,
+        'peakTx': ptx,
+        'from': int((row['t0'] if row else 0) or 0),
+        'to': int((row['t1'] if row else 0) or 0),
+        'coveredSec': covered,
+    }
+
+
+def stats_hosts(db, key):
+    """窗口内每台设备的用量排行。"""
+    win = _stats_window(key)
+    span = win[2]
+    args = []
+    where = ''
+    if span:
+        where = 'WHERE b.bucket_ts >= ?'
+        args.append(int(time.time()) - span)
+
+    rows = db.q(
+        'SELECT b.ip, SUM(b.rx) AS rx, SUM(b.tx) AS tx, '
+        'MAX(b.peak_rx) AS prx, MAX(b.peak_tx) AS ptx, COUNT(*) AS n '
+        'FROM traffic_bucket b ' + where + ' '
+        'GROUP BY b.ip ORDER BY (SUM(b.rx) + SUM(b.tx)) DESC LIMIT 30',
+        tuple(args))
+
+    notes = {}
+    try:
+        for c in db.q('SELECT ip, note FROM clients'):
+            notes[c['ip']] = c['note'] or ''
+    except Exception:
+        pass
+
+    out = []
+    for r in rows:
+        n = int(r['n'] or 0)
+        covered = max(1, n * STATS_BUCKET_SEC)
+        rx = int(r['rx'] or 0)
+        tx = int(r['tx'] or 0)
+        out.append({
+            'ip': r['ip'],
+            'note': notes.get(r['ip'], ''),
+            'rx': rx, 'tx': tx, 'total': rx + tx,
+            'avgRxBps': int(rx / covered), 'avgTxBps': int(tx / covered),
+            'peakRx': int(r['prx'] or 0), 'peakTx': int(r['ptx'] or 0),
+            'buckets': n,
+        })
+    return out
 
 
 def traffic_of(db, ip):
@@ -2359,6 +2575,68 @@ tr.fb-more>td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accen
 .dl-fold .inner .step{margin:12px 0 0}
 .dl-fold .inner .step .n{width:22px;height:22px;line-height:22px;font-size:11px}
 
+/* ── 多维统计面板 ──
+   思路抄异星工厂的产量统计：时间跨度越大，曲线上的点越粗，
+   但总量永远准确（桶可加，聚合只是求和）。 */
+.statpanel{background:var(--card);border:1px solid var(--line);
+  border-radius:14px;padding:16px 18px 18px;margin:0 0 16px;
+  box-shadow:var(--shadow)}
+.stat-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  margin-bottom:14px}
+.stat-title{font-size:14px;font-weight:700}
+.stat-sub{font-size:11.5px;color:var(--fg2)}
+
+/* 时间窗口切换：一排胶囊 */
+.winchips{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto}
+.winchips button{background:var(--card2);border:1px solid var(--line);
+  color:var(--fg2);font-size:11.5px;font-family:inherit;cursor:pointer;
+  padding:4px 10px;border-radius:99px;transition:all .15s}
+.winchips button:hover{border-color:var(--accent);color:var(--accent)}
+.winchips button.on{background:color-mix(in srgb,var(--accent) 16%,transparent);
+  border-color:var(--accent);color:var(--accent);font-weight:600}
+
+/* 汇总卡片：一行五张，窄屏折行 */
+.statcards{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;
+  margin:14px 0 4px}
+@media(max-width:900px){.statcards{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:560px){.statcards{grid-template-columns:repeat(2,1fr)}}
+.scard{background:var(--card2);border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px;min-width:0}
+.scard .k{font-size:11px;color:var(--fg2);margin-bottom:4px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.scard .v{font-size:16px;font-weight:700;font-family:Consolas,Monaco,monospace;
+  line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scard .s{font-size:10.5px;color:var(--fg2);margin-top:2px}
+.scard.blue .v{color:#4a9eff}
+.scard.orange .v{color:#ffa657}
+.scard.green .v{color:var(--ok)}
+.scard.purple .v{color:#a58cff}
+
+/* 统计图表：比实时图高一点，看趋势更清楚 */
+.stat-chart{position:relative;height:170px;margin-top:12px;
+  background:linear-gradient(180deg,color-mix(in srgb,var(--card2) 60%,transparent),transparent);
+  border-radius:10px;overflow:hidden}
+.stat-chart svg{display:block;width:100%;height:100%;padding-left:56px;
+  box-sizing:border-box}
+.stat-chart .grid-line{stroke:var(--line);stroke-width:1;
+  stroke-dasharray:3 4;opacity:.65}
+.stat-y{position:absolute;left:0;top:0;bottom:0;width:56px;pointer-events:none}
+.stat-y .ylab{position:absolute;left:4px;transform:translateY(-50%);
+  font-size:10px;color:var(--fg2);font-family:Consolas,Monaco,monospace;
+  white-space:nowrap}
+.stat-axis{display:flex;justify-content:space-between;margin:3px 2px 0;
+  font-size:9.5px;color:var(--fg2);font-family:Consolas,Monaco,monospace}
+
+/* 设备排行 */
+.stat-hosts{margin-top:16px}
+.stat-hosts h4{margin:0 0 8px;font-size:12.5px;color:var(--fg2);
+  font-weight:600;letter-spacing:.3px}
+.stat-hosts table{font-size:12px}
+.stat-hosts .bar{height:3px;border-radius:2px;background:var(--line);
+  margin-top:4px;overflow:hidden}
+.stat-hosts .bar>i{display:block;height:100%;border-radius:2px;
+  background:linear-gradient(90deg,#4a9eff,#a58cff)}
+
 /* 授权档位：一排可选按钮，比下拉框少一次点击 */
 .tiers{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 0}
 .tier{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
@@ -2423,6 +2701,7 @@ LIVE_UI = r'''
   <div class="perfgrid">
     <div class="pcard up">
       <div class="pico">&#8593;</div>
+
       <div class="pbody"><div class="plbl">上传速度</div>
         <div class="pval"><span id="pcTxSpd">—</span></div></div>
     </div>
@@ -2450,6 +2729,65 @@ LIVE_UI = r'''
       <div class="pico">&#9635;</div>
       <div class="pbody"><div class="plbl">服务端内存</div>
         <div class="pval"><span id="pcMem">—</span></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── 多维统计 ──
+     和上面的实时图分开：实时图是「此刻在发生什么」，这里是「过去一段时间用了多少」。
+     两者混在一起会让人误以为实时图也能切时间范围。 -->
+<div class="statpanel" id="sec-stats">
+  <div class="stat-head">
+    <span class="stat-title">多维统计</span>
+    <span class="stat-sub" id="statRange">—</span>
+    <div class="winchips" id="statWins"></div>
+  </div>
+
+  <div class="statcards">
+    <div class="scard blue"><div class="k">下行总量</div><div class="v" id="stRx">—</div><div class="s" id="stRxAvg">—</div></div>
+    <div class="scard orange"><div class="k">上行总量</div><div class="v" id="stTx">—</div><div class="s" id="stTxAvg">—</div></div>
+    <div class="scard green"><div class="k">合计</div><div class="v" id="stTotal">—</div><div class="s" id="stHosts">—</div></div>
+    <div class="scard purple"><div class="k">峰值速率</div><div class="v" id="stPeak">—</div><div class="s" id="stPeakAt">—</div></div>
+    <div class="scard"><div class="k">覆盖时段</div><div class="v" id="stCover">—</div><div class="s" id="stBuckets">—</div></div>
+  </div>
+
+  <div class="stat-chart">
+    <svg id="statChart" viewBox="0 0 800 170" preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="sgDown" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#4a9eff" stop-opacity="0.30"/>
+          <stop offset="100%" stop-color="#4a9eff" stop-opacity="0"/>
+        </linearGradient>
+        <linearGradient id="sgUp" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#ffa657" stop-opacity="0.28"/>
+          <stop offset="100%" stop-color="#ffa657" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      <g id="statGrid"></g>
+      <path id="statAreaUp"   fill="url(#sgUp)"   d=""></path>
+      <path id="statAreaDown" fill="url(#sgDown)" d=""></path>
+      <polyline id="statLineUp"   fill="none" stroke="#ffa657" stroke-width="1.5"
+                stroke-linejoin="round" stroke-linecap="round" points=""></polyline>
+      <polyline id="statLineDown" fill="none" stroke="#4a9eff" stroke-width="1.5"
+                stroke-linejoin="round" stroke-linecap="round" points=""></polyline>
+    </svg>
+    <div class="stat-y" id="statY"></div>
+  </div>
+  <div class="stat-axis" id="statAxis"></div>
+
+  <div class="stat-hosts">
+    <h4>设备用量排行（本窗口）</h4>
+    <div class="listwrap sm" style="max-height:260px">
+      <table>
+        <thead><tr>
+          <th>设备</th>
+          <th class="numh">下行</th>
+          <th class="numh">上行</th>
+          <th class="numh">峰值</th>
+          <th style="width:90px"></th>
+        </tr></thead>
+        <tbody id="statHosts"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      </table>
     </div>
   </div>
 </div>
@@ -3361,6 +3699,218 @@ LIVE_UI = r'''
     });
   }
 
+  // ── 多维统计 ──────────────────────────────────────────────
+  var statWin = '1h';
+  var statWinsBuilt = false;
+
+  function fmtDur(sec){
+    if (!sec) return '—';
+    if (sec < 3600) return Math.round(sec / 60) + ' 分钟';
+    if (sec < 86400) return (sec / 3600).toFixed(sec < 36000 ? 1 : 0) + ' 小时';
+    return (sec / 86400).toFixed(1) + ' 天';
+  }
+
+  function fmtClock(ts){
+    var d = new Date(ts * 1000);
+    function p(x){ return (x < 10 ? '0' : '') + x; }
+    return p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function fmtDay(ts){
+    var d = new Date(ts * 1000);
+    function p(x){ return (x < 10 ? '0' : '') + x; }
+    return (d.getMonth() + 1) + '/' + p(d.getDate());
+  }
+
+  // 窗口按跨度选时间格式：短窗口显示时分，长窗口显示日期
+  function fmtTick(ts, span){
+    return span && span > 86400 ? fmtDay(ts) : fmtClock(ts);
+  }
+
+  function buildStatWins(windows){
+    if (statWinsBuilt) return;
+    var box = document.getElementById('statWins');
+    if (!box) return;
+    box.innerHTML = '';
+    (windows || []).forEach(function(w){
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = w.label;
+      b.setAttribute('data-w', w.key);
+      if (w.key === statWin) b.className = 'on';
+      b.addEventListener('click', function(){
+        statWin = w.key;
+        Array.prototype.forEach.call(box.querySelectorAll('button'), function(x){
+          x.className = (x.getAttribute('data-w') === statWin) ? 'on' : '';
+        });
+        loadStats();
+      });
+      box.appendChild(b);
+    });
+    statWinsBuilt = true;
+  }
+
+  function loadStats(){
+    fetch('/api/admin/stats?w=' + encodeURIComponent(statWin),
+          {credentials:'same-origin', cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d.ok) return;
+        buildStatWins(d.windows);
+        renderStats(d);
+      })
+      .catch(function(){});
+  }
+
+  function renderStats(d){
+    var sm = d.summary || {};
+    var se = d.series || {};
+    var pts = se.points || [];
+
+    var set = function(id, v){ var e = document.getElementById(id); if (e) e.textContent = v; };
+    set('stRx', fmtBytes2(sm.rx || 0));
+    set('stTx', fmtBytes2(sm.tx || 0));
+    set('stTotal', fmtBytes2(sm.total || 0));
+    set('stRxAvg', '均 ' + fmtSpeed(sm.avgRxBps || 0));
+    set('stTxAvg', '均 ' + fmtSpeed(sm.avgTxBps || 0));
+    set('stHosts', (sm.hosts || 0) + ' 台设备');
+
+    var pk = Math.max(sm.peakRx || 0, sm.peakTx || 0);
+    set('stPeak', fmtSpeed(pk));
+    set('stPeakAt', (sm.peakRx || 0) >= (sm.peakTx || 0) ? '下行峰值' : '上行峰值');
+
+    set('stCover', fmtDur(sm.coveredSec || 0));
+    set('stBuckets', (sm.buckets || 0) + ' 个 ' + (d.bucketSec / 60) + ' 分钟桶');
+
+    var range = document.getElementById('statRange');
+    if (range) {
+      var from = sm.from ? fmtDay(sm.from) + ' ' + fmtClock(sm.from) : '—';
+      var to = sm.to ? fmtDay(sm.to) + ' ' + fmtClock(sm.to) : '—';
+      range.textContent = '粒度 ' + (se.unit || '—') + ' · ' + from + ' → ' + to;
+    }
+
+    renderStatChart(pts, se.span || 0);
+    renderStatHosts(d.hosts || []);
+  }
+
+  function renderStatChart(series, span){
+    var svg = document.getElementById('statChart');
+    if (!svg) return;
+    var W = 800, H = 170, PAD_T = 12, PAD_B = 8;
+    var plotH = H - PAD_T - PAD_B;
+
+    var maxV = 0;
+    for (var i = 0; i < series.length; i++) {
+      if (series[i].rx > maxV) maxV = series[i].rx;
+      if (series[i].tx > maxV) maxV = series[i].tx;
+    }
+    if (maxV < 1024) maxV = 1024;
+
+    // 和实时图同一套刻度取整逻辑（显示单位下取整，避免 57.2 这种刻度）
+    var du = ['B', 'KB', 'MB', 'GB'], di = 0, dv = maxV / 3;
+    while (dv >= 1024 && di < du.length - 1) { dv /= 1024; di++; }
+    var dmag = Math.pow(10, Math.floor(Math.log10(dv || 1)));
+    var dnorm = (dv || 1) / dmag;
+    var dn;
+    if (dnorm <= 1) dn = 1;
+    else if (dnorm <= 1.5) dn = 1.5;
+    else if (dnorm <= 2) dn = 2;
+    else if (dnorm <= 3) dn = 3;
+    else if (dnorm <= 5) dn = 5;
+    else dn = 10;
+    var top = dn * dmag * Math.pow(1024, di) * 3;
+
+    function pts(vals){
+      var n = vals.length;
+      if (!n) return '';
+      var arr = [];
+      for (var k = 0; k < n; k++) {
+        var x = (n === 1) ? W / 2 : (k / (n - 1)) * W;
+        var y = plotH - Math.min(1, vals[k] / top) * plotH;
+        arr.push(x.toFixed(1) + ',' + y.toFixed(1));
+      }
+      return arr.join(' ');
+    }
+    function area(vals){
+      var p = pts(vals);
+      if (!p) return '';
+      return 'M0,' + plotH + ' L' + p.split(' ').join(' L') + ' L' + W + ',' + plotH + ' Z';
+    }
+
+    var rxVals = [], txVals = [];
+    for (var j = 0; j < series.length; j++) {
+      rxVals.push(series[j].rx || 0);
+      txVals.push(series[j].tx || 0);
+    }
+
+    var e;
+    if ((e = document.getElementById('statLineDown'))) e.setAttribute('points', pts(rxVals));
+    if ((e = document.getElementById('statLineUp')))   e.setAttribute('points', pts(txVals));
+    if ((e = document.getElementById('statAreaDown'))) e.setAttribute('d', area(rxVals));
+    if ((e = document.getElementById('statAreaUp')))   e.setAttribute('d', area(txVals));
+
+    // 网格 + Y 轴标签
+    var grid = document.getElementById('statGrid');
+    var ybox = document.getElementById('statY');
+    if (grid) {
+      var g = '';
+      for (var gi = 0; gi <= 3; gi++) {
+        var yy = PAD_T + (plotH / 3) * gi;
+        g += '<line class="grid-line" x1="0" y1="' + yy.toFixed(1) +
+             '" x2="800" y2="' + yy.toFixed(1) + '"></line>';
+      }
+      grid.innerHTML = g;
+    }
+    if (ybox) {
+      var yh = '';
+      for (var yi = 0; yi <= 3; yi++) {
+        var val = top - (top / 3) * yi;
+        var yy2 = ((PAD_T + (plotH / 3) * yi) / H) * 100;
+        yh += '<div class="ylab" style="top:' + yy2.toFixed(1) + '%">' +
+              fmtSpeed(val) + '</div>';
+      }
+      ybox.innerHTML = yh;
+    }
+
+    // 时间轴：首、中、尾三个刻度
+    var ax = document.getElementById('statAxis');
+    if (ax) {
+      if (!series.length) { ax.innerHTML = ''; }
+      else {
+        var t0 = series[0].t, t2 = series[series.length - 1].t;
+        var tm = Math.round((t0 + t2) / 2);
+        ax.innerHTML = '<span>' + fmtTick(t0, span) + '</span>' +
+                       '<span>' + fmtTick(tm, span) + '</span>' +
+                       '<span>' + fmtTick(t2, span) + '</span>';
+      }
+    }
+  }
+
+  function renderStatHosts(hosts){
+    var body = document.getElementById('statHosts');
+    if (!body) return;
+    if (!hosts.length) {
+      body.innerHTML = '<tr><td colspan="5" class="muted">这个窗口还没有流量记录</td></tr>';
+      return;
+    }
+    var maxTotal = 1;
+    hosts.forEach(function(h){ maxTotal = Math.max(maxTotal, h.total || 0); });
+
+    var html = '';
+    hosts.forEach(function(h){
+      var pct = Math.max(2, Math.round((h.total / maxTotal) * 100));
+      var name = h.note ? (h.note + ' <span class="muted">' + h.ip + '</span>') : h.ip;
+      html += '<tr>'
+        + '<td class="mono nowrap">' + name + '</td>'
+        + '<td class="num">' + fmtBytes2(h.rx) + '</td>'
+        + '<td class="num">' + fmtBytes2(h.tx) + '</td>'
+        + '<td class="num">' + fmtSpeed(Math.max(h.peakRx, h.peakTx)) + '</td>'
+        + '<td><div class="bar"><i style="width:' + pct + '%"></i></div></td>'
+        + '</tr>';
+    });
+    body.innerHTML = html;
+  }
+
   function bootAll(){
     // 只调「需要手动触发」的那几个。
     // bindIpCells / bindAllNotes 各自在定义处就注册了 DOMContentLoaded，
@@ -3369,6 +3919,10 @@ LIVE_UI = r'''
     //   一执行就 ReferenceError，后面所有绑定全跳过：
     //   表现就是「意见反馈」永远停在「加载中…」。
     bindNetCtl(); bindFeedback(); bindNewCode();
+    // 统计面板：进来先拉一次，之后每 30 秒跟着 tick 一起刷（比实时图慢，
+    // 因为桶本身是 5 分钟粒度，刷太快没有意义）。
+    loadStats();
+    setInterval(loadStats, 30000);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', bootAll);
@@ -3545,6 +4099,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
 <nav class="adminnav">
   <a href="#sec-live">概览</a>
   <a href="#sec-keys">密钥</a>
+  <a href="#sec-stats">统计</a>
   <a href="#sec-feedback">反馈</a>
   <a href="#sec-users">设备</a>
   <a href="#sec-events">事件</a>
@@ -4661,6 +5216,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_download(path)
             elif path == '/logout':
                 self.handle_logout()
+            elif path == '/api/admin/stats':
+                self.handle_api_admin_stats()
             elif path == '/api/admin/live':
                 self.handle_api_admin_live()
             elif path == '/api/admin/net':
@@ -5608,6 +6165,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             'rateFileMtime': _mtime,
             'isSystem': (os.environ.get('USERNAME') or '').upper() == 'SYSTEM',
         })
+    def handle_api_admin_stats(self):
+        """多维统计：窗口序列 + 汇总 + 设备排行。
+
+        GET /api/admin/stats?w=10m|1h|5h|10h|50h|100h|250h|all&ip=<可选>
+        """
+        if not self.is_admin():
+            self.send_json({'ok': False, 'error': 'forbidden'}, 403)
+            return
+
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        key = (q.get('w') or ['1h'])[0]
+        ip = (q.get('ip') or [''])[0] or None
+
+        keys = [w[0] for w in STATS_WINDOWS]
+        if key not in keys:
+            key = '1h'
+
+        try:
+            series = stats_series(self.db, key, ip)
+            summary = stats_summary(self.db, key, ip)
+            hosts = stats_hosts(self.db, key)
+        except Exception as e:
+            self.send_json({'ok': False, 'error': str(e)}, 500)
+            return
+
+        self.send_json({
+            'ok': True,
+            'window': key,
+            'windows': [{'key': w[0], 'label': w[1]} for w in STATS_WINDOWS],
+            'series': series,
+            'summary': summary,
+            'hosts': hosts,
+            'bucketSec': STATS_BUCKET_SEC,
+            'keepHours': STATS_KEEP_HOURS,
+        })
+
     def handle_api_admin_live(self):
         """管理面版轮询用。只有管理员能看 —— 这里会暴露谁在用。"""
         if not self.is_admin():
@@ -6147,6 +6740,13 @@ def main():
                 # 事件表只留最近 2000 条，防止无限增长
                 db.x('DELETE FROM events WHERE id NOT IN '
                      '(SELECT id FROM events ORDER BY id DESC LIMIT 2000)')
+                # 清掉超过保留期的统计桶（默认 250 小时）
+                try:
+                    cutoff = int(time.time()) - STATS_KEEP_HOURS * 3600
+                    db.x('DELETE FROM traffic_bucket WHERE bucket_ts < ?', (cutoff,))
+                except Exception as e:
+                    sys.stderr.write('[janitor] 清理统计桶失败: %s\n' % e)
+
                 # 每天备份一份数据库，只留最近 7 天。
                 #
                 # 为什么在这里做：portal.db 里是全部账号的 token、授权到期时间、
