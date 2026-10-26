@@ -8,7 +8,7 @@
 
 ```
 git log -S"PrivateKey"  →  wireguard/ferry-wg.conf
-                            PrivateKey = MGBFbXlf+…（真私钥，不是示例）
+                            PrivateKey = <旧私钥>（真私钥，不是示例）
 ```
 
 同时远端 `pcs` 上 `wg0` 网卡还是 **Up** —— 也就是说这把私钥当时**仍然可用**。
@@ -86,7 +86,7 @@ git log -S"PrivateKey"  →  wireguard/ferry-wg.conf
 
 | 原值 | 替换为 | 出现位置 |
 |---|---|---|
-| `awwDHRG2…`（旧管理密码） | `<REDACTED-ADMIN-PW>` | `tools/verify-netctl-live.py`、`verify-note-edit.py` |
+| `<旧管理密码>` | `<REDACTED-ADMIN-PW>` | `tools/verify-netctl-live.py`、`verify-note-edit.py` |
 | `sngsb4-…`（旧激活令牌） | `<REDACTED-TOKEN>` | `HANDOVER-打包工作.md` |
 
 然后 `--force` 推送（所有 commit SHA 都变了）。
