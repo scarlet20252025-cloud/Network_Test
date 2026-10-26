@@ -6214,6 +6214,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """
         want = (qs.get('ip') or [''])[0].strip()
         src = self.client_ip()
+        with_token = (qs.get('with_token') or ['0'])[0].strip() == '1'
 
         # 不带 ip 参数 = 让服务端自己判断「你是哪台机器」。
         # 这是最可靠的方式：client_address 就是这台机器真实的局域网 IP，
@@ -6253,11 +6254,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             'sshPort': CFG['ssh_port'],
             'httpPort': CFG['port'] + 1,
             'accountIp': want,
-            # token 故意留空 —— 用户明确要求「密钥在软件里输入激活」。
-            # 从安装包直接下发 token 的话，新用户装完就是「已激活」状态，
-            # 既看不到剩余时长，也绕过了激活这一步；而且安装包一旦被转发，
-            # 凭据就跟着泄露了。token 只能由 POST /api/activate 签发。
-            'token': '',
+            # token 默认不下发 —— 安装包不该内置凭据（转发一份安装包就泄露一个账号）。
+            # 但客户端「自己没激活」时会带 with_token=1 来要自己的令牌：
+            # 请求必须来自这台机器的 IP（上面的 src == want 校验），
+            # 等价于「这台机器本人来取自己的令牌」，所以可以给。
+            # 这样卸载重装 / 配置被清 / 换目录之后，不用再找管理员要密钥。
+            'token': (cli['token'] or '') if with_token else '',
             'fallbackProxy': '',
             # 客户端激活密钥要用。存进 config.json 后，下次换网段也不用重装。
             'portalUrl': 'http://' + host + ':' + str(CFG['port']),

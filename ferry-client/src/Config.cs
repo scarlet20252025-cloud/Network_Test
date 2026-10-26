@@ -124,6 +124,55 @@ namespace Ferry
             catch (Exception) { return false; }
         }
 
+        /// <summary>
+        /// 默认门户地址。只在「配置里连 portalUrl 都没了」时用来兜底 ——
+        /// 那种情况正是卸载重装/配置文件被删，用户除了默认地址也没别的信息。
+        /// </summary>
+        public const string DefaultPortal = "http://10.13.24.1:8080";
+
+        /// <summary>
+        /// 激活自愈（第二层）：本地三份都没有 token 时，按**来源 IP** 向服务端要。
+        ///
+        /// 服务端 /api/config 只允许查「自己来源 IP」那一份 —— 知道别人的局域网
+        /// IP 也拿不到别人的令牌。客户端以前从不调它（只有安装器调），所以
+        /// 「卸载重装 / 配置文件被清 / 换目录」都只能重新找管理员要密钥。
+        ///
+        /// 只补 token / accountIp / expiresAt / portalUrl 四个字段，**不整份覆盖**
+        /// （用户可能改过端口、勾过 TUN）。返回 true 表示真的恢复了。
+        ///
+        /// portalUrl 为空时用 DefaultPortal 兜底 —— 实测踩过：配置被删之后
+        /// portalUrl 也是空的，如果这里直接 return，整个自愈等于没写。
+        /// </summary>
+        public static bool RecoverFromServer(string path)
+        {
+            try
+            {
+                var cur = Load(path);
+                if (cur.Activated) return false;
+
+                var portal = cur.PortalUrl;
+                if (string.IsNullOrEmpty(portal)) portal = DefaultPortal;
+
+                var json = Api.FetchSelfConfig(portal);
+                if (string.IsNullOrEmpty(json) || json.IndexOf('{') < 0) return false;
+
+                var tmp = Path.Combine(Path.GetTempPath(), "ferry-self-config.json");
+                File.WriteAllText(tmp, json, new UTF8Encoding(false));
+                var fetched = Load(tmp);
+                try { File.Delete(tmp); } catch (Exception) { }
+                if (!fetched.Activated) return false;
+
+                cur.Token = fetched.Token;
+                cur.AccountIp = fetched.AccountIp;
+                cur.ExpiresAt = fetched.ExpiresAt;
+                cur.PortalUrl = string.IsNullOrEmpty(fetched.PortalUrl) ? portal : fetched.PortalUrl;
+                if (string.IsNullOrEmpty(cur.RemoteHost)) cur.RemoteHost = "10.13.24.1";
+                cur.Save(path);
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
         public static Cfg Load(string path)        {
             var c = new Cfg();
             var text = ReadWithBackup(path);

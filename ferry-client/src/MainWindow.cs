@@ -470,6 +470,12 @@ namespace Ferry
         void Kickoff()
         {
             Log("渡口已启动 · 账号 " + (_cfg.AccountIp.Length > 0 ? _cfg.AccountIp : "（未激活）"));
+
+            // 先把上一轮异常退出的残骸清掉，再决定要不要借网。
+            // 顺序很重要：如果先检查借网状态，会把「上次残留的 FerryTun」误认成
+            // 「自己已经在借网」，界面显示已开启、实际网络是断的。
+            CleanupLeftovers();
+
             if (_cfg.Activated) { Log("正在向门户确认授权…"); CheckLicense(true); }
             else { Log("尚未激活 —— 在「输入密钥激活」框里填入管理员给的密钥"); _txtCode.Focus(); }
 
@@ -507,6 +513,41 @@ namespace Ferry
                 CheckUpdate();
             };
             updDelay.Start();
+        }
+
+        /// <summary>
+        /// 清理上一次客户端**异常退出**留下的残局。
+        ///
+        /// 会留下的东西：
+        ///   · mihomo 子进程（客户端被任务管理器结束 / 崩溃时不跟着死）
+        ///   · FerryTun 虚拟网卡 + 它上面的默认路由（网络列表里显示「无法访问 Internet」，
+        ///     严重时整台机器上不了网 —— 用户反馈过「开机不能上网」）
+        ///   · 系统代理还指着 127.0.0.1:10801（那个端口已经没人监听）
+        ///
+        /// 为什么必须在客户端启动时做：这些都是「上一次」留下的，本次进程
+        /// 完全不知道；不做就会出现「装了个软件就上不了网」这种最恶性的问题。
+        /// </summary>
+        void CleanupLeftovers()
+        {
+            try
+            {
+                bool tunLeft = TunMode.AdapterPresent("FerryTun");
+                bool proxyToUs = FerryCore.ProxyEnabled() &&
+                                 FerryCore.ProxyServer() == _cfg.BorrowServer;
+                if (!tunLeft && !proxyToUs) return;
+
+                Log("发现上次异常退出留下的残局（网卡=" + (tunLeft ? "FerryTun" : "无") +
+                    " 代理=" + (proxyToUs ? "指向渡口" : "正常") + "），正在还原");
+
+                if (proxyToUs)
+                {
+                    try { FerryCore.RestoreDirect(_cfg, _appDir); } catch (Exception) { }
+                }
+                if (tunLeft) TunMode.CleanupStale(_appDir, Log);
+
+                Log("残局清理完成");
+            }
+            catch (Exception) { }
         }
 
         void ProbeNet()
@@ -884,6 +925,11 @@ namespace Ferry
 
             _btnUpd.IsEnabled = false;
 
+            // 记下「更新前是不是正在借网」。新实例起来后要恢复同样的状态 ——
+            // 否则用户看到的是「更新完网就断了」，还得自己再去点「开始借网」。
+            // 这台机器往往没有别的出口，这一步不是体验问题，是能不能用的问题。
+            bool wasBorrowing = _rt != null;
+
             ThreadPool.QueueUserWorkItem(delegate
             {
                 try
@@ -953,7 +999,9 @@ namespace Ferry
                         var sb2 = new StringBuilder();
                         sb2.AppendLine("@echo off");
                         sb2.AppendLine("timeout /t 2 /nobreak >nul");
-                        sb2.Append("start \"\" \"").Append(exe).Append("\" /allow-wait").AppendLine();
+                        sb2.Append("start \"\" \"").Append(exe).Append("\" /allow-wait");
+                        if (wasBorrowing) sb2.Append(" /start");
+                        sb2.AppendLine();
                         File.WriteAllText(relaunch, sb2.ToString(), Encoding.Default);
                     }
                     catch (Exception e2) { UpdateLog("写延迟启动脚本失败：" + e2.Message); }

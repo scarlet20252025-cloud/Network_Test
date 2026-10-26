@@ -269,8 +269,10 @@ namespace Ferry
             sb.AppendLine("  fake-ip-filter:");
             sb.AppendLine("    - '*.lan'");
             sb.AppendLine("    - '*.local'");
-            sb.AppendLine("    - '+.msftconnecttest.com'");
-            sb.AppendLine("    - '+.msftncsi.com'");
+            // 这里**故意不**排除 msftconnecttest / msftncsi：
+            // 让 Windows 的连通性探测走 fake-ip → TUN → 代理出去，探测成功，
+            // FerryTun 网卡就不会一直显示「无法访问 Internet」。
+            // （详见 MuteNcsiProbing 调用处被替换成 RestoreNcsiProbing 的注释。）
             sb.AppendLine("  nameserver:");
             sb.AppendLine("    - 223.5.5.5");
             sb.AppendLine("    - 119.29.29.29");
@@ -439,7 +441,19 @@ namespace Ferry
                 if (AdapterExists("FerryTun"))
                 {
                     _running = true;
-                    MuteNcsiProbing(_appDir);
+                    // 不再关闭 NCSI 主动探测。
+                    //
+                    // 旧做法是把 EnableActiveProbing 设 0。代价有两个：
+                    //   ① 关掉之后**任何**网络都不再显示「无 Internet」，客户端
+                    //      状态行成了唯一线索；
+                    //   ② FerryTun 网卡状态一直挂着「无法访问 Internet」——
+                    //      用户看到就以为网没通（实际能上），反馈过好几次。
+                    //
+                    // 新做法：让探测流量自己走代理。下面 DNS 的 fake-ip-filter
+                    // 不再把 msftconnecttest / msftncsi 排除，它们拿到 fake-ip
+                    // → 进 TUN → MATCH,ferry → 经出口机访问 → 探测成功 → 图标正常。
+                    // 万一探测失败，也只是图标难看，不影响实际流量。
+                    RestoreNcsiProbing(_appDir);
                     return "";
                 }
             }
@@ -522,8 +536,66 @@ namespace Ferry
             _log("[TUN] 残留网卡清不掉（可能被别的进程占用），TUN 会启动失败；重启电脑可彻底恢复");
         }
 
-        string PidFilePath { get { return Path.Combine(_appDir, "tun-mihomo.pid"); } }
+        /// <summary>
+        /// 静态入口：客户端**启动时**清掉上次异常退出遗留的 mihomo / FerryTun 网卡。
+        ///
+        /// 为什么必须单独有一个静态版本：这个清理要发生在「还没决定要不要借网」
+        /// 之前 —— 用户开机时客户端才刚起来，此时若上一轮崩溃留下了 FerryTun
+        /// 和默认路由，网络已经是断的，而且界面会显示「全局模式已开启」
+        /// （其实是上一次的残骸）。没有这一步，用户会以为「装了个软件就上不了网」。
+        ///
+        /// 逻辑与实例方法 CleanupStaleAdapter 相同：
+        ///   ① 按 PID 文件杀残留 mihomo（它退出时会自己回收网卡）
+        ///   ② 网卡还在才 Remove-NetAdapter 强删（禁用不算，名字仍被占用）
+        /// </summary>
+        public static void CleanupStale(string appDir, Action<string> log)
+        {
+            try
+            {
+                var pidFile = Path.Combine(appDir, "tun-mihomo.pid");
+                if (File.Exists(pidFile))
+                {
+                    try
+                    {
+                        var txt = File.ReadAllText(pidFile).Trim();
+                        int pid;
+                        if (int.TryParse(txt, out pid) && pid > 0)
+                        {
+                            var p = Process.GetProcessById(pid);   // 不存在会抛
+                            if (p != null && !p.HasExited &&
+                                p.ProcessName.IndexOf("mihomo", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                log("[TUN] 杀掉上次残留的 mihomo（PID " + pid + "）");
+                                try { p.Kill(); p.WaitForExit(4000); } catch (Exception) { }
+                                System.Threading.Thread.Sleep(1000);
+                            }
+                        }
+                    }
+                    catch (Exception) { }
+                    try { File.Delete(pidFile); } catch (Exception) { }
+                }
 
+                if (!AdapterPresent("FerryTun")) return;
+
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    log("[TUN] 发现残留网卡 FerryTun（尝试 " + (attempt + 1) + "），正在清理");
+                    RunHidden("powershell.exe",
+                        "-NoProfile -ExecutionPolicy Bypass -Command " +
+                        "\"Remove-NetAdapter -Name 'FerryTun' -Confirm:$false -ErrorAction SilentlyContinue\"", 20000);
+                    System.Threading.Thread.Sleep(1200);
+                    if (!AdapterPresent("FerryTun"))
+                    {
+                        log("[TUN] 残留网卡已清理");
+                        return;
+                    }
+                }
+                log("[TUN] 残留网卡清不掉（可能被占用），重启电脑可彻底恢复");
+            }
+            catch (Exception) { }
+        }
+
+        string PidFilePath { get { return Path.Combine(_appDir, "tun-mihomo.pid"); } }
         void SavePidFile(int pid)
         {
             try { File.WriteAllText(PidFilePath, pid.ToString(), new UTF8Encoding(false)); }

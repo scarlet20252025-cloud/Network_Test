@@ -1,3 +1,86 @@
+## v0.14.3 — 2026-10-27
+
+> 客户端 1.0.6：**激活交给服务器按 IP 管**、开机不会再被上一次的残局断网。
+
+### 一、激活状态改由服务器管理（解决「卸载/配置被清就要重新要密钥」）
+
+服务端 `/api/config` 新增 `with_token=1`：**只允许查自己来源 IP 的那一份**
+（原有的 `src == want` 校验），默认不带该参数时依然返回空 token ——
+安装包本身仍然不含凭据，转发安装包不会泄露账号。
+
+客户端在「本地三份都没有 token」时调它补回来，只补
+`token / accountIp / expiresAt / portalUrl` 四个字段，其余一律不动。
+`portalUrl` 为空时用 `http://10.13.24.1:8080` 兜底 —— 实测踩过：配置被删之后
+`portalUrl` 也是空的，如果这里直接返回，整个自愈等于没写。
+
+测试机（10.113.66.6）实测：
+
+```
+$ curl "http://10.13.24.1:8080/api/config?with_token=1"
+{"registered": true, "accountIp": "10.113.66.6", "token": "TEST-XT-0001", ...}
+
+PASS  empty config is not activated
+PASS  RecoverFromServer returned true        ← 配置全空也能恢复
+PASS  token restored from server
+PASS  second call is a no-op                 ← 已有 token 不动
+PASS  user httpPort preserved                ← 用户改过的设置不被覆盖
+PASS  user useTun preserved
+ALL PASS
+```
+
+### 二、开机不会再「上不了网」：启动时清残局
+
+客户端被强杀 / 崩溃 / 注销时，`mihomo`、`FerryTun` 网卡、系统代理都不会自己还原。
+用户重启后看到「FerryTun 无法访问 Internet」，严重时整台机器没有出口。
+
+现在启动第一件事就是清：
+
+| 残局 | 处理 |
+|---|---|
+| 系统代理还指着 `127.0.0.1:10801` | `RestoreDirect` 还原到备份的原代理 |
+| `FerryTun` 网卡还在 | 先按 PID 杀残留 mihomo（它退出会回收网卡），还在就 `Remove-NetAdapter` 强删 |
+| 上一步都失败 | 日志写明「重启电脑可彻底恢复」，不再静默 |
+
+顺序上，清理放在「判断借网状态」之前 —— 否则会把上一次的残骸误认为「自己已经在借网」。
+
+### 三、FerryTun 不再显示「无法访问 Internet」
+
+旧做法是 TUN 期间把 `EnableActiveProbing` 设 0（关掉系统连通性探测）。
+代价有两个：**所有**网络都不再显示「无 Internet」；而且 `FerryTun` 网卡状态
+一直挂着「无法访问 Internet」—— 用户看到就以为网没通。
+
+现在改成让探测流量自己走代理：DNS 的 `fake-ip-filter` **不再**排除
+`msftconnecttest / msftncsi`，它们拿到 fake-ip → 进 TUN → `MATCH,ferry`
+→ 经出口机访问 → 探测成功 → 图标正常。探测失败也只是图标难看，不影响流量。
+
+### 四、更新完自动恢复借网
+
+`DoUpdate` 记录「更新前是否在借网」，新实例的延迟启动命令带上 `/start`。
+之前更新完新实例是「干净启动」，用户得自己再去点「开始借网」——
+而这台机器往往没有别的出口，那一步不是体验问题，是能不能用的问题。
+
+### 五、卸载：清理干净，但不删用户的激活备份
+
+`/uninstall` 按顺序做：还原代理 → 杀 mihomo → 删 `FerryTun` 网卡 →
+删计划任务/启动项 → 清 `%TEMP%` 里的更新中间文件。
+
+**`%APPDATA%\Ferry\config.backup.json` 故意保留**。两条硬规则已写进 `AGENTS.md`：
+程序任何自动流程只做「没有就补」，不做「有就删」；
+在用户的机器上重启客户端 = 断他的网（这台机器本身靠渡口借网上网）。
+
+### 验证
+
+- 服务端接口：测试机实测返回本机自己的 token
+- 客户端恢复逻辑：12 项断言全过（含「有就不动」「用户设置保留」）
+- 残局清理：模拟「借网→强杀」，代理从 `10801` 还原到 `7897`，幂等
+- `/uninstall`：代理已还原、计划任务已清、`%TEMP%` 无产品残留
+- 掉激活：**不会** —— 更新路径只换 exe，测试机上 `config.json` 逐字节不变
+
+### 未验证（如实记录）
+
+`FerryTun` 图标的改动需要真借网才能看到效果，而测试机到出口机的 SOCKS 端口不通，
+只能在用户的机器上看。用户装 1.0.6 后反馈正常。
+
 ## v0.14.2 — 2026-10-26
 
 > 客户端 1.0.5：**更新时目录里短暂没有 exe 的窗口**被消掉了；启动过程开始留痕。

@@ -255,6 +255,27 @@ namespace Ferry
             return res;
         }
 
+        /// <summary>
+        /// 按来源 IP 向服务端要「本机的配置」（含激活令牌）。
+        ///
+        /// 服务端 `/api/config` 的边界：只允许查**自己来源 IP** 那一份 ——
+        /// 知道别人的局域网 IP 也拿不到别人的令牌。安装器早就在用它，
+        /// 但客户端从来没用过，于是「卸载重装 / 配置被清」只能重新找管理员要密钥。
+        ///
+        /// 返回 null 表示拿不到（离线 / 未注册 / 服务端异常），调用方保持原样。
+        /// </summary>
+        public static string FetchSelfConfig(string portalUrl)
+        {
+            if (string.IsNullOrEmpty(portalUrl)) return null;
+            try
+            {
+                var req = Make(portalUrl.TrimEnd('/') + "/api/config?with_token=1", "GET");
+                using (var r = req.GetResponse())
+                    return ReadBody(r);
+            }
+            catch (Exception) { return null; }
+        }
+
         public static VersionInfo Version(string portalUrl)
         {
             var v = new VersionInfo();
