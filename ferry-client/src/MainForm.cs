@@ -145,35 +145,49 @@ namespace Ferry
             _card.SetBounds(20, 80, 480, 212);
             Controls.Add(_card);
 
+            // ⚠ 状态卡内的控件**按实际高度累加 y**，不能写死 12/54/92/128/152/176。
+            //
+            // 踩过的坑：改成 AutoSize 之后 Label 会自己长高（多行描述能到 40px），
+            // 而后面几行的 y 还是写死的 → 直接叠在一起。用户截图里
+            // 「正在用本机网络。需要时点「开始借网」…」被下面几行压住，
+            // 看起来就是「文字被遮挡」。诊断程序在 96 DPI 下显示全部 OK，
+            // 因为那个检查只看「高度够不够」，没看「有没有被压」。
+            int cy = 12;
+
+            // ⚠ 这里的 y 只在「初始文本」下成立，真正的排版靠 LayoutCard()。
+            //
+            // 踩过的坑（两次）：
+            //   ① AutoSize 的 Label 没进容器时 Height 是 0 → 算出来间距为 0
+            //   ② 更隐蔽：创建时文本是空串（_lblDesc = Theme.Text2("")），
+            //      所以 PreferredHeight 是单行；等 RefreshUi 把两三行的文字
+            //      填进去，Label 长高了，而下面控件的位置早就定死了 → 压住。
+            //
+            // 所以：**每次文字变化后都要重新排一次**（见 LayoutCard）。
             _lblBig = Theme.Text2("检查中", Theme.FBig, Theme.Muted);
-            Theme.Place(_lblBig, 24, 12, 430);
             _card.Controls.Add(_lblBig);
 
             _lblDesc = Theme.Text2("", Theme.FBody, Theme.Muted);
-            Theme.Place(_lblDesc, 24, 54, 430);
             _card.Controls.Add(_lblDesc);
 
             _lblQuota = Theme.Text2("", Theme.FSmall, Theme.Muted);
-            Theme.Place(_lblQuota, 24, 92, 430);
             _card.Controls.Add(_lblQuota);
 
             // 「隧道」那行去掉了：现在只有一种模式（直连出口机的 SOCKS），
             // SSH 隧道的界面入口和显示都已移除，见 Config.cs 的说明。
 
-            _rowBridge = Row(_card, 128);
-            _rowProxy = Row(_card, 152);
-            // 第四行：TUN 状态。默认隐藏（只在设置里勾了全局接管时才显示），
-            // 避免普通用户看到一行「未开启」以为是故障。
-            _rowTun = Row(_card, 176);
-            Theme.Place(_rowTun, 24, 176, 352);
+            _rowBridge = Row(_card, 0);
+            _rowProxy = Row(_card, 0);
+            _rowTun = Row(_card, 0);
             _rowTun.Visible = true;
 
             // 全局模式的开关摆在「全局模式」这一行右边 —— 状态和动作在同一处。
             _btnGlobal = Theme.FlatButton("开启", false);
-            _btnGlobal.SetBounds(390, 174, 70, 26);
+            _btnGlobal.SetBounds(390, 0, 70, 26);
             _btnGlobal.Font = Theme.FSmall;
             _btnGlobal.Click += delegate { OnGlobalClicked(); };
             _card.Controls.Add(_btnGlobal);
+
+            LayoutCard();
 
             // ── 激活卡：输入框直接放在主界面，不弹窗 ──
             _actCard = Theme.Card(14);
@@ -251,11 +265,63 @@ namespace Ferry
             BuildTray();
         }
 
+        /// <summary>
+        /// 按当前文字**重新排状态卡里所有行**，并把卡片高度调到内容高度。
+        ///
+        /// 为什么必须每次文字变化都调：这些 Label 是 AutoSize 的，
+        /// 文字从 1 行变成 2 行时高度会变，而下面控件的 y 是定死的 ——
+        /// 不重排就会压住。之前「借网异常」那条提示（两行）压住「剩余 N 天」
+        /// 就是这个原因。
+        /// </summary>
+        void LayoutCard()
+        {
+            if (_card == null) return;
+            int y = 12;
+
+            PlaceRow(_lblBig, ref y, 6);
+            PlaceRow(_lblDesc, ref y, 8);
+            PlaceRow(_lblQuota, ref y, 8);
+            PlaceRow(_rowBridge, ref y, 6);
+            PlaceRow(_rowProxy, ref y, 6);
+
+            _rowTun.Location = new Point(24, y);
+            _rowTun.Width = 352;
+            if (_btnGlobal != null) _btnGlobal.Top = y - 2;
+            y += Math.Max(_rowTun.PreferredHeight, 17) + 10;
+
+            _card.Height = y;
+
+            // 卡片变高后，下面的激活卡和按钮要跟着下移，否则会被盖住
+            if (_actCard != null)
+            {
+                int dy = _card.Top + _card.Height + 8 - _actCard.Top;
+                if (dy != 0)
+                {
+                    _actCard.Top += dy;
+                    _btnOn.Top += dy;
+                    _btnOff.Top += dy;
+                    _btnRefresh.Top += dy;
+                    _btnSettings.Top += dy;
+                    _logCard.Top += dy;
+                }
+            }
+        }
+
+        /// <summary>把一行放到 y，然后把 y 推进它自己的高度 + gap。</summary>
+        static void PlaceRow(Label l, ref int y, int gap)
+        {
+            if (l == null) return;
+            l.Location = new Point(l.Left, y);
+            y += Math.Max(l.PreferredHeight, 17) + gap;
+        }
+
         static Label Row(Panel parent, int y)
         {
             var l = Theme.Text2("", Theme.FSmall, Theme.Muted);
-            // 高度由 Theme.Text2 按字体实测给出，这里只定位置和宽度
-            l.SetBounds(24, y, 430, l.Height);
+            // 位置由 LayoutCard() 统一排；这里只给宽度和初始 y。
+            l.MaximumSize = new Size(430, 0);
+            l.MinimumSize = new Size(430, 0);
+            l.Location = new Point(24, y);
             parent.Controls.Add(l);
             return l;
         }
@@ -1293,6 +1359,9 @@ namespace Ferry
                 _rowTun.Visible = true;
                 _btnGlobal.Visible = true;
             }
+
+            // 文字可能刚变过（多行提示），重排一次避免压住
+            LayoutCard();
 
             _btnOn.Enabled = !_busy && !borrowing;
             _btnOff.Enabled = !_busy && (borrowing || runtimeUp || (proxyOn && proxySrv == borrowServer));
