@@ -51,6 +51,19 @@ namespace Ferry
             _cfgPath = cfgPath;
             _appDir = appDir;
             _logPath = Path.Combine(appDir, "assistant.log");
+            // 日志轮转：超过 2 MB 就留一份 .1 再重开。
+            // 不轮转的话这个文件会一直涨（每 5 秒心跳都可能写一行）。
+            try
+            {
+                var fi = new FileInfo(_logPath);
+                if (fi.Exists && fi.Length > 2 * 1024 * 1024)
+                {
+                    var bak = _logPath + ".1";
+                    if (File.Exists(bak)) File.Delete(bak);
+                    File.Move(_logPath, bak);
+                }
+            }
+            catch (Exception) { }
             _cfg = Cfg.Load(cfgPath);
             // 高 DPI：让 WinForms 按系统缩放比例整体放大控件。
             //

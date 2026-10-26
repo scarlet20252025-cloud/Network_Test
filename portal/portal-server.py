@@ -4544,6 +4544,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(302)
         self.send_header('Location', to)
         if cookie:
+            # HttpOnly：即使哪天出现 XSS，会话 cookie 也偷不走。
+            # SameSite=Lax：挡住跨站请求带 cookie（CSRF 的第二道闸）。
+            # 不加 Secure —— 门户是 http（内网自建没有证书），加了 cookie 直接失效。
+            if 'HttpOnly' not in cookie:
+                cookie = cookie + '; HttpOnly'
+            if 'SameSite' not in cookie:
+                cookie = cookie + '; SameSite=Lax'
             self.send_header('Set-Cookie', cookie)
         self._sec_headers()
         self.end_headers()
@@ -6140,6 +6147,10 @@ def main():
                 # 事件表只留最近 2000 条，防止无限增长
                 db.x('DELETE FROM events WHERE id NOT IN '
                      '(SELECT id FROM events ORDER BY id DESC LIMIT 2000)')
+                # 反馈里可能带联系方式（微信/QQ），没道理永久留着。
+                # 只保留最近 500 条 —— 个人工具的量级，够回溯很久了。
+                db.x('DELETE FROM feedback WHERE id NOT IN '
+                     '(SELECT id FROM feedback ORDER BY id DESC LIMIT 500)')
                 if n:
                     sys.stderr.write(f'[janitor] 清理过期会话 {n} 条\n')
 

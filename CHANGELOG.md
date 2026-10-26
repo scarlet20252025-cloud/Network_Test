@@ -1,3 +1,50 @@
+## v0.13.14 — 2026-10-26
+
+> 全量风险复查。客户端 0.9.23。
+
+### 又找到一个真泄露：WireGuard 私钥
+
+上一轮只审计了管理密码和激活令牌，这次把「私钥类」也扫了一遍：
+
+```
+git log -S"PrivateKey"  →  wireguard/ferry-wg.conf
+                            PrivateKey = MGBFbXlf+…（真私钥，不是示例）
+```
+
+同时远端 `pcs` 上 `wg0` 网卡还是 **Up** —— 也就是说这把私钥当时**仍然可用**。
+
+处理：
+
+1. 远端停用并删除 `WireGuardTunnel$wg0`（服务 + 网卡都没了）
+   - 踩坑：远端默认 shell 是 PowerShell，`sc stop "WireGuardTunnel$wg0"` 里的 `$wg0`
+     会被 PowerShell 当变量展开成空 → 报「服务未安装」。改用
+     `Get-Service | Where-Object Name -like 'WireGuardTunnel*wg0*' | Stop-Service`
+2. `git filter-branch` 再重写一次历史，把私钥替换成 `<REDACTED-WG-PRIVATE-KEY>`
+3. 删掉整个废弃的 WireGuard 面：`ferry-wg.conf` / `client.pub` /
+   `ferry-wg-server.sh` / `stop-wg.cmd` / `启用WG线路.cmd` / `测试WG线路.cmd`，
+   本地 `client.key` 也删了（它没进 git，但躺在工作区里）
+4. 保留 `ferry-socks5-server.py` / `deploy-udp-relay.ps1` / `ferry-server-*.ps1`
+   —— 这些是**生产在用**的 TCP 服务端和远端管理菜单
+
+### 顺手加固的三处
+
+| 项 | 改动 | 为什么 |
+|---|---|---|
+| 会话 cookie | 加 `HttpOnly` + `SameSite=Lax` | 即使哪天出 XSS 也偷不走会话；再挡一层 CSRF |
+| 意见反馈保留 | 只留最近 **500 条**（原来永久） | 里面可能有微信/QQ 等联系方式，没道理永久留存 |
+| 客户端日志 | 超过 2 MB 轮转成 `.1` | 心跳每 5 秒可能写一行，不轮转会一直涨 |
+
+`Secure` 属性**没加** —— 门户是 http（内网自建没有证书），加上 cookie 直接失效。
+
+### 仍然存在、需要你决策的
+
+1. **仓库还是 public**。历史重写只能清掉「能 grep 到的东西」，GitHub 上的旧
+   commit 对象在 GC 前仍能用 SHA 打开。转 private 是最彻底的一步。
+2. **门户是明文 HTTP**，管理密码在登录时是明文过局域网的。要 HTTPS 就得管证书
+   （自签会让浏览器报警告，比明文好但也麻烦）。目前建议只在内网用。
+3. **`portal.db` 没有自动备份**。里面是全部账号的 token 和授权到期时间，
+   删了就得挨个重新激活。
+
 ## v0.13.13 — 2026-10-26
 
 > 客户端 0.9.22。两个「点了没反应 / 文字被埋」的问题。
