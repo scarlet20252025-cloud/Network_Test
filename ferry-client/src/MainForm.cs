@@ -144,7 +144,7 @@ namespace Ferry
             // 第四行：TUN 状态。默认隐藏（只在设置里勾了全局接管时才显示），
             // 避免普通用户看到一行「未开启」以为是故障。
             _rowTun = Row(_card, 180);
-            _rowTun.SetBounds(24, 180, 352, 18);
+            _rowTun.SetBounds(24, 176, 352, 18);
             _rowTun.Visible = true;
 
             // 全局模式的开关摆在「全局模式」这一行右边 —— 状态和动作在同一处。
@@ -156,11 +156,11 @@ namespace Ferry
 
             // ── 激活卡：输入框直接放在主界面，不弹窗 ──
             _actCard = Theme.Card(14);
-            _actCard.SetBounds(20, 282, 480, 92);
+            _actCard.SetBounds(20, 288, 480, 86);
             Controls.Add(_actCard);
 
             _lblActTitle = Theme.Text2("输入密钥激活", Theme.FBody, Theme.Text);
-            _lblActTitle.SetBounds(20, 10, 300, 22);
+            _lblActTitle.SetBounds(20, 8, 300, 22);
             _actCard.Controls.Add(_lblActTitle);
 
             _txtCode = new TextBox();
@@ -168,7 +168,7 @@ namespace Ferry
             _txtCode.CharacterCasing = CharacterCasing.Upper;
             _txtCode.MaxLength = 16;
             _txtCode.TextAlign = HorizontalAlignment.Center;
-            _txtCode.SetBounds(20, 38, 300, 28);
+            _txtCode.SetBounds(20, 32, 300, 28);
             _txtCode.KeyDown += delegate (object s, KeyEventArgs e)
             {
                 if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; DoInlineActivate(); }
@@ -176,13 +176,13 @@ namespace Ferry
             _actCard.Controls.Add(_txtCode);
 
             _btnActivate = Theme.FlatButton("激活", true);
-            _btnActivate.SetBounds(332, 37, 128, 30);
+            _btnActivate.SetBounds(332, 31, 128, 30);
             _btnActivate.Click += delegate { DoInlineActivate(); };
             _actCard.Controls.Add(_btnActivate);
 
             _lblActHint = Theme.Text2("管理员给你的 8 位字母数字，一个密钥只能用一次。",
                 Theme.FSmall, Theme.Muted);
-            _lblActHint.SetBounds(20, 68, 440, 18);
+            _lblActHint.SetBounds(20, 60, 440, 18);
             _actCard.Controls.Add(_lblActHint);
 
             // ── 主按钮 ──
@@ -977,9 +977,12 @@ namespace Ferry
         /// <summary>
         /// 替换脚本（GBK + chcp 936，否则中文乱码）。
         ///
-        /// 为什么不先检测进程再复制：`tasklist` 的输出受系统语言和编码影响，
-        /// `find` 匹配中文进程名在不同代码页下会假失败。
-        /// 直接「复制 → 失败就等 1 秒重试」更笨但更可靠，最多等 15 秒。
+        /// 两个都是实测出来的：
+        ///  · **杀进程必须用 PowerShell**。`taskkill /IM 渡口助手.exe /F` 在 GBK 脚本里
+        ///    对中文进程名不可靠 —— 静默失败，然后 copy 一直重试、最后报「文件被占用」。
+        ///    实测：换成 `Get-Process -Name '渡口助手' | Stop-Process -Force` 立刻成功。
+        ///  · copy 失败就等 1 秒重试（最多 10 次），不要靠 tasklist 检测进程 ——
+        ///    它的输出受系统语言和代码页影响，中文下会假失败。
         /// </summary>
         static string BuildUpdateScript()
         {
@@ -989,12 +992,16 @@ namespace Ferry
                 "setlocal",
                 "set \"DST=%LOCALAPPDATA%\\Ferry\\渡口助手.exe\"",
                 "set \"NEW=%TEMP%\\ferry-client-new.exe\"",
+                "",
+                "powershell -NoProfile -NonInteractive -Command \"Get-Process -Name '渡口助手' -ErrorAction SilentlyContinue | Stop-Process -Force\"",
+                "timeout /t 2 /nobreak >nul",
+                "",
                 "set /a n=0",
                 ":retry",
                 "copy /Y \"%NEW%\" \"%DST%\" >nul 2>&1",
                 "if not errorlevel 1 goto done",
                 "set /a n+=1",
-                "if %n% lss 15 (",
+                "if %n% lss 10 (",
                 "  timeout /t 1 /nobreak >nul",
                 "  goto retry",
                 ")",
@@ -1004,7 +1011,7 @@ namespace Ferry
                 "del \"%NEW%\" >nul 2>&1",
                 "exit /b 0",
                 ":fail",
-                "msg * \"渡口更新失败：客户端文件被占用。请手动关闭后重新打开。\"",
+                "msg * \"渡口更新失败：客户端文件被占用，请手动关闭后重新打开。\"",
                 "exit /b 1",
                 ""
             });
@@ -1133,7 +1140,7 @@ namespace Ferry
             }
             else
             {
-                SetText(_lblBig, "直连", Theme.Idle);
+                SetText(_lblBig, "直连", Theme.Text);
                 SetText(_lblDesc, "正常使用本机网络。断网时点「开始借网」。", Theme.Muted);
             }
 
@@ -1173,7 +1180,7 @@ namespace Ferry
                 }
                 else if (_cfg.UseTun && !Elevator.IsAdmin())
                 {
-                    SetText(_rowTun, "全局模式    待管理员授权", Theme.Bad);
+                    SetText(_rowTun, "全局模式    待管理员授权", Theme.Warn);
                     SetText(_btnGlobal, "开启", Theme.Text);
                 }
                 else if (_cfg.UseTun && runtimeUp)

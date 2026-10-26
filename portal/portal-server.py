@@ -1511,8 +1511,9 @@ def landing_page(online_now=0):
   </div>
   <div class="fcard">
     <div class="ico">&#9889;</div>
-    <h3>国内直连，墙外自动分流</h3>
-    <p>国内站直连最快（实测 0.1 秒）；google / youtube 这类直连不通的，自动改走远端的 Clash 出口，你无需任何设置。</p>
+    <h3>按目标自动选路</h3>
+    <p>国内站点直连最快（实测 0.1 秒）；直连不通的目标自动改走出口机，不需要你手动切换任何配置。
+       两条路同时发起、谁先连上就用谁，输的那条立刻取消 &mdash;&mdash; 所以你感觉不到「切换」这个动作。</p>
     <span class="tg">&#9679; 已实测</span>
   </div>
   <div class="fcard">
@@ -1531,7 +1532,7 @@ def landing_page(online_now=0):
   <div class="fcard">
     <div class="ico">&#8942;</div>
     <h3>托盘常驻，一键开关</h3>
-    <p>托盘图标就能借网 / 恢复直连。停止时自动还原你原来的系统代理（比如你的 Clash），不会把网络搞断。</p>
+    <p>托盘图标就能借网 / 恢复直连。停止时自动还原你原来的系统代理，不会把网络搞断。</p>
     <span class="tg">&#9679; 不动你的配置</span>
   </div>
   <div class="fcard">
@@ -1572,7 +1573,7 @@ def landing_page(online_now=0):
 
 <div class="faq">
   <details>
-    <summary>会影响我本来用的 Clash / 代理吗？</summary>
+    <summary>会影响我本来用的代理软件吗？</summary>
     <div class="ans">不会。借网时渡口只切到自己的端口；停止借网时还原你原来的代理地址，并且会先探测那个代理是否活着 &mdash;&mdash; 探不通就直接关掉系统代理，至少保证你能上网。</div>
   </details>
   <details>
@@ -1601,10 +1602,14 @@ def landing_page(online_now=0):
        速度上限由服务端按 IP 下发，改本地配置绕不过去。</div>
   </details>
   <details>
-    <summary>和 VPN、机场梯子是什么关系？</summary>
-    <div class="ans">VPN 要一台公网服务器，机场要买流量；渡口借的是同一局域网里已经能上网的那台机器 &mdash;&mdash;
-       不需要公网 IP，也不用另外付费。代价是那台机器关机或断网就用不了 &mdash;&mdash;
-       它是补丁，不是替代品。</div>
+    <summary>出口那台机器关机 / 断网了怎么办？</summary>
+    <div class="ans">借网就断了 &mdash;&mdash; 它是整条链路的关键，这一点没办法绕。客户端会检测到并提示，
+       点「停止并恢复直连」就能回到本地网络。想长期稳定，出口机最好设成开机自启、别随手关机。</div>
+  </details>
+  <details>
+    <summary>开着全局模式会影响局域网 / 打印机 / 共享吗？</summary>
+    <div class="ans">不会。10.x、172.16&ndash;31.x、192.168.x 这些内网地址在分流规则里是直连的，
+       局域网打印机、共享目录、内网其它机器都照常访问 &mdash;&mdash; 全局接管只接管去外网的流量。</div>
   </details>
   <details>
     <summary>已经断网了，还能装上吗？</summary>
@@ -5940,7 +5945,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   <h2 style="margin-top:0">已知限制</h2>
   <div style="font-size:13.5px;line-height:1.9">
     · 出口带宽取决于远端主机，不是无上限<br>
-    · 远端办公网可能封某些站点（实测 google 两端都不通）<br>
+    · 远端办公网可能封某些站点（两端都不通）<br>
     · 门户本身是 HTTP 不是 HTTPS，临时密钥在局域网内明文传输<br>
     · 断的是 WLAN 接入层（连网关都不通）时，这套方案救不了
   </div>
