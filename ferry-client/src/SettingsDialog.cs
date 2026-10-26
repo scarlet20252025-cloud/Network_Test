@@ -26,6 +26,9 @@ namespace Ferry
         readonly string _appDir;
         readonly Action _onUninstall;
 
+        /// <summary>高 DPI 下开关卡片比设计高度高出的像素数（下方控件要跟着下移）。</summary>
+        int _cardGrow;
+
         CheckBox _chkAutoStart;
         CheckBox _chkAutoBorrow;
         CheckBox _chkMinimized;
@@ -197,36 +200,51 @@ namespace Ferry
             Font = Theme.FBody;
 
             var t = Theme.Text2("设置", Theme.FTitle, Theme.Text);
-            t.SetBounds(22, 16, 200, 28);
+            Theme.Place(t, 22, 16, 200);
             Controls.Add(t);
 
             var sub = Theme.Text2("改动立即生效，不需要重启", Theme.FSmall, Theme.Muted);
-            sub.SetBounds(22, 44, 400, 18);
+            Theme.Place(sub, 22, 44, 400);
             Controls.Add(sub);
 
             var card = Theme.Card(14);
             card.SetBounds(20, 74, 430, 294);
             Controls.Add(card);
 
+            // y 坐标**不再写死**，由前一项的实际高度累加。
+            //
+            // 踩过的坑：原来固定 16/82/148/214（每项 66px），在 125% 缩放下
+            // 标题和说明都变高，相邻两项就叠在一起 —— 表现为「勾选框的标题
+            // 被下一项的说明压住一半」。
+            int cy = 16;
             _chkAutoStart = MakeCheck("开机自动启动",
-                "登录 Windows 后自动就绪（收在托盘，不弹窗）。用计划任务实现，不会弹 UAC", 16);
+                "登录 Windows 后自动就绪（收在托盘，不弹窗）。用计划任务实现，不会弹 UAC", cy);
             _chkAutoStart.Checked = AutoStartOn();
             card.Controls.Add(_chkAutoStart);
+            cy += CheckBlockHeight(_chkAutoStart, "登录 Windows 后自动就绪（收在托盘，不弹窗）。用计划任务实现，不会弹 UAC");
 
             _chkAutoBorrow = MakeCheck("断网时自动借网",
-                "检测到本机连不上网时，自动开隧道并切换系统代理", 82);
+                "检测到本机连不上网时，自动开隧道并切换系统代理", cy);
             _chkAutoBorrow.Checked = _cfg.AutoBorrow;
             card.Controls.Add(_chkAutoBorrow);
+            cy += CheckBlockHeight(_chkAutoBorrow, "检测到本机连不上网时，自动开隧道并切换系统代理");
 
             _chkMinimized = MakeCheck("启动后最小化到托盘",
-                "双击图标时不显示主窗口，直接驻留托盘", 148);
+                "双击图标时不显示主窗口，直接驻留托盘", cy);
             _chkMinimized.Checked = _cfg.StartMinimized;
             card.Controls.Add(_chkMinimized);
+            cy += CheckBlockHeight(_chkMinimized, "双击图标时不显示主窗口，直接驻留托盘");
 
             _chkReconnect = MakeCheck("隧道断开时自动重连",
-                "远端重启、网络中抖时自动恢复（退避 5 秒起，最长 60 秒）", 214);
+                "远端重启、网络中抖时自动恢复（退避 5 秒起，最长 60 秒）", cy);
             _chkReconnect.Checked = _cfg.AutoReconnect;
             card.Controls.Add(_chkReconnect);
+            cy += CheckBlockHeight(_chkReconnect, "远端重启、网络中抖时自动恢复（退避 5 秒起，最长 60 秒）");
+
+            // 卡片高度跟着内容走。下方控件在 BuildUi 末尾统一按增量下移
+            // （那时它们才创建好，见 RelayoutBelowCard）。
+            _cardGrow = Math.Max(0, (cy + 10) - 294);
+            card.Height = 294 + _cardGrow;
 
             // 意见反馈入口。
             // 放在设置里而不是主界面：反馈是低频操作，主界面要留给
@@ -261,7 +279,7 @@ namespace Ferry
             // 用户不知道该信哪个，只能先取消再勾一次才触发。
 
             var lblIv = Theme.Text2("断网检测间隔", Theme.FSmall, Theme.Text);
-            lblIv.SetBounds(24, 388, 130, 20);
+            Theme.Place(lblIv, 24, 388, 130);
             Controls.Add(lblIv);
 
             _numInterval = new NumericUpDown();
@@ -273,12 +291,12 @@ namespace Ferry
             Controls.Add(_numInterval);
 
             var lblSec = Theme.Text2("秒", Theme.FSmall, Theme.Muted);
-            lblSec.SetBounds(264, 388, 30, 20);
+            Theme.Place(lblSec, 264, 388, 30);
             Controls.Add(lblSec);
 
             _lblHint = Theme.Text2("间隔越短越灵敏，但每次检测要发一次 DNS 查询；" + Environment.NewLine +
                                    "断网后大约一个间隔内会自动开始借网。", Theme.FSmall, Theme.Muted);
-            _lblHint.SetBounds(24, 420, 424, 34);
+            Theme.Place(_lblHint, 24, 420, 424);
             Controls.Add(_lblHint);
 
             var ok = Theme.FlatButton("保存", true);
@@ -316,7 +334,7 @@ namespace Ferry
             _lblVer.Font = Theme.FSmall;
             _lblVer.ForeColor = Theme.Muted;
             _lblVer.AutoSize = true;
-            _lblVer.SetBounds(142, 479, 150, 18);
+            Theme.Place(_lblVer, 142, 479, 150);
             Controls.Add(_lblVer);
 
             var lnkCheck = new LinkLabel();
@@ -329,8 +347,38 @@ namespace Ferry
             lnkCheck.LinkClicked += delegate { CheckUpdateManual(); };
             Controls.Add(lnkCheck);
 
+            RelayoutBelowCard();
+
             AcceptButton = ok;
             CancelButton = cancel;
+        }
+
+        /// <summary>
+        /// 卡片因为 DPI 变高之后，把卡片下方的控件整体下移，并把窗口加高。
+        /// 不做这一步的话，125% 缩放下卡片会盖住「断网检测间隔」那一行。
+        /// </summary>
+        void RelayoutBelowCard()
+        {
+            if (_cardGrow <= 0) return;
+            foreach (Control c in Controls)
+            {
+                if (c.Top > 294) c.Top += _cardGrow;
+            }
+            ClientSize = new Size(ClientSize.Width, ClientSize.Height + _cardGrow);
+        }
+
+        /// <summary>
+        /// 一个「勾选框 + 说明」占多高（含与下一项的间距）。
+        ///
+        /// ⚠ 不能用 `(c.Tag as Label).Height` —— AutoSize 的 Label 在还没有
+        /// 父容器时高度是 0（要等 PerformLayout 之后才算出真实值）。
+        /// 实测踩到：读出来是 0，于是每项只占 39px，相邻两项直接叠在一起。
+        /// 所以这里用 Theme.MeasureHeight 另起一个探针 Label 量。
+        /// </summary>
+        int CheckBlockHeight(CheckBox c, string hint)
+        {
+            int hh = Theme.MeasureHeight(hint, Theme.FSmall, 384);
+            return c.Height + 6 + hh + 12;
         }
 
         CheckBox MakeCheck(string title, string hint, int y)
@@ -339,11 +387,17 @@ namespace Ferry
             c.Text = title;
             c.Font = Theme.FBody;
             c.ForeColor = Theme.Text;
-            c.SetBounds(20, y, 390, 22);
+            // 复选框也要 AutoSize。
+            // 写死高度（哪怕按 MeasureHeight 算）依然会裁 —— 因为 CheckBox
+            // 的文字是在「扣除勾选框图形宽度」之后的区域里排版的，
+            // 用 Label 的算法量出来的高度对它偏小。交给它自己算才准。
+            c.AutoSize = true;
+            c.MaximumSize = new Size(390, 0);
+            c.Location = new Point(20, y);
             c.BackColor = Color.Transparent;
 
             var h = Theme.Text2(hint, Theme.FSmall, Theme.Muted);
-            h.SetBounds(40, y + 22, 384, 34);
+            Theme.Place(h, 40, y + c.Height + 2, 384);
             h.Tag = "hint:" + title;
             // 提示挂在同一个父容器上，随 checkbox 一起显示
             c.Tag = h;

@@ -161,15 +161,75 @@ namespace Ferry
             return p;
         }
 
+        /// <summary>
+        /// 建一个文字 Label，**高度由 WinForms 自己算**。
+        ///
+        /// 踩过的坑（反复改 DPI 模式都没解决，最后靠实测定位）：
+        ///   Label 是 AutoSize=false + SetBounds 写死 18px 高，而字体是 pt
+        ///   单位、随系统 DPI 放大 —— 125% 下 8.5pt 中文单行就要 20px，
+        ///   于是每行字的下沿被裁 2px。各人缩放不同，裁掉的像素也不同，
+        ///   看起来就是「文字下面一半被遮挡」。
+        ///
+        /// 为什么不用 TextRenderer.MeasureText 自己算：
+        ///   试过，**中文长句算不准**。WordBreak 依赖空格断行，中文没有空格，
+        ///   MeasureText 会认为一行放得下，返回单行高度；而 Label 实际渲染时
+        ///   会按字符折行。结果就是「按测量值给高度」依然被裁。
+        ///
+        /// 所以交给 Label 自己：AutoSize=true + MaximumSize 限定宽度，
+        /// 它会用和渲染完全相同的排版逻辑算高度，中英文都准。
+        /// 代价是必须在设完 Text 之后再读 Height（见 Place）。
+        /// </summary>
         public static Label Text2(string text, Font f, Color c)
         {
             var l = new Label();
             l.Text = text;
             l.Font = f;
             l.ForeColor = c;
-            l.AutoSize = false;
             l.BackColor = Color.Transparent;
+            l.AutoSize = true;
+            // 默认给个宽松的上限，真正的位置/宽度由 Place() 定
+            l.MaximumSize = new Size(480, 0);
+            l.UseMnemonic = false;   // 文字里的 & 原样显示，不当快捷键
             return l;
+        }
+
+        /// <summary>
+        /// 把 Label 放到 (x, y)，宽度 w，**高度自动**。
+        ///
+        /// 用法替换原来的 l.SetBounds(x, y, w, h)：高度不再由调用方猜。
+        /// </summary>
+        public static void Place(Label l, int x, int y, int w)
+        {
+            l.MaximumSize = new Size(w, 0);
+            l.MinimumSize = new Size(w, 0);
+            l.Location = new Point(x, y);
+            l.Width = w;
+            // AutoSize 的 Label 在改 Text 后高度会变，这里强制重算一次
+            l.PerformLayout();
+        }
+
+        /// <summary>文字变了之后重新量高度（状态行这种会变的）。</summary>
+        public static void Refit(Label l)
+        {
+            if (l == null || !l.AutoSize) return;
+            l.PerformLayout();
+        }
+
+        /// <summary>
+        /// 量一段文字需要多高 —— 只在需要「预留空间」时用（比如给下面的控件定位）。
+        /// 内部靠一个临时 Label，保证和真实渲染一致。
+        /// </summary>
+        public static int MeasureHeight(string text, Font f, int width)
+        {
+            using (var probe = new Label())
+            {
+                probe.AutoSize = true;
+                probe.MaximumSize = new Size(Math.Max(16, width), 0);
+                probe.MinimumSize = new Size(Math.Max(16, width), 0);
+                probe.Font = f;
+                probe.Text = string.IsNullOrEmpty(text) ? "国" : text;
+                return probe.PreferredHeight;
+            }
         }
     }
 }

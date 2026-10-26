@@ -102,6 +102,82 @@ namespace Ferry
                 return;
             }
 
+            // 自动更新的自检入口：`渡口助手.exe /update`
+            //
+            // 为什么需要它：自动更新这条链路之前几次都「看起来没反应」，
+            // 而我每次都是手工把 exe 复制过去然后宣布成功 —— 那不是验收，
+            // 是自己骗自己。有了这个参数，可以在真实客户端里跑完整条链路
+            // （下载 → 改名 → 覆盖 → 重启），日志可查、可自动化。
+            if (HasArg(args, "/update") || HasArg(args, "-update"))
+            {
+                var cfgU = Cfg.Load(cfgPath);
+                var logU = Path.Combine(appDir, "update-selftest.log");
+                Action<string> w = delegate (string line)
+                {
+                    try
+                    {
+                        File.AppendAllText(logU,
+                            DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + line + Environment.NewLine,
+                            new System.Text.UTF8Encoding(false));
+                    }
+                    catch (Exception) { }
+                };
+
+                w("=== /update 开始，当前 " + Application.ProductVersion + " ===");
+                try
+                {
+                    var v = Api.Version(cfgU.PortalUrl);
+                    w("服务端版本 = " + (v.Ok ? v.Latest : "(取不到)"));
+                    if (!v.Ok) { w("取版本失败，中止"); return; }
+
+                    var exeU = Application.ExecutablePath;
+                    var oldU = exeU + ".old";
+                    var tmpU = Path.Combine(Path.GetTempPath(), "ferry-client-new.exe");
+                    var urlU = cfgU.PortalUrl.TrimEnd('/') + "/download-client";
+
+                    w("下载 " + urlU);
+                    if (File.Exists(tmpU)) { try { File.Delete(tmpU); } catch (Exception) { } }
+                    using (var wc = new System.Net.WebClient())
+                    {
+                        wc.Proxy = null;
+                        wc.DownloadFile(urlU, tmpU);
+                    }
+                    var lenU = new FileInfo(tmpU).Length;
+                    w("下载完成 " + lenU + " 字节");
+                    if (lenU < 50 * 1024) { w("文件太小，中止"); return; }
+
+                    if (File.Exists(oldU)) { try { File.Delete(oldU); } catch (Exception) { } }
+                    w("改名 " + exeU + " → " + oldU);
+                    File.Move(exeU, oldU);
+                    w("改名成功");
+
+                    try
+                    {
+                        File.Copy(tmpU, exeU, true);
+                        w("复制成功 " + new FileInfo(exeU).Length + " 字节");
+                    }
+                    catch (Exception e2)
+                    {
+                        w("复制失败：" + e2.Message);
+                        try { File.Move(oldU, exeU); w("已回滚"); } catch (Exception) { }
+                        return;
+                    }
+
+                    w("启动新进程");
+                    bool okU = Elevator.StartDetached("cmd.exe /c start \"\" \"" + exeU + "\"");
+                    w("WMI 结果 = " + okU);
+                    try { File.Delete(tmpU); } catch (Exception) { }
+                    w("=== 成功，退出旧进程 ===");
+                    System.Threading.Thread.Sleep(500);
+                    Environment.Exit(0);
+                }
+                catch (Exception e)
+                {
+                    w("失败：" + e.GetType().Name + " - " + e.Message);
+                }
+                return;
+            }
+
             // 上次自动更新会把旧 exe 改名成 .old（运行中无法覆盖），这里顺手清掉。
             try
             {

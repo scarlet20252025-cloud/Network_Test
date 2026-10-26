@@ -113,22 +113,28 @@ namespace Ferry
             DoubleBuffered = true;
 
             var title = Theme.Text2("渡口", Theme.FTitle, Theme.Text);
-            title.SetBounds(24, 16, 120, 28);
+            Theme.Place(title, 24, 16, 120);
             Controls.Add(title);
 
             var sub = Theme.Text2("内网应急接入 · 断网时借一台能出网的主机中转", Theme.FSmall, Theme.Muted);
-            sub.SetBounds(24, 44, 300, 18);
+            Theme.Place(sub, 24, 44, 300);
             Controls.Add(sub);
 
             _lblAcct = Theme.Text2("", Theme.FSmall, Theme.Muted);
-            _lblAcct.SetBounds(240, 22, 256, 20);
+            Theme.Place(_lblAcct, 240, 22, 256);
             _lblAcct.TextAlign = ContentAlignment.MiddleRight;
             Controls.Add(_lblAcct);
 
             _btnUpd = Theme.FlatButton("更新", false);
             _btnUpd.SetBounds(394, 48, 102, 26);
             _btnUpd.Visible = false;
-            _btnUpd.Click += delegate { DoUpdate(); };
+            // 这个按钮上的文字就是「更新 x.y.z」，版本号已经在 CheckUpdate 里拿到了。
+            // 记在 _latestVer 里，点按钮时直接用，不再发一次请求。
+            _btnUpd.Click += delegate
+            {
+                if (_latestVer.Length == 0) { Log("[更新] 还没拿到版本号，忽略点击"); return; }
+                DoUpdate(_latestVer);
+            };
             Controls.Add(_btnUpd);
 
             // ── 状态卡 ──
@@ -140,15 +146,15 @@ namespace Ferry
             Controls.Add(_card);
 
             _lblBig = Theme.Text2("检查中", Theme.FBig, Theme.Muted);
-            _lblBig.SetBounds(24, 12, 430, 40);
+            Theme.Place(_lblBig, 24, 12, 430);
             _card.Controls.Add(_lblBig);
 
             _lblDesc = Theme.Text2("", Theme.FBody, Theme.Muted);
-            _lblDesc.SetBounds(24, 54, 430, 36);
+            Theme.Place(_lblDesc, 24, 54, 430);
             _card.Controls.Add(_lblDesc);
 
             _lblQuota = Theme.Text2("", Theme.FSmall, Theme.Muted);
-            _lblQuota.SetBounds(24, 92, 430, 20);
+            Theme.Place(_lblQuota, 24, 92, 430);
             _card.Controls.Add(_lblQuota);
 
             // 「隧道」那行去掉了：现在只有一种模式（直连出口机的 SOCKS），
@@ -159,7 +165,7 @@ namespace Ferry
             // 第四行：TUN 状态。默认隐藏（只在设置里勾了全局接管时才显示），
             // 避免普通用户看到一行「未开启」以为是故障。
             _rowTun = Row(_card, 176);
-            _rowTun.SetBounds(24, 176, 352, 20);
+            Theme.Place(_rowTun, 24, 176, 352);
             _rowTun.Visible = true;
 
             // 全局模式的开关摆在「全局模式」这一行右边 —— 状态和动作在同一处。
@@ -175,7 +181,7 @@ namespace Ferry
             Controls.Add(_actCard);
 
             _lblActTitle = Theme.Text2("输入密钥激活", Theme.FBody, Theme.Text);
-            _lblActTitle.SetBounds(20, 6, 300, 22);
+            Theme.Place(_lblActTitle, 20, 6, 300);
             _actCard.Controls.Add(_lblActTitle);
 
             _txtCode = new TextBox();
@@ -197,7 +203,7 @@ namespace Ferry
 
             _lblActHint = Theme.Text2("管理员给你的 8 位字母数字，一个密钥只能用一次。",
                 Theme.FSmall, Theme.Muted);
-            _lblActHint.SetBounds(20, 58, 440, 18);
+            Theme.Place(_lblActHint, 20, 58, 440);
             _actCard.Controls.Add(_lblActHint);
 
             // ── 主按钮 ──
@@ -238,7 +244,7 @@ namespace Ferry
             _logCard.Controls.Add(_log);
 
             var foot = Theme.Text2("渡口仅用于个人学习与内网连通性测试", Theme.FSmall, Color.FromArgb(170, 176, 186));
-            foot.SetBounds(20, 722, 480, 18);
+            Theme.Place(foot, 20, 722, 480);
             foot.TextAlign = ContentAlignment.MiddleCenter;
             Controls.Add(foot);
 
@@ -248,7 +254,8 @@ namespace Ferry
         static Label Row(Panel parent, int y)
         {
             var l = Theme.Text2("", Theme.FSmall, Theme.Muted);
-            l.SetBounds(24, y, 430, 18);
+            // 高度由 Theme.Text2 按字体实测给出，这里只定位置和宽度
+            l.SetBounds(24, y, 430, l.Height);
             parent.Controls.Add(l);
             return l;
         }
@@ -894,6 +901,7 @@ namespace Ferry
 
                 BeginInvoke(new Action(delegate
                 {
+                    _latestVer = v.Latest;
                     _btnUpd.Text = "更新 " + v.Latest;
                     _btnUpd.Visible = true;
                     Log("发现新版本 " + v.Latest + "（当前 " + mine + "）");
@@ -910,13 +918,16 @@ namespace Ferry
                         "配置和授权都不受影响，装完会自动重新打开。\r\n" +
                         "选「否」就继续用当前版本，本次运行不再提醒。",
                         "有可用更新", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-                    if (r == DialogResult.Yes) DoUpdate();
+                    if (r == DialogResult.Yes) DoUpdate(v.Latest);
                 }));
             });
         }
 
         /// <summary>已经弹过提示的版本号。同一个版本不重复弹。</summary>
         string _updPrompted = "";
+
+        /// <summary>CheckUpdate 拿到的服务端最新版本号（「更新」按钮用）。</summary>
+        string _latestVer = "";
 
         /// <summary>
         /// 更新：**只替换客户端本体**，不跑安装包。
@@ -933,97 +944,141 @@ namespace Ferry
         ///
         /// 首次安装仍然用安装包（它还要放 mihomo/wintun 和建卸载项）。
         /// </summary>
-        void DoUpdate()
+        /// <summary>
+        /// 把更新过程的每一步都写进 assistant.log。
+        ///
+        /// 为什么必须这样：之前几次失败，日志只停在「发现新版本」，
+        /// 之后一行都没有 —— 到底是下载失败、改名失败还是压根没进 DoUpdate，
+        /// 完全看不出来。现在每个分支都留痕，下次失败能直接定位。
+        /// </summary>
+        void UpdateLog(string step)
         {
-            var v = Api.Version(_cfg.PortalUrl);
-            if (!v.Ok) { MessageBox.Show(this, "拿不到版本信息", "渡口"); return; }
+            Log("[更新] " + step);
+        }
 
-            // 只下载、不跑安装包、也不靠外部 .cmd —— 全程在进程内完成：
-            //
-            //   ① 把**正在运行的自己**改名成 渡口助手.exe.old（NTFS 允许重命名运行中的 exe）
-            //   ② 把新 exe 复制回原名
-            //   ③ 用 WMI 起新进程（脱离本进程的 Job，否则退出时会被一起回收）
-            //   ④ 自己退出；.old 在下次启动时删掉
-            //
-            // 为什么不再用 .cmd 中转：实测过一次「脚本成功删掉了临时文件、但没把进程
-            // 拉起来」的情况，排查成本很高（日志、临时文件、msg 弹窗都要看）。
-            // 现在每一步都在进程内，失败能当场回滚并告诉用户哪一步断了。
+        /// <summary>
+        /// 更新：**只替换客户端本体**，全程在后台线程。
+        ///
+        /// 三次失败的共同原因（这次才查清）：
+        ///   ① 整个 DoUpdate 跑在 UI 线程上 —— 下载是同步的，界面冻住，
+        ///      用户看到的就是「点完是就没了」。而且冻住期间 RealQuit 里的
+        ///      确认框也没机会画出来。
+        ///   ② 第一句又调了一次 Api.Version。正在借网时系统代理指向 10801，
+        ///      这次请求可能超时；失败就静默 return，界面上什么都没发生。
+        ///   ③ 最后调 RealQuit()，它在「正在借网」时会弹「确定退出吗」——
+        ///      更新场景下这个框是多余的，而且会把已经改好名的 exe 留在
+        ///      「.old」状态（用户点否 → 程序还在，但 exe 已经被换掉了）。
+        ///
+        /// 现在：
+        ///   · 版本号由 CheckUpdate 传进来，不再重复请求
+        ///   · 下载 / 改名 / 复制 / 启动全在 ThreadPool 里
+        ///   · 成功后直接 Environment.Exit(0)，不经过 RealQuit
+        ///   · 每一步都写日志，失败弹框说明是哪一步
+        /// </summary>
+        void DoUpdate(string latest)
+        {
+            UpdateLog("开始（当前 " + Application.ProductVersion + " → " + latest + "）");
 
             var exe = Application.ExecutablePath;
             var old = exe + ".old";
             var tmp = Path.Combine(Path.GetTempPath(), "ferry-client-new.exe");
+            var url = _cfg.PortalUrl.TrimEnd('/') + "/download-client";
 
-            try
+            // 按钮先禁用，避免用户连点两次开两个下载
+            if (_btnUpd != null) _btnUpd.Enabled = false;
+
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                var url = _cfg.PortalUrl.TrimEnd('/') + "/download-client";
-                if (File.Exists(tmp)) { try { File.Delete(tmp); } catch (Exception) { } }
-                using (var wc = new System.Net.WebClient())
-                {
-                    wc.Proxy = null;
-                    wc.DownloadFile(url, tmp);
-                }
-
-                var len = new FileInfo(tmp).Length;
-                if (len < 50 * 1024)
-                {
-                    MessageBox.Show(this, "下载到的文件不完整（" + len + " 字节），稍后再试。", "更新");
-                    return;
-                }
-
-                // 上次更新如果没删掉 .old，先清掉（那时它已经不在运行了）
-                if (File.Exists(old)) { try { File.Delete(old); } catch (Exception) { } }
-
-                // ① 自己改名。运行中的 exe 可以被重命名，但不能被覆盖。
-                File.Move(exe, old);
-
-                // ② 新版本就位
                 try
                 {
-                    File.Copy(tmp, exe, true);
-                }
-                catch (Exception)
-                {
-                    // 回滚，别把用户留在「程序没了」的状态
-                    try { File.Move(old, exe); } catch (Exception) { }
-                    throw;
-                }
+                    UpdateLog("下载 " + url);
+                    if (File.Exists(tmp)) { try { File.Delete(tmp); } catch (Exception) { } }
+                    using (var wc = new System.Net.WebClient())
+                    {
+                        // 不走系统代理：正在借网时代理指向 10801，
+                        // 而这是局域网直连，绕一圈只会更慢甚至超时。
+                        wc.Proxy = null;
+                        wc.DownloadFile(url, tmp);
+                    }
 
-                // ③ 起新进程。WMI 起的不在本进程的 Job 里，不会被回收。
-                Log("已更新到 " + v.Latest + "，正在重启…");
-                // ⚠ WMI 的 Win32_Process.Create 不认「整个命令行被引号包住」的写法
-                //   （返回码 9 = Path Not Found）。走 cmd /c start 让它自己拆引号。
-                bool started = Elevator.StartDetached(
-                    "cmd.exe /c start \"\" \"" + exe + "\"");
-                if (!started)
-                {
+                    var len = new FileInfo(tmp).Length;
+                    UpdateLog("下载完成 " + len + " 字节");
+                    if (len < 50 * 1024)
+                        throw new Exception("下载到的文件不完整（" + len + " 字节）");
+
+                    // 上次更新残留的 .old（那时它已经不在运行了）
+                    if (File.Exists(old)) { try { File.Delete(old); } catch (Exception) { } }
+
+                    // ① 自己改名 —— 运行中的 exe 可以被重命名，但不能被覆盖
+                    UpdateLog("改名 " + exe + " → " + old);
+                    File.Move(exe, old);
+                    UpdateLog("改名成功");
+
+                    // ② 新版本就位
                     try
+                    {
+                        UpdateLog("复制新版本到位");
+                        File.Copy(tmp, exe, true);
+                        UpdateLog("复制成功 " + new FileInfo(exe).Length + " 字节");
+                    }
+                    catch (Exception)
+                    {
+                        try { File.Move(old, exe); UpdateLog("已回滚"); } catch (Exception) { }
+                        throw;
+                    }
+
+                    // ③ 起新进程（WMI，脱离本进程的 Job）
+                    UpdateLog("启动新进程");
+                    bool started = Elevator.StartDetached(
+                        "cmd.exe /c start \"\" \"" + exe + "\"");
+                    UpdateLog("WMI 启动结果 = " + started);
+                    if (!started)
                     {
                         var psi = new ProcessStartInfo(exe);
                         psi.UseShellExecute = true;
                         psi.WorkingDirectory = _appDir;
                         Process.Start(psi);
+                        UpdateLog("已用 ShellExecute 兜底启动");
+                    }
+
+                    try { File.Delete(tmp); } catch (Exception) { }
+
+                    UpdateLog("更新完成，退出旧进程");
+                    Thread.Sleep(400);
+
+                    // 直接退，不走 RealQuit —— 它会在借网时弹确认框，
+                    // 而那时 exe 已经换好了，程序留在原地反而更奇怪。
+                    try
+                    {
+                        if (_rt != null) { FerryCore.RestoreDirect(_cfg, _appDir); _rt.Stop(); _rt = null; }
+                    }
+                    catch (Exception) { }
+                    Environment.Exit(0);
+                }
+                catch (Exception e)
+                {
+                    UpdateLog("失败：" + e.GetType().Name + " - " + e.Message);
+                    try
+                    {
+                        if (!File.Exists(exe) && File.Exists(old)) File.Move(old, exe);
+                    }
+                    catch (Exception) { }
+
+                    try
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            if (_btnUpd != null) _btnUpd.Enabled = true;
+                            MessageBox.Show(this,
+                                "更新失败：" + e.Message + "\r\n\r\n程序已保持原状，可以继续使用。",
+                                "更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }));
                     }
                     catch (Exception) { }
                 }
-
-                try { File.Delete(tmp); } catch (Exception) { }
-
-                // ④ 让出位置：先还原代理再退，别留死端口
-                Thread.Sleep(300);
-                RealQuit();
-            }
-            catch (Exception e)
-            {
-                // 任何一步失败都要能把程序还原回可用状态
-                try
-                {
-                    if (!File.Exists(exe) && File.Exists(old)) File.Move(old, exe);
-                }
-                catch (Exception) { }
-                MessageBox.Show(this, "更新失败：" + e.Message +
-                    "\r\n\r\n程序已保持原状，可以继续使用。", "更新");
-            }
+            });
         }
+
         /// <summary>
         /// 替换脚本（GBK + chcp 936，否则中文乱码）。
         ///
