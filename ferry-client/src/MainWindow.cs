@@ -458,7 +458,12 @@ namespace Ferry
                     "当前正在借网。退出会恢复直连，确定吗？",
                     "渡口", MessageBoxButton.YesNo, MessageBoxImage.Question);
                 if (r != MessageBoxResult.Yes) return;
-                try { FerryCore.RestoreDirect(_cfg, _appDir); _rt.Stop(); _rt = null; } catch (Exception) { }
+                if (_weSetProxy)
+                {
+                    try { FerryCore.RestoreDirect(_cfg, _appDir); } catch (Exception) { }
+                    _weSetProxy = false;
+                }
+                try { _rt.Stop(); _rt = null; } catch (Exception) { }
             }
             // 用户主动退出 = 结束使用，记成直连；下次打开不要自己又去借网。
             SaveLastState(false);
@@ -537,6 +542,32 @@ namespace Ferry
         //
         // 存在独立小文件里，不塞 config.json —— 那是用户的配置，不该被频繁改写，
         // 也不该因为「改了个端口」就顺手把借网状态一起改掉。
+        // ── 接入方式：抢系统代理，还是只当一个 SOCKS 节点 ──
+        //
+        // 系统的「代理服务器」只有一个位置。用户如果已经开着 Clash / 游戏加速器，
+        // 我们再写进去，两边会每秒互相改回来 —— 现象就是「借上网了但什么都打不开」。
+        // 所以：**发现代理已被别人占着，就只提供服务，不碰那个位置**。
+        // 用户在自己的 Clash 里把 127.0.0.1:<socks> 加成一个 SOCKS5 节点即可。
+        bool _nodeMode = false;
+        bool _weSetProxy = false;
+
+        /// <summary>系统代理是否已被别的程序（Clash / 加速器）占着。</summary>
+        bool OtherProxyActive()
+        {
+            try
+            {
+                if (!FerryCore.ProxyEnabled()) return false;
+                var srv = FerryCore.ProxyServer();
+                if (string.IsNullOrEmpty(srv)) return false;
+                var ours = "127.0.0.1:" + _cfg.HttpPort;
+                var ours2 = "127.0.0.1:" + _cfg.SocksPort;
+                if (srv.IndexOf(ours, StringComparison.OrdinalIgnoreCase) >= 0) return false;
+                if (srv.IndexOf(ours2, StringComparison.OrdinalIgnoreCase) >= 0) return false;
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
         string LastStatePath { get { return Path.Combine(_appDir, "last-state.txt"); } }
 
         void SaveLastState(bool borrowing)
@@ -756,6 +787,11 @@ namespace Ferry
                 return;
             }
 
+            // 每次启动都重新判断：用户可能刚开了 Clash，也可能刚关掉。
+            _nodeMode = OtherProxyActive();
+            if (_nodeMode)
+                Log("检测到系统代理已被其他程序占用 → 只提供 SOCKS 端口，不去抢（节点模式）");
+
             SetBusy(true);
             Log("启动隧道与代理…");
             ThreadPool.QueueUserWorkItem(delegate
@@ -766,12 +802,16 @@ namespace Ferry
                 if (err.Length == 0)
                 {
                     _rt = rt;
-                    try
+                    if (!_nodeMode)
                     {
-                        FerryCore.BackupProxyOnce(_cfg, _appDir);
-                        FerryCore.SetProxy(true, rt.BorrowServer);
+                        try
+                        {
+                            FerryCore.BackupProxyOnce(_cfg, _appDir);
+                            FerryCore.SetProxy(true, rt.BorrowServer);
+                            _weSetProxy = true;
+                        }
+                        catch (Exception) { }
                     }
-                    catch (Exception) { }
                     exitIp = rt.ExitIpViaProxy(6000);
                 }
                 else rt.Stop();
@@ -788,7 +828,11 @@ namespace Ferry
                     else
                     {
                         Log("隧道 + 代理已就绪（SOCKS " + _rt.SocksPort + " / HTTP " + _rt.HttpPort + "）");
-                        Log("系统代理已切到 " + _rt.BorrowServer);
+                        if (_nodeMode)
+                            Log("节点模式：不改系统代理。在 Clash/加速器里加 SOCKS5 127.0.0.1:" +
+                                _rt.SocksPort + "（HTTP " + _rt.HttpPort + "）");
+                        else
+                            Log("系统代理已切到 " + _rt.BorrowServer);
                         if (exitIp.Length > 0) { _exitVia = exitIp; Log("出口 IP：" + exitIp); }
                         else Log("出口探测失败（不影响使用，可能是远端暂时不通）");
                         SaveLastState(true);      // 下次启动/更新/开机自启要回到借网
@@ -805,7 +849,11 @@ namespace Ferry
             Log("切回直连…");
             ThreadPool.QueueUserWorkItem(delegate
             {
-                try { FerryCore.RestoreDirect(_cfg, _appDir); } catch (Exception) { }
+                if (_weSetProxy)
+                {
+                    try { FerryCore.RestoreDirect(_cfg, _appDir); } catch (Exception) { }
+                    _weSetProxy = false;
+                }
                 if (_rt != null) { try { _rt.Stop(); } catch (Exception) { } _rt = null; }
                 Thread.Sleep(200);
                 Dispatcher.BeginInvoke(new Action(delegate
@@ -1123,10 +1171,13 @@ namespace Ferry
             bool bridgeUp = runtimeUp && rt.ProxyAlive;
 
             string borrowServer = "http://127.0.0.1:" + httpPort;
-            bool borrowing = proxyOn && proxySrv == borrowServer && bridgeUp;
+            bool borrowing = _nodeMode ? (runtimeUp && bridgeUp)
+                                       : (proxyOn && proxySrv == borrowServer && bridgeUp);
 
-            if (runtimeUp && proxyOn && bridgeUp && proxySrv != borrowServer &&
-                proxySrv.StartsWith("http://127.0.0.1:"))
+            // 纠正「代理指错地方」只在**我们自己是接管模式**时做。
+            // 节点模式下那个位置属于用户的 Clash，我们一律不碰。
+            if (!_nodeMode && _weSetProxy && runtimeUp && proxyOn && bridgeUp &&
+                proxySrv != borrowServer && proxySrv.StartsWith("http://127.0.0.1:"))
             {
                 try { FerryCore.SetProxy(true, borrowServer); } catch (Exception) { }
                 Log("系统代理指错了地方 " + proxySrv + " → " + borrowServer + "，已纠正");
@@ -1186,8 +1237,20 @@ namespace Ferry
             {
                 _lblBig.Text = "正在走渡口";
                 _lblBig.Foreground = Palette.GoodB;
-                _lblDesc.Text = _exitVia.Length > 0
-                    ? "流量经远端主机中转 · 出口 " + _exitVia : "流量经远端主机中转";
+                if (_nodeMode)
+                {
+                    // 节点模式：系统代理归用户的 Clash 管，我们只提供端口。
+                    // 这里必须把「该怎么接」说清楚，否则用户只会看到「借网成功但上不了网」。
+                    _lblDesc.Text = "节点模式 · 在 Clash / 加速器里添加 SOCKS5 127.0.0.1:" +
+                        (rt != null ? rt.SocksPort : _cfg.SocksPort) +
+                        "（HTTP " + (rt != null ? rt.HttpPort : _cfg.HttpPort) + "）" +
+                        ( _exitVia.Length > 0 ? "\n出口 " + _exitVia : "");
+                }
+                else
+                {
+                    _lblDesc.Text = _exitVia.Length > 0
+                        ? "流量经远端主机中转 · 出口 " + _exitVia : "流量经远端主机中转";
+                }
                 _lblDesc.Foreground = Palette.MutedB;
 
                 if (_cfg.UseTun && !(rt != null && rt.TunRunning))
