@@ -1,3 +1,42 @@
+## v0.13.12 — 2026-10-26
+
+> 安全：重写 git 历史，清掉历史里的旧密码与旧令牌。
+
+### 做了什么
+
+`git filter-branch` 重写全部 89 个提交，把两个字符串替换成占位符：
+
+| 原值 | 替换为 | 出现位置 |
+|---|---|---|
+| `awwDHRG2…`（旧管理密码） | `<REDACTED-ADMIN-PW>` | `tools/verify-netctl-live.py`、`verify-note-edit.py` |
+| `sngsb4-…`（旧激活令牌） | `<REDACTED-TOKEN>` | `HANDOVER-打包工作.md` |
+
+然后 `--force` 推送（所有 commit SHA 都变了）。
+
+**两个都是真的泄露**：仓库是 public，这两个值在 HEAD 和历史里都能直接读到。
+虽然现在已经轮换（旧值在服务端已失效），但历史里留着就等于把「曾经的管理密码」
+公开挂着，所以还是清了。
+
+### 过程中踩的坑
+
+第一遍 filter 只清了 `.py`，`.md` 没动 —— 因为脚本写成了：
+
+```bash
+for f in $(git ls-files "*.md"); do ... done
+```
+
+`$(...)` 按空白分词，**中文文件名会被拆碎**，`sed -i` 全部失败（错误还被吞了）。
+改成 NUL 分隔才对：
+
+```bash
+git ls-files -z | while IFS= read -r -d '' f; do ... done
+```
+
+### 没有清掉的
+
+GitHub 上旧的 commit 对象仍然可以通过 SHA 直接访问，直到 GitHub 侧 GC。
+如果在意这一点，**把仓库改成 private** 比继续折腾历史更彻底 —— 目前 0 fork、1 star。
+
 ## v0.13.11 — 2026-10-26
 
 > 客户端 0.9.20：定位改成「应急接手没做完的工作」；界面去掉 SSH 隧道。
