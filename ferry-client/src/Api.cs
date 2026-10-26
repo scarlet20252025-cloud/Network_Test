@@ -284,7 +284,8 @@ namespace Ferry
         /// csrf：从 /feedback 页面抓。带上 User-Agent 里的版本号
         /// 对定位问题帮助极大（「v0.9.2 才出现」vs「一直都有」）。
         /// </summary>
-        public static string Feedback(Cfg cfg, string kind, string text, string contact)
+        public static string Feedback(Cfg cfg, string kind, string text, string contact,
+                                      string attachIds = null)
         {
             if (string.IsNullOrEmpty(cfg.PortalUrl)) return "没有配置门户地址";
             if (string.IsNullOrEmpty(text) || text.Trim().Length < 4) return "描述太短了，至少写 4 个字";
@@ -305,6 +306,10 @@ namespace Ferry
                     + "&text=" + Uri.EscapeDataString(text.Trim())
                     + "&contact=" + Uri.EscapeDataString(contact ?? "")
                     + "&ver=" + Uri.EscapeDataString(ClientVersion);
+                // 附件 id 列表（逗号分隔）。服务端按 upload_token 绑定，
+                // 这里传 ids 是给「客户端上传时没带 token」的兜底路径用。
+                if (!string.IsNullOrEmpty(attachIds))
+                    body += "&attach_ids=" + Uri.EscapeDataString(attachIds);
                 var req = Make(baseUrl + "/feedback", "POST");
                 req.ContentType = "application/x-www-form-urlencoded; charset=utf-8";
                 var bytes = System.Text.Encoding.UTF8.GetBytes(body);
@@ -322,6 +327,59 @@ namespace Ferry
             } catch (Exception e) {
                 return "提交失败：" + e.Message;
             }
+        }
+
+        /// <summary>
+        /// 上传一个附件，成功返回服务端给的 id（字符串），失败返回空串。
+        ///
+        /// 为什么要手写 multipart：.NET Framework 没有现成的 multipart 客户端
+        /// （HttpClient 在 4.8 里可用但要引 System.Net.Http，会多一个依赖）。
+        /// 手工拼 body 只有二十行，反而更省。
+        /// </summary>
+        public static string UploadAttachment(Cfg cfg, string filePath)
+        {
+            if (string.IsNullOrEmpty(cfg.PortalUrl)) return "";
+            try
+            {
+                var name = Path.GetFileName(filePath);
+                var bytes = File.ReadAllBytes(filePath);
+                if (bytes.Length == 0 || bytes.Length > 8 * 1024 * 1024) return "";
+
+                string mime = "application/octet-stream";
+                var ext = Path.GetExtension(filePath).ToLowerInvariant();
+                if (ext == ".png") mime = "image/png";
+                else if (ext == ".jpg" || ext == ".jpeg") mime = "image/jpeg";
+                else if (ext == ".gif") mime = "image/gif";
+                else if (ext == ".webp") mime = "image/webp";
+                else if (ext == ".txt" || ext == ".log") mime = "text/plain";
+                else if (ext == ".csv") mime = "text/csv";
+                else if (ext == ".json") mime = "application/json";
+                else if (ext == ".zip") mime = "application/zip";
+
+                string boundary = "----Ferry" + Guid.NewGuid().ToString("N");
+                var head = "--" + boundary + "\r\n"
+                    + "Content-Disposition: form-data; name=\"file\"; filename=\"" + name + "\"\r\n"
+                    + "Content-Type: " + mime + "\r\n\r\n";
+                var tail = "\r\n--" + boundary + "--\r\n";
+
+                var hb = System.Text.Encoding.UTF8.GetBytes(head);
+                var tb = System.Text.Encoding.UTF8.GetBytes(tail);
+
+                var req = Make(cfg.PortalUrl.TrimEnd('/') + "/attach/upload", "POST");
+                req.ContentType = "multipart/form-data; boundary=" + boundary;
+                req.ContentLength = hb.Length + bytes.Length + tb.Length;
+                using (var st = req.GetRequestStream())
+                {
+                    st.Write(hb, 0, hb.Length);
+                    st.Write(bytes, 0, bytes.Length);
+                    st.Write(tb, 0, tb.Length);
+                }
+                string resp;
+                using (var r = req.GetResponse()) resp = ReadBody(r);
+                var m = System.Text.RegularExpressions.Regex.Match(resp, @"""id""\s*:\s*(\d+)");
+                return m.Success ? m.Groups[1].Value : "";
+            }
+            catch (Exception) { return ""; }
         }
 
         /// <summary>客户端版本号（反馈时带上，便于定位）。</summary>

@@ -174,6 +174,26 @@ CREATE TABLE IF NOT EXISTS traffic (
 -- 为什么不需要用户表：IP 本身就是身份（借网按 IP 限速、按 IP 激活）。
 -- 让用户「不用登录就能反馈」比多一套账号体系重要 ——
 -- 反馈往往来自「还没装好/还没激活」的人，拿登录挡他们等于没这个功能。
+-- 反馈附件。
+--
+-- 为什么单独一张表而不是塞进 feedback：
+--   · 一条反馈可能带多张图（截图往往不止一张）
+--   · 附件要在「反馈还没提交」时就能上传（用户粘完图再点提交），
+--     那时 feedback_id 还不存在，所以先落 upload_token，提交时再绑定
+CREATE TABLE IF NOT EXISTS feedback_attach (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    feedback_id  INTEGER DEFAULT 0,   -- 0 = 还没绑定到任何反馈
+    upload_token TEXT DEFAULT '',     -- 上传时给前端的随机串，提交反馈时带回来
+    name         TEXT DEFAULT '',
+    mime         TEXT DEFAULT '',
+    size         INTEGER DEFAULT 0,
+    stored       TEXT DEFAULT '',     -- 磁盘上的文件名（不含目录）
+    created_at   INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_attach_fb ON feedback_attach(feedback_id);
+CREATE INDEX IF NOT EXISTS idx_attach_tok ON feedback_attach(upload_token);
+
 CREATE TABLE IF NOT EXISTS feedback (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          INTEGER NOT NULL,
@@ -964,6 +984,50 @@ TOTAL_FLUSH_SEC = 60
 STATS_BUCKET_SEC = 300
 STATS_KEEP_HOURS = 250
 
+# 反馈附件：单个最大 8 MB，一条反馈最多 6 个。
+# 8 MB 够放一张手机截图（PNG 通常 1~3 MB）；再大就不是「反馈」而是传文件了。
+ATTACH_MAX_BYTES = 8 * 1024 * 1024
+ATTACH_MAX_COUNT = 6
+ATTACH_DIRNAME = 'attachments'
+
+# 只接受这几种，避免被当成网盘或者上传可执行文件。
+# 图片是为了截图，文本/日志是为了贴报错。
+ATTACH_ALLOWED = {
+    'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif',
+    'image/webp': '.webp',
+    'text/plain': '.txt', 'text/csv': '.csv',
+    'application/json': '.json',
+    'application/zip': '.zip',
+}
+
+
+def attach_dir():
+    """附件目录，跟 portal.db 放一起，方便整体备份/迁移。"""
+    base = os.path.dirname(os.path.abspath(CFG.get('db') or 'portal.db'))
+    d = os.path.join(base, ATTACH_DIRNAME)
+    if not os.path.isdir(d):
+        try:
+            os.makedirs(d)
+        except Exception:
+            pass
+    return d
+
+
+def attach_url(aid):
+    return '/attach/' + str(int(aid))
+
+
+def attach_list(db, feedback_id):
+    """某条反馈的附件列表（给管理面板用）。"""
+    try:
+        rows = db.q('SELECT id, name, mime, size FROM feedback_attach '
+                    'WHERE feedback_id = ? ORDER BY id', (feedback_id,))
+    except Exception:
+        return []
+    return [{'id': r['id'], 'name': r['name'] or ('附件 ' + str(r['id'])),
+             'mime': r['mime'] or '', 'size': r['size'] or 0,
+             'url': attach_url(r['id'])} for r in rows]
+
 
 def note_totals(ip, d_rx, d_tx, rx_bps, tx_bps):
     """把这次心跳的增量累到内存。"""
@@ -1571,6 +1635,135 @@ def download_page(detected_ip=''):
    .replace('LOG_HTML', log_html)) 
 
 
+# 反馈附件的前端逻辑：粘贴 / 拖拽 / 选择 + 缩略图列表。
+#
+# 为什么单独一份而不是复用 ADMIN_JS：管理面板那 46 KB 脚本里全是实时图、
+# 统计、设备表格的逻辑，反馈页一样用不上。共用只会让反馈页也去跑轮询。
+ATTACH_JS = r"""
+<script>
+(function(){
+  var attach = [];
+  var token = '';
+
+  function tok(){
+    if (token) return token;
+    var a = 'abcdefghjkmnpqrstuvwxyz23456789', s = '';
+    for (var i = 0; i < 16; i++) s += a[Math.floor(Math.random() * a.length)];
+    token = s;
+    return s;
+  }
+
+  function human(n){
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+
+  function esc(s){
+    return String(s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+
+  function render(){
+    var box = document.getElementById('fbAttachList');
+    if (!box) return;
+    if (!attach.length) { box.innerHTML = ''; return; }
+    var h = '';
+    attach.forEach(function(a, i){
+      var isImg = (a.mime || '').indexOf('image/') === 0;
+      h += '<div class="att-item">'
+        + (isImg
+            ? '<img class="att-thumb" src="' + a.url + '?t=' + encodeURIComponent(tok()) + '" alt="">'
+            : '<div class="att-thumb att-doc">' + (a.name.split('.').pop() || '?').toUpperCase() + '</div>')
+        + '<div class="att-meta"><div class="att-name" title="' + esc(a.name) + '">'
+        + esc(a.name) + '</div><div class="att-size">' + human(a.size) + '</div></div>'
+        + '<button type="button" class="att-del" data-i="' + i + '" title="移除">&times;</button>'
+        + '</div>';
+    });
+    box.innerHTML = h;
+    Array.prototype.forEach.call(box.querySelectorAll('.att-del'), function(b){
+      b.addEventListener('click', function(){
+        attach.splice(parseInt(b.getAttribute('data-i'), 10), 1);
+        render();
+      });
+    });
+  }
+
+  function upload(file){
+    if (!file) return;
+    if (attach.length >= 6) { alert('最多 6 个附件'); return; }
+    if (file.size > 8 * 1048576) { alert('单个附件上限 8 MB'); return; }
+
+    var box = document.getElementById('fbAttachList');
+    var tip = document.createElement('div');
+    tip.className = 'att-item att-uploading';
+    tip.innerHTML = '<div class="att-thumb att-doc">&hellip;</div>'
+      + '<div class="att-meta"><div class="att-name">' + esc(file.name || '粘贴的图片') + '</div>'
+      + '<div class="att-size">上传中&hellip;</div></div>';
+    if (box) box.appendChild(tip);
+
+    var fd = new FormData();
+    fd.append('token', tok());
+    fd.append('file', file, file.name || ('paste-' + Date.now() + '.png'));
+
+    fetch('/attach/upload', { method: 'POST', body: fd, credentials: 'same-origin' })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d.ok) { alert('上传失败：' + (d.error || '未知')); return; }
+        attach.push(d);
+        render();
+      })
+      .catch(function(e){ alert('上传失败：' + e.message); })
+      .then(function(){ if (tip.parentNode) tip.parentNode.removeChild(tip); });
+  }
+
+  var zone = document.getElementById('fbDrop');
+  var input = document.getElementById('fbFile');
+  var form = document.querySelector('.fbform form');
+  if (zone && input) {
+    zone.addEventListener('click', function(){ input.click(); });
+    zone.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); }
+    });
+    input.addEventListener('change', function(){
+      Array.prototype.forEach.call(input.files, upload);
+      input.value = '';
+    });
+    ['dragenter', 'dragover'].forEach(function(ev){
+      zone.addEventListener(ev, function(e){ e.preventDefault(); zone.classList.add('hot'); });
+    });
+    ['dragleave', 'drop'].forEach(function(ev){
+      zone.addEventListener(ev, function(e){ e.preventDefault(); zone.classList.remove('hot'); });
+    });
+    zone.addEventListener('drop', function(e){
+      var dt = e.dataTransfer;
+      if (dt) Array.prototype.forEach.call(dt.files || [], upload);
+    });
+    // 粘贴只在表单里生效，不干扰用户粘文字
+    if (form) {
+      form.addEventListener('paste', function(e){
+        var items = (e.clipboardData && e.clipboardData.items) || [];
+        var got = false;
+        Array.prototype.forEach.call(items, function(it){
+          if (it.kind === 'file') {
+            var f = it.getAsFile();
+            if (f) { upload(f); got = true; }
+          }
+        });
+        if (got) e.preventDefault();
+      });
+      form.addEventListener('submit', function(){
+        var t = document.getElementById('fbAttachToken');
+        if (t) t.value = tok();
+      });
+    }
+  }
+})();
+</script>
+"""
+
+
 def feedback_page(detected_ip='', msg='', err=''):
     """意见反馈页。
 
@@ -1627,6 +1820,22 @@ def feedback_page(detected_ip='', msg='', err=''):
       <textarea name="text" maxlength="2000" required
                 placeholder="发生了什么？期望的结果是什么？如果能贴上报错文字或截图描述，会更好定位。"></textarea>
 
+      <!-- 附件区：拖拽 / 点击选择 / 直接粘贴截图，三个入口共用同一个上传接口。 -->
+      <label>截图或文件（选填）</label>
+      <div class="fbdrop" id="fbDrop" tabindex="0" role="button"
+           aria-label="点击选择文件，或把文件拖进来">
+        <div class="fbdrop-ico">&#128206;</div>
+        <div class="fbdrop-t">
+          <b>点击选择</b>、把文件<b>拖进来</b>，或者直接在这里 <b>Ctrl+V 粘贴截图</b>
+        </div>
+        <div class="fbdrop-h">支持 PNG / JPG / GIF / WebP / TXT / LOG / JSON / ZIP，
+          单个不超过 8 MB，最多 6 个</div>
+      </div>
+      <input type="file" id="fbFile" multiple accept="image/*,.txt,.log,.json,.zip,.csv"
+             style="display:none">
+      <div class="att-list" id="fbAttachList"></div>
+      <input type="hidden" name="attach_token" id="fbAttachToken">
+
       MSGBOX
       ERRBOX
 
@@ -1645,7 +1854,7 @@ def feedback_page(detected_ip='', msg='', err=''):
   </div>
 </div>
 """.replace('IP_TXT', ip_txt).replace('MSGBOX', msgbox).replace('ERRBOX', errbox)
-   .replace('CSRF_IN', csrf_in))
+   .replace('CSRF_IN', csrf_in) + ATTACH_JS)
 
 
 
@@ -2443,6 +2652,44 @@ html[data-theme="light"] .arw.up{color:#d97706}
 .fbmsg.err{display:block;background:var(--errbg);color:var(--err)}
 .fbnote{font-size:11.5px;color:var(--fg2);line-height:1.75;margin-top:14px}
 
+/* ── 反馈附件上传 ── */
+.fbdrop{border:1.5px dashed var(--line2);border-radius:12px;padding:18px 16px;
+  text-align:center;cursor:pointer;transition:border-color .15s,background .15s;
+  background:color-mix(in srgb,var(--card2) 50%,transparent);outline:none}
+.fbdrop:hover,.fbdrop:focus-visible{border-color:var(--accent);
+  background:color-mix(in srgb,var(--accent) 6%,transparent)}
+.fbdrop.hot{border-color:var(--accent);border-style:solid;
+  background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.fbdrop-ico{font-size:22px;line-height:1;margin-bottom:8px;opacity:.75}
+.fbdrop-t{font-size:12.5px;color:var(--fg2);line-height:1.7}
+.fbdrop-t b{color:var(--fg);font-weight:600}
+.fbdrop-h{font-size:11px;color:var(--fg2);opacity:.75;margin-top:6px;line-height:1.6}
+
+.att-list{display:flex;flex-direction:column;gap:7px;margin-top:10px}
+.att-item{display:flex;align-items:center;gap:10px;padding:7px 9px;
+  background:var(--card2);border:1px solid var(--line);border-radius:9px}
+.att-item.att-uploading{opacity:.6}
+.att-thumb{width:38px;height:38px;border-radius:7px;object-fit:cover;
+  flex:0 0 auto;background:var(--line);border:1px solid var(--line2)}
+.att-thumb.att-doc{display:flex;align-items:center;justify-content:center;
+  font-size:10px;font-weight:700;color:var(--fg2);font-family:Consolas,Monaco,monospace}
+.att-meta{flex:1 1 auto;min-width:0}
+.att-name{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.att-size{font-size:10.5px;color:var(--fg2);margin-top:1px}
+.att-del{flex:0 0 auto;width:24px;height:24px;padding:0;background:transparent;
+  border:0;color:var(--fg2);font-size:17px;line-height:1;cursor:pointer;border-radius:6px}
+.att-del:hover{color:var(--err);background:var(--errbg)}
+
+/* 管理面板里显示附件：小缩略图 + 名字，点开看大图 */
+.fb-attach{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.fb-attach a{display:inline-flex;align-items:center;gap:5px;font-size:11px;
+  color:var(--fg2);text-decoration:none;background:var(--card2);
+  border:1px solid var(--line);border-radius:7px;padding:3px 8px;
+  transition:border-color .15s,color .15s}
+.fb-attach a:hover{color:var(--accent);border-color:var(--accent)}
+.fb-attach img{width:44px;height:44px;object-fit:cover;border-radius:6px;
+  border:1px solid var(--line2);display:block}
+
 /* ── 意见反馈管理 ── */
 .fb-st{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;
   white-space:nowrap}
@@ -2491,6 +2738,60 @@ tr.fb-more>td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accen
 .dsec{margin:16px 0 8px;font-size:12px;color:var(--fg2);letter-spacing:.4px}
 .devlist{margin:0;padding-left:16px;line-height:1.9;font-size:12px;color:var(--fg2)}
 .devlist b{color:var(--fg);font-weight:500}
+
+/* ── 管理面板：顶部导航 + 页头 ──
+   五个区块拆成独立页面后，导航变成「你在哪一页」的指示器。 */
+.adminnav{position:sticky;top:0;z-index:60;display:flex;gap:4px;flex-wrap:wrap;
+  padding:8px 0;margin:0 0 18px;
+  background:color-mix(in srgb,var(--bg) 90%,transparent);
+  backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--line)}
+.adminnav a.anav-item{font-size:12.5px;color:var(--fg2);text-decoration:none;
+  padding:6px 14px;border-radius:9px;transition:color .15s,background .15s}
+.adminnav a.anav-item:hover{color:var(--fg);background:var(--card)}
+.adminnav a.anav-item.on{color:var(--accent);
+  background:color-mix(in srgb,var(--accent) 14%,transparent);font-weight:600}
+
+.ahead{display:flex;align-items:flex-end;justify-content:space-between;
+  gap:16px;flex-wrap:wrap;margin:0 0 18px}
+.ahead h1{margin:0 0 4px;font-size:24px;font-weight:800;letter-spacing:-.3px}
+.ahead .asub{font-size:12.5px;color:var(--fg2)}
+.ahead-act{display:flex;gap:8px;flex-wrap:wrap}
+
+/* 反馈页工具栏 + 卡片列表 */
+.fbtoolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 12px}
+.fbfilters{display:flex;gap:6px;flex-wrap:wrap}
+.fbfilters .fb-filter.on{background:color-mix(in srgb,var(--accent) 16%,transparent);
+  border-color:var(--accent);color:var(--accent);font-weight:600}
+.fbcount{margin-left:auto;font-size:12px;color:var(--warn)}
+
+.fbcards{display:flex;flex-direction:column;gap:10px}
+.fbskel{color:var(--fg2);font-size:13px;padding:20px 0;text-align:center}
+
+.fbcard{background:var(--card);border:1px solid var(--line);border-radius:13px;
+  padding:14px 16px;transition:border-color .15s}
+.fbcard:hover{border-color:var(--line2)}
+.fbcard.st0{border-left:3px solid var(--warn)}
+.fbcard.st1{border-left:3px solid var(--ok)}
+.fbcard.st2{border-left:3px solid var(--line2);opacity:.75}
+.fbcard.st3{border-left:3px solid var(--err);opacity:.7}
+.fbcard-top{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:8px}
+.fbcard .fb-st{font-size:11px}
+.fbkind{font-size:11.5px;color:var(--fg2);background:var(--card2);
+  border:1px solid var(--line);border-radius:99px;padding:1px 9px}
+.fbwho{margin-left:auto;font-size:11px;color:var(--fg2);
+  font-family:Consolas,Monaco,monospace;white-space:nowrap}
+.fbcard .fb-text{font-size:13px;line-height:1.7;max-width:none;color:var(--fg)}
+.fbcard .fb-extra{font-size:11.5px;color:var(--fg2);margin-top:6px}
+.fbcard-foot{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
+.fbcard-foot select{font-size:11.5px;padding:3px 7px;background:var(--card2);
+  color:var(--fg);border:1px solid var(--line2);border-radius:7px;font-family:inherit}
+.fbold{font-size:11px;color:var(--fg2);background:transparent;border:0;
+  cursor:pointer;padding:2px 0;text-decoration:underline dotted;
+  text-underline-offset:3px;font-family:inherit}
+.fbold:hover{color:var(--accent)}
+.evtag{font-size:11px;background:var(--card2);border:1px solid var(--line);
+  border-radius:6px;padding:1px 7px;font-family:Consolas,Monaco,monospace}
 
 /* ── 管理面板分区导航 ──
    sticky 顶部，滚动时一直在。五个区块都是长表格，
@@ -2650,7 +2951,8 @@ tr.fb-more>td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accen
 .tier:has(input:checked) span{color:var(--accent);font-weight:600}
 </style>'''
 
-LIVE_UI = r'''
+# 管理面板的 HTML 骨架（实时图 + 统计面板 + 带宽控制台 + 弹窗）。
+ADMIN_UI_HTML = r'''
 
 <div class="perfpanel" id="sec-live">
   <div class="perf-head">
@@ -2791,10 +3093,86 @@ LIVE_UI = r'''
     </div>
   </div>
 </div>
+<!-- 右侧带宽控制台 -->
+<button type="button" class="netctl-handle" id="ncHandle" title="展开带宽控制">◀</button>
+<aside class="netctl" id="netCtl">
+  <div class="netctl-head">
+    <h3>带宽控制</h3>
+    <button type="button" class="netctl-toggle" id="ncCollapse" title="收起">▶</button>
+  </div>
+  <div class="sub2 netctl-fold">
+    改动写入限速配置，中继 5 秒内热生效 —— 不会断开正在传的连接。
+  </div>
 
+  <div class="field">
+    <label>每台机器上限</label>
+    <div class="rowline">
+      <input type="number" id="ncPerIp" min="0" max="1000" step="1" placeholder="10">
+      <span class="unit">MB/s</span>
+    </div>
+  </div>
+  <div class="presets">
+    <button type="button" data-rate="3">3</button>
+    <button type="button" data-rate="5">5</button>
+    <button type="button" data-rate="10">10</button>
+    <button type="button" data-rate="20">20</button>
+    <button type="button" data-rate="0">不限</button>
+  </div>
 
+  <div class="field">
+    <label>全站总上限</label>
+    <div class="rowline">
+      <input type="number" id="ncTotal" min="0" max="10000" step="1" placeholder="0">
+      <span class="unit">MB/s</span>
+    </div>
+  </div>
 
-<script>
+  <div class="field">
+    <label>远端出口带宽</label>
+    <div class="rowline">
+      <input type="number" id="ncUplink" min="1" max="100000" step="10" placeholder="1000">
+      <span class="unit">Mbps</span>
+    </div>
+  </div>
+
+  <button type="button" class="apply" id="ncApply">应用</button>
+  <div class="saved" id="ncMsg"></div>
+
+  <div class="hintbox">
+    <b>三个数字怎么填</b><br>
+    · 每台上限：一个人最多跑多快。填 0 = 不限。<br>
+    · 全站上限：所有人加起来的天花板。校园网出口有限，
+      每人都 10 MB/s 时三个人就能把百兆线吃满。<br>
+    · 出口带宽：只用于算上面的载荷百分比，不参与限速。
+      默认 1000（pcs 是千兆线路）。
+  </div>
+  <div class="hintbox">
+    <b>载荷到多少会卡</b><br>
+    60% 起进入拥挤区（开始有排队的体感），
+    85% 以上基本饱和 —— 这时候谁再多跑一点，所有人都会觉得卡。
+    仪表上那两条竖线就是这两个边界。
+  </div>
+</aside>
+
+<!-- 机器详情弹窗的骨架。放在这里（跟着 LIVE_UI 一起）而不是页面最底部，
+     是为了让「弹窗样式 + 弹窗 JS + 弹窗 DOM」三件东西待在同一个位置，
+     改的时候不用满文件找。 -->
+<div class="modal" id="clientModal" aria-hidden="true">
+  <div class="modal-bg"></div>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="clientTitle">
+    <div class="modal-head">
+      <span class="modal-title" id="clientTitle">—</span>
+      <button type="button" class="modal-close" aria-label="关闭">&times;</button>
+    </div>
+    <div class="modal-body" id="clientBody"></div>
+  </div>
+</div>'''
+
+# 管理面板的脚本。**每个管理页都要注入** —— 反馈页、密钥页虽然不含
+# 实时图，但复用同一套 fmtSpeed / fbEsc / loadFeedback 等工具函数。
+# 踩过的坑：脚本原来夹在 LIVE_UI 的 HTML 中间，拆页时忘了一起带上，
+# 反馈页就变成「加载中…」永远不动（JS 根本没加载）。
+ADMIN_JS = r'''<script>
 (function(){
   var peak = {rx:0, tx:0};
   function esc(s){
@@ -3111,96 +3489,89 @@ LIVE_UI = r'''
         if (!d.ok) return;
         var c = d.counts || {};
         var nb = document.getElementById('fbNew');
-        if (nb) nb.textContent = c[0] ? ('· ' + c[0] + ' 条待处理') : '';
+        if (nb) nb.textContent = c[0] ? (c[0] + ' 条待处理') : '';
 
         var rows = (d.list || []).filter(function(x){
           return fbFilter === 'all' ? true : String(x.status) === fbFilter;
         });
-        var body = document.getElementById('fbBody');
-        if (!body) return;
+        var box = document.getElementById('fbCards');
+        if (!box) return;
         if (!rows.length) {
-          body.innerHTML = '<tr><td colspan="6" class="muted">没有符合条件的反馈</td></tr>';
+          box.innerHTML = '<div class="fbskel">没有符合条件的反馈</div>';
           return;
         }
+
+        // 卡片列表而不是表格：
+        // 反馈正文长短不一、还可能带图，塞进表格单元格里必然挤成一团。
+        // 卡片能自然换行、附件缩略图有地方放、状态一眼看出（左边色条）。
         var h = '';
-
-        // ── 相同来源折叠 ──
-        // 同一个 IP 的多条反馈默认只展开最新一条，其余收在「共 N 条」里。
-        // 为什么：一个人连着报五六条（改一版说一次）会把整个面板顶满，
-        // 别人的反馈被挤到看不见 —— 而面板的用途是「别漏掉任何一条」。
-        // 后端不动：list 已按 id DESC 返回，这里只决定谁显示、谁收起。
-        var order = [], groups = {};
         rows.forEach(function(x){
-          var key = x.ip || '?';
-          if (!groups[key]) { groups[key] = []; order.push(key); }
-          groups[key].push(x);
-        });
+          var kind = FB_KIND[x.kind] || x.kind || '其他';
+          var atts = x.attachments || [];
+          h += '<div class="fbcard st' + x.status + '" data-id="' + x.id + '">'
+            + '<div class="fbcard-top">'
+            + '<span class="fb-st fb-st-' + x.status + '">' + (FB_ST[x.status] || '?') + '</span>'
+            + '<span class="fbkind">' + fbEsc(kind) + '</span>'
+            + '<span class="fbwho">' + fbEsc(x.ip)
+            + (x.client_ver ? ' · v' + fbEsc(x.client_ver) : '') + ' · '
+            + fbTime(x.ts) + '</span>'
+            + '</div>'
+            + '<div class="fb-text">' + fbEsc(x.text) + '</div>';
 
-        order.forEach(function(key, gi){
-          var g = groups[key];
-          g.forEach(function(x, xi){
-            var kind = FB_KIND[x.kind] || x.kind || '其他';
-            var isMore = xi > 0;
-            h += '<tr data-id="' + x.id + '"'
-              + (isMore ? ' class="fb-more" data-g="' + gi + '" style="display:none"' : '')
-              + '>'
-              + '<td class="nowrap"><span class="fb-st fb-st-' + x.status + '">'
-              + (FB_ST[x.status] || '?') + '</span></td>'
-              + '<td class="nowrap">' + fbEsc(kind) + '</td>'
-              + '<td><div class="fb-text">' + fbEsc(x.text) + '</div>'
-              + (x.contact ? '<div class="hint" style="margin-top:3px">联系: '
-                 + fbEsc(x.contact) + '</div>' : '')
-              + (x.admin_note ? '<div class="hint" style="margin-top:3px">备注: '
-                 + fbEsc(x.admin_note) + '</div>' : '')
-              + '</td>'
-              + '<td class="mono nowrap" style="font-size:11.5px">'
-              + fbEsc(x.ip) + (x.client_ver ? '<div class="hint">v'
-                 + fbEsc(x.client_ver) + '</div>' : '')
-              + (!isMore && g.length > 1
-                 ? '<div><button type="button" class="fb-fold" data-g="' + gi
-                   + '" data-total="' + g.length + '">共 ' + g.length
-                   + ' 条 &#9662;</button></div>'
-                 : '')
-              + '</td>'
-              + '<td class="muted nowrap" style="font-size:11.5px">'
-              + fbTime(x.ts) + '</td>'
-              + '<td class="nowrap">'
-              + '<select class="fb-sel" data-id="' + x.id + '" style="font-size:11.5px;'
-              + 'padding:2px 4px;background:var(--card2);color:var(--fg);'
-              + 'border:1px solid var(--line2);border-radius:5px">'
-              + '<option value="0"' + (x.status === 0 ? ' selected' : '') + '>新提交</option>'
-              + '<option value="1"' + (x.status === 1 ? ' selected' : '') + '>处理中</option>'
-              + '<option value="2"' + (x.status === 2 ? ' selected' : '') + '>已解决</option>'
-              + '<option value="3"' + (x.status === 3 ? ' selected' : '') + '>暂不做</option>'
-              + '</select></td>'
-              + '</tr>';
-          });
-        });
-        body.innerHTML = h;
+          if (x.contact) h += '<div class="fb-extra">联系方式：' + fbEsc(x.contact) + '</div>';
+          if (x.admin_note) h += '<div class="fb-extra">备注：' + fbEsc(x.admin_note) + '</div>';
 
-        // 折叠按钮：整组子行一起显示/收起。
-        Array.prototype.forEach.call(body.querySelectorAll('.fb-fold'), function(btn){
-          btn.addEventListener('click', function(){
-            var g = btn.getAttribute('data-g');
-            var open = btn.getAttribute('data-open') === '1';
-            Array.prototype.forEach.call(
-              body.querySelectorAll('tr.fb-more[data-g="' + g + '"]'),
-              function(tr){ tr.style.display = open ? 'none' : ''; });
-            btn.setAttribute('data-open', open ? '0' : '1');
-            btn.innerHTML = open
-              ? ('共 ' + btn.getAttribute('data-total') + ' 条 &#9662;')
-              : '收起 &#9652;';
-          });
-        });
+          if (atts.length) {
+            h += '<div class="fb-attach">';
+            atts.forEach(function(a){
+              var isImg = (a.mime || '').indexOf('image/') === 0;
+              h += '<a href="' + a.url + '" target="_blank" rel="noopener" title="'
+                + fbEsc(a.name) + '">'
+                + (isImg ? '<img src="' + a.url + '" alt="">' : '&#128196;')
+                + '<span>' + fbEsc(a.name) + ' · ' + fbHumanSize(a.size) + '</span></a>';
+            });
+            h += '</div>';
+          }
 
-        Array.prototype.forEach.call(body.querySelectorAll('.fb-sel'), function(sel){
+          h += '<div class="fbcard-foot">'
+            + '<select class="fb-sel" data-id="' + x.id + '">'
+            + '<option value="0"' + (x.status === 0 ? ' selected' : '') + '>新提交</option>'
+            + '<option value="1"' + (x.status === 1 ? ' selected' : '') + '>处理中</option>'
+            + '<option value="2"' + (x.status === 2 ? ' selected' : '') + '>已解决</option>'
+            + '<option value="3"' + (x.status === 3 ? ' selected' : '') + '>暂不做</option>'
+            + '</select>'
+            + '<button type="button" class="fbold" data-note="' + x.id + '">加备注</button>'
+            + '</div></div>';
+        });
+        box.innerHTML = h;
+
+        Array.prototype.forEach.call(box.querySelectorAll('.fb-sel'), function(sel){
           sel.addEventListener('change', function(){
             var id = sel.getAttribute('data-id');
             var st = parseInt(sel.value, 10);
             var csrfEl = document.querySelector('input[name="csrf"]');
+            var body = new URLSearchParams();
+            body.append('id', id);
+            body.append('status', st);
+            if (csrfEl) body.append('csrf', csrfEl.value);
+            fetch('/api/admin/feedback', {
+              method: 'POST', credentials: 'same-origin',
+              headers: {'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'fetch'},
+              body: body.toString()
+            }).then(function(){ loadFeedback(); }).catch(function(){});
+          });
+        });
+
+        Array.prototype.forEach.call(box.querySelectorAll('.fbold'), function(b){
+          b.addEventListener('click', function(){
+            var id = b.getAttribute('data-note');
+            var txt = window.prompt('备注（例如：已修，下版生效）');
+            if (txt === null) return;
+            var csrfEl = document.querySelector('input[name="csrf"]');
             var body2 = new URLSearchParams();
             body2.append('id', id);
-            body2.append('status', st);
+            body2.append('note', txt);
             if (csrfEl) body2.append('csrf', csrfEl.value);
             fetch('/api/admin/feedback', {
               method: 'POST', credentials: 'same-origin',
@@ -3219,11 +3590,9 @@ LIVE_UI = r'''
       b.addEventListener('click', function(){
         fbFilter = b.getAttribute('data-st');
         Array.prototype.forEach.call(document.querySelectorAll('.fb-filter'), function(x){
-          x.style.borderColor = '';
-          x.style.color = '';
+          x.classList.remove('on');
         });
-        b.style.borderColor = 'var(--accent)';
-        b.style.color = 'var(--accent)';
+        b.classList.add('on');
         loadFeedback();
       });
     });
@@ -3911,6 +4280,132 @@ LIVE_UI = r'''
     body.innerHTML = html;
   }
 
+  // ── 反馈附件：粘贴 / 拖拽 / 选择 ──
+  //
+  // 三个入口共用同一个上传函数：截图党 Ctrl+V、文件党拖进来、剩下的点按钮选。
+  var fbAttach = [];
+  var fbToken = '';
+
+  function fbTokenGet(){
+    if (fbToken) return fbToken;
+    // token 只用来把「先传的附件」和「后提交的反馈」绑在一起。
+    // 随机 16 位够用，不需要不可预测。
+    var a = 'abcdefghjkmnpqrstuvwxyz23456789';
+    var s = '';
+    for (var i = 0; i < 16; i++) s += a[Math.floor(Math.random() * a.length)];
+    fbToken = s;
+    return s;
+  }
+
+  function fbHumanSize(n){
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+
+  function fbRenderAttach(){
+    var box = document.getElementById('fbAttachList');
+    if (!box) return;
+    if (!fbAttach.length) { box.innerHTML = ''; return; }
+    var h = '';
+    fbAttach.forEach(function(a, i){
+      var isImg = (a.mime || '').indexOf('image/') === 0;
+      h += '<div class="att-item">'
+        + (isImg
+            ? '<img class="att-thumb" src="' + a.url + '?t=' + encodeURIComponent(fbTokenGet()) + '" alt="">'
+            : '<div class="att-thumb att-doc">' + (a.name.split('.').pop() || '?').toUpperCase() + '</div>')
+        + '<div class="att-meta"><div class="att-name" title="' + fbEsc(a.name) + '">'
+        + fbEsc(a.name) + '</div><div class="att-size">' + fbHumanSize(a.size) + '</div></div>'
+        + '<button type="button" class="att-del" data-i="' + i + '" title="移除">&times;</button>'
+        + '</div>';
+    });
+    box.innerHTML = h;
+    Array.prototype.forEach.call(box.querySelectorAll('.att-del'), function(b){
+      b.addEventListener('click', function(){
+        fbAttach.splice(parseInt(b.getAttribute('data-i'), 10), 1);
+        fbRenderAttach();
+      });
+    });
+  }
+
+  function fbUpload(file){
+    if (!file) return;
+    if (fbAttach.length >= 6) { alert('最多 6 个附件'); return; }
+    if (file.size > 8 * 1048576) { alert('单个附件上限 8 MB'); return; }
+
+    var box = document.getElementById('fbAttachList');
+    var tip = document.createElement('div');
+    tip.className = 'att-item att-uploading';
+    tip.innerHTML = '<div class="att-thumb att-doc">…</div>'
+      + '<div class="att-meta"><div class="att-name">' + fbEsc(file.name || '粘贴的图片') + '</div>'
+      + '<div class="att-size">上传中…</div></div>';
+    if (box) box.appendChild(tip);
+
+    var fd = new FormData();
+    fd.append('token', fbTokenGet());
+    fd.append('file', file, file.name || ('paste-' + Date.now() + '.png'));
+
+    fetch('/attach/upload', { method: 'POST', body: fd, credentials: 'same-origin' })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d.ok) { alert('上传失败：' + (d.error || '未知')); return; }
+        fbAttach.push(d);
+        fbRenderAttach();
+      })
+      .catch(function(e){ alert('上传失败：' + e.message); })
+      .then(function(){ if (tip.parentNode) tip.parentNode.removeChild(tip); });
+  }
+
+  function fbBindAttach(){
+    var zone = document.getElementById('fbDrop');
+    var input = document.getElementById('fbFile');
+    var form = document.querySelector('.fbform form');
+    if (!zone || !input) return;
+
+    zone.addEventListener('click', function(){ input.click(); });
+    zone.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); }
+    });
+    input.addEventListener('change', function(){
+      Array.prototype.forEach.call(input.files, fbUpload);
+      input.value = '';
+    });
+
+    ['dragenter', 'dragover'].forEach(function(ev){
+      zone.addEventListener(ev, function(e){ e.preventDefault(); zone.classList.add('hot'); });
+    });
+    ['dragleave', 'drop'].forEach(function(ev){
+      zone.addEventListener(ev, function(e){ e.preventDefault(); zone.classList.remove('hot'); });
+    });
+    zone.addEventListener('drop', function(e){
+      var dt = e.dataTransfer;
+      if (!dt) return;
+      Array.prototype.forEach.call(dt.files || [], fbUpload);
+    });
+
+    // 粘贴：只在反馈表单区域里生效，避免干扰用户粘文字
+    if (form) {
+      form.addEventListener('paste', function(e){
+        var items = (e.clipboardData && e.clipboardData.items) || [];
+        var got = false;
+        Array.prototype.forEach.call(items, function(it){
+          if (it.kind === 'file') {
+            var f = it.getAsFile();
+            if (f) { fbUpload(f); got = true; }
+          }
+        });
+        if (got) e.preventDefault();
+      });
+    }
+
+    if (form) {
+      form.addEventListener('submit', function(){
+        var t = document.getElementById('fbAttachToken');
+        if (t) t.value = fbTokenGet();
+      });
+    }
+  }
+
   function bootAll(){
     // 只调「需要手动触发」的那几个。
     // bindIpCells / bindAllNotes 各自在定义处就注册了 DOMContentLoaded，
@@ -3918,11 +4413,15 @@ LIVE_UI = r'''
     // ⚠ 原来这里写的是 bindNotes() —— 那个函数根本不存在（真名 bindAllNotes），
     //   一执行就 ReferenceError，后面所有绑定全跳过：
     //   表现就是「意见反馈」永远停在「加载中…」。
-    bindNetCtl(); bindFeedback(); bindNewCode();
-    // 统计面板：进来先拉一次，之后每 30 秒跟着 tick 一起刷（比实时图慢，
-    // 因为桶本身是 5 分钟粒度，刷太快没有意义）。
-    loadStats();
-    setInterval(loadStats, 30000);
+    bindNetCtl(); bindFeedback(); bindNewCode(); fbBindAttach();
+
+    // 统计和实时图只在「概览 / 设备」页存在。
+    // 其它页也注入了同一份脚本（复用工具函数），但没必要跑轮询 ——
+    // 反馈页每 30 秒打一次 stats 接口纯属浪费。
+    if (document.getElementById('statChart')) {
+      loadStats();
+      setInterval(loadStats, 30000);
+    }
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', bootAll);
@@ -3931,6 +4430,9 @@ LIVE_UI = r'''
   }
 
   function tick(){
+    // 没有实时图的页面（反馈/密钥/事件）不轮询 —— 那些接口每次都要跑
+    // netstat + 采样，白烧 CPU。
+    if (!document.getElementById('perfChart')) return;
     fetch('/api/admin/live', {credentials:'same-origin', cache:'no-store'})
       .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(render)
@@ -3939,177 +4441,53 @@ LIVE_UI = r'''
   }
   tick();
 })();
-</script>
+</script>'''
 
-<!-- 右侧带宽控制台 -->
-<button type="button" class="netctl-handle" id="ncHandle" title="展开带宽控制">◀</button>
-<aside class="netctl" id="netCtl">
-  <div class="netctl-head">
-    <h3>带宽控制</h3>
-    <button type="button" class="netctl-toggle" id="ncCollapse" title="收起">▶</button>
-  </div>
-  <div class="sub2 netctl-fold">
-    改动写入限速配置，中继 5 秒内热生效 —— 不会断开正在传的连接。
-  </div>
 
-  <div class="field">
-    <label>每台机器上限</label>
-    <div class="rowline">
-      <input type="number" id="ncPerIp" min="0" max="1000" step="1" placeholder="10">
-      <span class="unit">MB/s</span>
-    </div>
-  </div>
-  <div class="presets">
-    <button type="button" data-rate="3">3</button>
-    <button type="button" data-rate="5">5</button>
-    <button type="button" data-rate="10">10</button>
-    <button type="button" data-rate="20">20</button>
-    <button type="button" data-rate="0">不限</button>
-  </div>
 
-  <div class="field">
-    <label>全站总上限</label>
-    <div class="rowline">
-      <input type="number" id="ncTotal" min="0" max="10000" step="1" placeholder="0">
-      <span class="unit">MB/s</span>
-    </div>
-  </div>
+ADMIN_SECTIONS = [
+    ('overview', '/admin', '概览', '实时流量、出口载荷与多维统计'),
+    ('keys', '/admin/keys', '密钥', '生成与撤销一次性激活密钥'),
+    ('users', '/admin/users', '设备', '已登录机器、实时速率与备注'),
+    ('feedback', '/admin/feedback', '反馈', '用户提交的问题与建议'),
+    ('events', '/admin/events', '事件', '登录、激活、限流等审计记录'),
+]
 
-  <div class="field">
-    <label>远端出口带宽</label>
-    <div class="rowline">
-      <input type="number" id="ncUplink" min="1" max="100000" step="10" placeholder="1000">
-      <span class="unit">Mbps</span>
-    </div>
-  </div>
 
-  <button type="button" class="apply" id="ncApply">应用</button>
-  <div class="saved" id="ncMsg"></div>
+def admin_nav(active):
+    """管理面板顶部导航。
 
-  <div class="hintbox">
-    <b>三个数字怎么填</b><br>
-    · 每台上限：一个人最多跑多快。填 0 = 不限。<br>
-    · 全站上限：所有人加起来的天花板。校园网出口有限，
-      每人都 10 MB/s 时三个人就能把百兆线吃满。<br>
-    · 出口带宽：只用于算上面的载荷百分比，不参与限速。
-      默认 1000（pcs 是千兆线路）。
-  </div>
-  <div class="hintbox">
-    <b>载荷到多少会卡</b><br>
-    60% 起进入拥挤区（开始有排队的体感），
-    85% 以上基本饱和 —— 这时候谁再多跑一点，所有人都会觉得卡。
-    仪表上那两条竖线就是这两个边界。
-  </div>
-</aside>
+    为什么拆成独立页面而不是一页到底：
+      原来所有区块堆在一页里靠锚点跳，越加越长（密钥 + 反馈 + 设备 +
+      流量 + 事件），滚到一半就不知道自己在哪。独立页面各自有明确的
+      标题、副标题和操作区，加新功能也不会把别人的页面撑长。
+    """
+    items = []
+    for key, href, label, _desc in ADMIN_SECTIONS:
+        cls = ' on' if key == active else ''
+        items.append('<a href="%s" class="anav-item%s">%s</a>' % (href, cls, label))
+    return '<nav class="adminnav">' + ''.join(items) + '</nav>'
 
-<!-- 机器详情弹窗的骨架。放在这里（跟着 LIVE_UI 一起）而不是页面最底部，
-     是为了让「弹窗样式 + 弹窗 JS + 弹窗 DOM」三件东西待在同一个位置，
-     改的时候不用满文件找。 -->
-<div class="modal" id="clientModal" aria-hidden="true">
-  <div class="modal-bg"></div>
-  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="clientTitle">
-    <div class="modal-head">
-      <span class="modal-title" id="clientTitle">—</span>
-      <button type="button" class="modal-close" aria-label="关闭">&times;</button>
-    </div>
-    <div class="modal-body" id="clientBody"></div>
+
+def admin_shell(active, title, subtitle, body):
+    """所有管理页共用的外壳：导航 + 标题区 + 内容。"""
+    desc = ''
+    for key, _h, _l, d in ADMIN_SECTIONS:
+        if key == active:
+            desc = d
+    return page('管理 · ' + title, f"""
+{admin_nav(active)}
+<div class="ahead">
+  <div>
+    <h1>{html.escape(title)}</h1>
+    <div class="asub">{html.escape(subtitle or desc)}</div>
   </div>
 </div>
-'''
+{body}
+""" + ADMIN_JS)
 
 
-def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
-    csrf_in = f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">' if csrf else ''
-    _ld = int(CFG.get('license_days') or 0)
-    license_days_txt = '永久' if _ld <= 0 else (str(_ld) + ' 天')
-    _tier_txt = tier_text
-    inv = db.q('SELECT * FROM invites ORDER BY id DESC LIMIT 40')
-    cli = db.q('SELECT * FROM clients ORDER BY created_at DESC')
-    ev = db.q('SELECT * FROM events ORDER BY id DESC LIMIT 30')
-
-    if new_code:
-        codebox = f"""
-<div class="msg ok">
-  <div style="font-size:13px;margin-bottom:6px">新密钥（{new_hours} 小时有效，只能用一次）</div>
-  <div class="big mono">{html.escape(new_code)}</div>
-  <div style="font-size:12px;margin-top:6px">复制发给对方，服务端只存哈希，关掉本页就再也看不到明文。</div>
-</div>"""
-    else:
-        codebox = ''
-
-    msgbox = ''
-    if msg:
-        msgbox = f'<div class="msg ok">{html.escape(msg)}</div>'
-    if err:
-        msgbox = f'<div class="msg err">{html.escape(err)}</div>'
-
-    inv_rows = ''.join(f"""<tr>
-  <td class="mono">{html.escape(r['code_hint'])}</td>
-  <td>{html.escape(r['note']) or '<span class="muted">—</span>'}</td>
-  <td class="mono">{_tier_txt(r['license_days'])}</td>
-  <td>{'<span class="bad">已撤销</span>' if r['revoked'] else
-       ('<span class="muted">已使用</span>' if r['used_by_ip'] else
-        ('<span class="bad">已过期</span>' if r['expires_at'] < now() else
-         f'<span class="ok">未使用 · 剩 {fmt_left(r["expires_at"])}</span>'))}</td>
-  <td class="muted">{html.escape(r['used_by_ip']) or '—'}</td>
-  <td class="muted">{fmt_ts(r['created_at'])}</td>
-  <td>{'' if r['revoked'] else f'<form method="post" action="/admin/revoke" style="display:inline">{csrf_in}<input type="hidden" name="id" value="{r["id"]}"><button class="sm ghost" type="submit">撤销</button></form>'}</td>
-</tr>""" for r in inv)
-
-    # 行里带 data-ip / data-rank，前端按 rank 重排 DOM（不重建行，保住 CSRF）
-    #
-    # 备注列做成「点笔才编辑」：
-    #   非编辑态只显示文字 + 一个小笔图标（避免一整列输入框把表格撑得很吵）。
-    #   笔是内联 SVG 而不是 emoji —— ✏️ 这类字符在多数系统上会被渲染成
-    #   彩色 emoji，跟深色主题打架；SVG 用 currentColor，永远跟着文字颜色走。
-    cli_rows = ''.join(f"""<tr data-ip="{html.escape(r['ip'])}" data-rank="{1000000 - i}">
-  <td class="st"><span class="dot off"></span><span class="stx">离线</span></td>
-  <td class="mono ipcell off" data-ip="{html.escape(r['ip'])}" title="点击查看详情">{html.escape(r['ip'])}</td>
-  <td class="notecell" data-ip="{html.escape(r['ip'])}" data-note="{html.escape(r['note'] or '')}">
-    <span class="notetxt{' empty' if not r['note'] else ''}">{html.escape(r['note'] or '点击编辑')}</span>
-    <button type="button" class="notebtn" title="编辑备注" aria-label="编辑备注">
-      <svg viewBox="0 0 16 16" width="12" height="12" fill="none"
-           stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
-           stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13H3v-2z"/></svg>
-    </button>
-    <input type="text" class="notein" maxlength="60" value="{html.escape(r['note'] or '')}"
-           style="display:none" placeholder="备注">
-  </td>
-  <td class="num rx"><span class="arw down">&#8595;</span>—</td>
-  <td class="num tx"><span class="arw up">&#8593;</span>—</td>
-  <td class="num cs">—</td>
-  <td class="modecell">—</td>
-  <td>{'<span class="ok">启用</span>' if r['enabled'] else '<span class="bad">停用</span>'}</td>
-  <td class="muted">{fmt_ts(r['last_seen']) or '从未'}</td>
-  <td class="nowrap">
-    <form method="post" action="/admin/toggle" style="display:inline">{csrf_in}<input type="hidden" name="ip" value="{html.escape(r['ip'])}"><button class="sm ghost" type="submit">{'停用' if r['enabled'] else '启用'}</button></form>
-  </td>
-</tr>""" for i, r in enumerate(cli))
-
-    ev_rows = ''.join(
-        f'<tr><td class="muted">{fmt_ts(r["ts"])}</td><td>{html.escape(r["kind"])}</td>'
-        f'<td class="mono">{html.escape(r["ip"])}</td>'
-        f'<td class="muted">{html.escape(r["detail"])}</td></tr>' for r in ev)
-
-    return page('渡口门户管理', f"""
-<h1>管理面板</h1>
-
-<!-- 分区导航。五个区块都是长表格，没有它就得靠滚轮翻半天才能找到
-     「意见反馈」；sticky 在顶部，滚到哪儿都能跳。 -->
-<nav class="adminnav">
-  <a href="#sec-live">概览</a>
-  <a href="#sec-keys">密钥</a>
-  <a href="#sec-stats">统计</a>
-  <a href="#sec-feedback">反馈</a>
-  <a href="#sec-users">设备</a>
-  <a href="#sec-events">事件</a>
-</nav>
-
-{LIVE_UI}
-<div class="sub">创建临时密钥 · 管理已登录的机器 ·
-  <a href="/admin/unlock">查看 / 解除登录锁定</a></div>
-{msgbox}{codebox}
-
+CODE_MODAL = """
 <!-- 密钥浮窗。
      为什么用浮窗而不是「重新渲染一整页」：
        老做法是 POST 后直接渲染面板，地址栏停在 /admin/newcode，
@@ -4141,11 +4519,47 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
     </div>
   </div>
 </div>
+"""
 
-<div class="card" id="sec-keys">
+
+def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf='',
+               section='overview'):
+    """管理面板。section 决定渲染哪一块。"""
+    csrf_in = f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">' if csrf else ''
+    _ld = int(CFG.get('license_days') or 0)
+    license_days_txt = '永久' if _ld <= 0 else (str(_ld) + ' 天')
+    _tier_txt = tier_text
+
+    msgbox = ''
+    if msg:
+        msgbox = f'<div class="msg ok">{html.escape(msg)}</div>'
+    if err:
+        msgbox = f'<div class="msg err">{html.escape(err)}</div>'
+
+    # ══════════ 概览 ══════════
+    if section == 'overview':
+        return admin_shell('overview', '概览',
+            '实时流量、出口载荷与多维统计',
+            msgbox + ADMIN_UI_HTML)
+
+    # ══════════ 密钥 ══════════
+    if section == 'keys':
+        inv = db.q('SELECT * FROM invites ORDER BY id DESC LIMIT 40')
+        inv_rows = ''.join(f"""<tr>
+  <td class="mono">{html.escape(r['code_hint'])}</td>
+  <td>{html.escape(r['note']) or '<span class="muted">—</span>'}</td>
+  <td class="mono">{_tier_txt(r['license_days'])}</td>
+  <td>{'<span class="bad">已撤销</span>' if r['revoked'] else
+       ('<span class="muted">已使用</span>' if r['used_by_ip'] else
+        ('<span class="bad">已过期</span>' if r['expires_at'] < now() else
+         f'<span class="ok">未使用 · 剩 {fmt_left(r["expires_at"])}</span>'))}</td>
+  <td class="muted">{html.escape(r['used_by_ip']) or '—'}</td>
+  <td class="muted">{fmt_ts(r['created_at'])}</td>
+  <td>{'' if r['revoked'] else f'<form method="post" action="/admin/revoke" style="display:inline">{csrf_in}<input type="hidden" name="id" value="{r["id"]}"><button class="sm ghost" type="submit">撤销</button></form>'}</td>
+</tr>""" for r in inv)
+        body = msgbox + f"""
+<div class="card">
   <h2 style="margin-top:0">创建临时密钥</h2>
-  <details class="newcode">
-  <summary>＋ 新建密钥</summary>
   <form method="post" action="/admin/newcode" id="ncForm">
     {csrf_in}
     <div class="row">
@@ -4177,51 +4591,51 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
     </div>
     <button type="submit" id="ncBtn">生成密钥</button>
   </form>
-  </details>
 </div>
 
 <div class="card">
   <h2 style="margin-top:0">临时密钥（最近 40 条）</h2>
-  <div class="listwrap sm">
+  <div class="listwrap">
   <table><thead><tr><th>密钥前缀</th><th>备注</th><th>可用时长</th><th>状态</th><th>使用方</th><th>创建</th><th></th></tr></thead>
   <tbody>{inv_rows or '<tr><td colspan="7" class="muted">还没有密钥</td></tr>'}</tbody></table>
   </div>
-</div>
+</div>""" + CODE_MODAL
+        return admin_shell('keys', '密钥', '生成、查看、撤销一次性激活密钥', body)
 
-<div class="card" id="sec-feedback">
-  <h2 style="margin-top:0">意见反馈
-    <span class="hint" id="fbNew" style="font-weight:400;margin-left:8px"></span>
-  </h2>
-  <div class="hint" style="margin:-4px 0 10px">
-    来自网页 <code>/feedback</code> 和客户端「设置 → 意见反馈」。
-    按 IP 定位，所以用户不用登录也能反馈。
-  </div>
-  <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px" id="fbFilters">
-    <button type="button" class="sm ghost fb-filter" data-st="all">全部</button>
-    <button type="button" class="sm ghost fb-filter" data-st="0">新提交</button>
-    <button type="button" class="sm ghost fb-filter" data-st="1">处理中</button>
-    <button type="button" class="sm ghost fb-filter" data-st="2">已解决</button>
-    <button type="button" class="sm ghost fb-filter" data-st="3">暂不做</button>
-  </div>
-  <div class="listwrap" style="max-height:460px;overflow-y:auto">
-    <table>
-      <thead><tr>
-        <th>状态</th><th>类型</th><th>内容</th><th>来源</th><th>时间</th><th>操作</th>
-      </tr></thead>
-      <tbody id="fbBody">
-        <tr><td colspan="6" class="muted">加载中…</td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<div class="card" id="sec-users">
+    # ══════════ 设备 ══════════
+    if section == 'users':
+        cli = db.q('SELECT * FROM clients ORDER BY created_at DESC')
+        cli_rows = ''.join(f"""<tr data-ip="{html.escape(r['ip'])}" data-rank="{1000000 - i}">
+  <td class="st"><span class="dot off"></span><span class="stx">离线</span></td>
+  <td class="mono ipcell off" data-ip="{html.escape(r['ip'])}" title="点击查看详情">{html.escape(r['ip'])}</td>
+  <td class="notecell" data-ip="{html.escape(r['ip'])}" data-note="{html.escape(r['note'] or '')}">
+    <span class="notetxt{' empty' if not r['note'] else ''}">{html.escape(r['note'] or '点击编辑')}</span>
+    <button type="button" class="notebtn" title="编辑备注" aria-label="编辑备注">
+      <svg viewBox="0 0 16 16" width="12" height="12" fill="none"
+           stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+           stroke-linejoin="round"><path d="M11.5 2.5l2 2L5 13H3v-2z"/></svg>
+    </button>
+    <input type="text" class="notein" maxlength="60" value="{html.escape(r['note'] or '')}"
+           style="display:none" placeholder="备注">
+  </td>
+  <td class="num rx"><span class="arw down">&#8595;</span>—</td>
+  <td class="num tx"><span class="arw up">&#8593;</span>—</td>
+  <td class="num cs">—</td>
+  <td class="modecell">—</td>
+  <td>{'<span class="ok">启用</span>' if r['enabled'] else '<span class="bad">停用</span>'}</td>
+  <td class="muted">{fmt_ts(r['last_seen']) or '从未'}</td>
+  <td class="nowrap">
+    <form method="post" action="/admin/toggle" style="display:inline">{csrf_in}<input type="hidden" name="ip" value="{html.escape(r['ip'])}"><button class="sm ghost" type="submit">{'停用' if r['enabled'] else '启用'}</button></form>
+  </td>
+</tr>""" for i, r in enumerate(cli))
+        body = msgbox + f"""
+<div class="card">
   <h2 style="margin-top:0">已登录的机器</h2>
   <div class="hint" style="margin:-4px 0 10px">
     在线置顶，离线靠下。速率来自客户端每 5 秒一次的心跳；
     老版本客户端不上报心跳，速率列显示「—」，但在线状态仍准确。
   </div>
-  <div class="listwrap">
+  <div class="listwrap" style="max-height:640px">
   <table id="userTable">
     <thead><tr>
       <th>状态</th><th>局域网 IP</th><th>备注</th>
@@ -4235,34 +4649,62 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf=''):
   </table>
   </div>
 </div>
+""" + ADMIN_UI_HTML
+        return admin_shell('users', '设备', '已登录机器、实时速率与备注', body)
 
-<div class="card" id="sec-traffic">
-  <h2 style="margin-top:0">流量统计</h2>
-  <div class="listwrap sm">
-  <table>
-    <thead><tr>
-      <th>时段</th>
-      <th class="numh"><span class="arw down">&#8595;</span>平均下行</th>
-      <th class="numh"><span class="arw up">&#8593;</span>平均上行</th>
-      <th class="numh"><span class="arw down">&#8595;</span>下行流量</th>
-      <th class="numh"><span class="arw up">&#8593;</span>上行流量</th>
-    </tr></thead>
-    <tbody id="hourlyBody"><tr><td colspan="5" class="muted">等客户端上报心跳后出现</td></tr></tbody>
-  </table>
+    # ══════════ 事件 ══════════
+    if section == 'events':
+        ev = db.q('SELECT * FROM events ORDER BY id DESC LIMIT 200')
+        ev_rows = ''.join(
+            f'<tr><td class="muted nowrap">{fmt_ts(r["ts"])}</td>'
+            f'<td class="nowrap"><span class="evtag">{html.escape(r["kind"])}</span></td>'
+            f'<td class="mono">{html.escape(r["ip"])}</td>'
+            f'<td class="muted">{html.escape(r["detail"])}</td></tr>' for r in ev)
+        body = msgbox + f"""
+<div class="card">
+  <h2 style="margin-top:0">最近事件（200 条）</h2>
+  <div class="hint" style="margin:-4px 0 12px">
+    登录、激活、密钥生成、限流、下载等操作的审计记录。
   </div>
-  <div class="hint" id="hourlySum" style="margin-top:10px">
-    速率来自客户端每 5 秒一次的心跳；流量是两次心跳之间的增量累加。
-  </div>
-</div>
-
-<div class="card" id="sec-events">
-  <h2 style="margin-top:0">最近事件</h2>
-  <div class="listwrap sm">
+  <div class="listwrap" style="max-height:700px">
   <table><thead><tr><th>时间</th><th>类型</th><th>IP</th><th>说明</th></tr></thead>
   <tbody>{ev_rows or '<tr><td colspan="4" class="muted">无</td></tr>'}</tbody></table>
   </div>
-</div>""")
+</div>"""
+        return admin_shell('events', '事件', '审计日志', body)
 
+    # ══════════ 反馈（独立页）══════════
+    return admin_feedback_page(db, csrf, msgbox)
+
+
+def admin_feedback_page(db, csrf, msgbox=''):
+    """意见反馈独立页。
+
+    原来它只是概览页里的一张卡，夹在密钥和机器列表中间 ——
+    有附件之后表格会变得很高，必须给它一页。
+    """
+    body = msgbox + f"""
+<div class="fbtoolbar">
+  <div class="fbfilters" id="fbFilters">
+    <button type="button" class="sm ghost fb-filter on" data-st="all">全部</button>
+    <button type="button" class="sm ghost fb-filter" data-st="0">新提交</button>
+    <button type="button" class="sm ghost fb-filter" data-st="1">处理中</button>
+    <button type="button" class="sm ghost fb-filter" data-st="2">已解决</button>
+    <button type="button" class="sm ghost fb-filter" data-st="3">暂不做</button>
+  </div>
+  <div class="fbcount" id="fbNew"></div>
+</div>
+
+<div class="hint" style="margin:-4px 0 14px">
+  来自网页 <code>/feedback</code> 和客户端「设置 → 意见反馈」。按 IP 定位，
+  所以用户不用登录也能反馈。带附件的条目会显示缩略图，点开可看原图。
+</div>
+
+<input type="hidden" name="csrf" value="{html.escape(csrf)}">
+<div id="fbCards" class="fbcards">
+  <div class="fbskel">加载中…</div>
+</div>"""
+    return admin_shell('feedback', '意见反馈', '用户提交的问题与建议', body)
 
 def admin_login_page(err='', csrf=''):
     errbox = f'<div class="msg err">{html.escape(err)}</div>' if err else ''
@@ -5216,6 +5658,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_download(path)
             elif path == '/logout':
                 self.handle_logout()
+            elif path.startswith('/attach/'):
+                self.handle_attach_get(path)
             elif path == '/api/admin/stats':
                 self.handle_api_admin_stats()
             elif path == '/api/admin/live':
@@ -5228,7 +5672,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_api_admin_client(
                     urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
             elif path == '/admin':
-                self.handle_admin()
+                self.handle_admin('overview')
+            elif path == '/admin/keys':
+                self.handle_admin('keys')
+            elif path == '/admin/users':
+                self.handle_admin('users')
+            elif path == '/admin/feedback':
+                self.handle_admin('feedback')
+            elif path == '/admin/events':
+                self.handle_admin('events')
             elif path == '/proxy.mjs':
                 self.handle_proxy_mjs()
             elif path == '/api/status':
@@ -5304,6 +5756,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             # 软件内激活：JSON 接口，不是浏览器表单，没有 CSRF token 可言。
             # 防爆破靠 rate_fail（和网页登录共用 user scope）。
+            # 附件上传：multipart，CSRF 走表单里的 token 字段而不是 csrf ——
+            # 这个接口既给网页反馈页用（未登录），也给客户端用（没有 cookie）。
+            if path == '/attach/upload':
+                self.handle_attach_upload()
+                return
+
             if path == '/api/activate':
                 self.handle_api_activate()
                 return
@@ -6208,7 +6666,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.send_json(sample_live(self.db))
 
-    def handle_admin(self):
+    def handle_admin(self, section='overview'):
         if not self.is_admin():
             self.send_html(admin_login_page(csrf=csrf_set('adminlogin|' + self.client_ip())))
             return
@@ -6223,7 +6681,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             nhours = 12
         self.send_html(admin_page(self.db, new_code=(ncode or None), new_hours=nhours,
-                                  csrf=csrf_set('admin|' + self.client_ip())))
+                                  csrf=csrf_set('admin|' + self.client_ip()),
+                                  section=section))
 
     def handle_admin_login(self, form):
         src_ip = self.client_ip()
@@ -6306,6 +6765,167 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.db.log('invite_revoke', self.client_ip(), f'id={iid}')
         self.send_html(admin_page(self.db, msg='已撤销', csrf=csrf_set('admin|' + self.client_ip())))
 
+    def handle_attach_upload(self):
+        """接收一个附件（multipart/form-data）。
+
+        为什么用 multipart 而不是 base64 塞进 JSON：
+          8 MB 的截图 base64 之后变 11 MB，前端要整个读进内存再编码，
+          移动端会直接卡死。multipart 是浏览器原生能力，`fetch(formData)` 就行。
+
+        安全边界（都是刻意加的）：
+          · 白名单 MIME —— 不接受 exe / html / svg（svg 能带脚本）
+          · 单文件 8 MB、一条反馈最多 6 个
+          · 存盘用随机文件名，原名只入库（防路径穿越）
+          · 下载接口要登录（管理员）或带正确 upload_token
+        """
+        ip = self.client_ip()
+        ctype = self.headers.get('Content-Type') or ''
+        if 'multipart/form-data' not in ctype.lower():
+            self.send_json({'ok': False, 'error': '需要 multipart/form-data'}, 400)
+            return
+
+        n = int(self.headers.get('Content-Length') or 0)
+        if n <= 0:
+            self.send_json({'ok': False, 'error': '空请求'}, 400)
+            return
+        if n > ATTACH_MAX_BYTES + 65536:
+            self.send_json({'ok': False,
+                            'error': '文件太大（上限 %d MB）' % (ATTACH_MAX_BYTES // 1048576)}, 413)
+            return
+
+        raw = self.rfile.read(n)
+        m = re.search(r'boundary="?([^";]+)"?', ctype)
+        if not m:
+            self.send_json({'ok': False, 'error': '缺少 boundary'}, 400)
+            return
+        boundary = m.group(1).encode()
+
+        # 极简 multipart 解析：只取 file 段和 token 字段。
+        # 不引第三方库（门户要能在裸 Python 上跑）。
+        parts = raw.split(b'--' + boundary)
+        filename = ''
+        mime = ''
+        blob = b''
+        token = ''
+        for part in parts:
+            if not part.strip(b'-\r\n'):
+                continue
+            head, sep, body = part.partition(b'\r\n\r\n')
+            if not sep:
+                continue
+            hl = head.decode('utf-8', 'replace').lower()
+            body = body.rstrip(b'\r\n')
+            if 'name="token"' in hl:
+                token = body.decode('utf-8', 'replace').strip()[:64]
+            elif 'filename="' in hl:
+                fn = re.search(r'filename="([^"]*)"', head.decode('utf-8', 'replace'))
+                filename = (fn.group(1) if fn else '')[:120]
+                ct = re.search(r'content-type:\s*([^\r\n;]+)', hl)
+                mime = (ct.group(1).strip() if ct else '')
+                blob = body
+
+        if not blob:
+            self.send_json({'ok': False, 'error': '没有收到文件内容'}, 400)
+            return
+        if len(blob) > ATTACH_MAX_BYTES:
+            self.send_json({'ok': False,
+                            'error': '文件太大（上限 %d MB）' % (ATTACH_MAX_BYTES // 1048576)}, 413)
+            return
+
+        # MIME 缺失时按扩展名兜底（有些客户端不上报 Content-Type）
+        if not mime:
+            low = filename.lower()
+            for k, ext in ATTACH_ALLOWED.items():
+                if low.endswith(ext):
+                    mime = k
+                    break
+        ext = ATTACH_ALLOWED.get(mime)
+        if not ext:
+            self.send_json({'ok': False,
+                            'error': '不支持的文件类型：' + (mime or '未知')}, 415)
+            return
+
+        # 这条 token 已绑了 6 个就拒绝
+        if token:
+            cnt = self.db.q1('SELECT COUNT(*) AS n FROM feedback_attach '
+                             'WHERE upload_token = ? AND feedback_id = 0', (token,))
+            if cnt and int(cnt['n'] or 0) >= ATTACH_MAX_COUNT:
+                self.send_json({'ok': False,
+                                'error': '最多 %d 个附件' % ATTACH_MAX_COUNT}, 400)
+                return
+
+        # 存盘：随机名 + 白名单扩展名。原名只入库。
+        stored = secrets.token_hex(16) + ext
+        try:
+            with open(os.path.join(attach_dir(), stored), 'wb') as f:
+                f.write(blob)
+        except Exception as e:
+            self.send_json({'ok': False, 'error': '保存失败：' + str(e)}, 500)
+            return
+
+        cur = self.db.x(
+            'INSERT INTO feedback_attach (feedback_id, upload_token, name, mime, size, '
+            'stored, created_at) VALUES (0,?,?,?,?,?,?)',
+            (token, filename or ('附件' + ext), mime, len(blob), stored, now()))
+        aid = getattr(cur, 'lastrowid', 0) or 0
+        if not aid:
+            r = self.db.q1('SELECT MAX(id) AS m FROM feedback_attach')
+            aid = int((r['m'] if r else 0) or 0)
+        self.db.log('attach_up', ip, '%s %dB' % (mime, len(blob)))
+        self.send_json({'ok': True, 'id': aid, 'name': filename or ('附件' + ext),
+                        'size': len(blob), 'mime': mime, 'url': attach_url(aid)})
+
+    def handle_attach_get(self, path):
+        """下载 / 预览附件。
+
+        权限：管理员直接放行；否则必须带 ?t=<upload_token>。
+        """
+        try:
+            aid = int(path[len('/attach/'):].split('/')[0])
+        except ValueError:
+            self.send_html(page('无效', '<h1>附件不存在</h1>'), 404)
+            return
+
+        row = self.db.q1('SELECT * FROM feedback_attach WHERE id = ?', (aid,))
+        if not row:
+            self.send_html(page('无效', '<h1>附件不存在</h1>'), 404)
+            return
+
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        tok = (q.get('t') or [''])[0]
+        if not self.is_admin():
+            if not tok or tok != (row['upload_token'] or ''):
+                self.send_html(page('拒绝', '<h1>无权查看这个附件</h1>'), 403)
+                return
+
+        fp = os.path.join(attach_dir(), row['stored'] or '')
+        if not row['stored'] or not os.path.isfile(fp):
+            self.send_html(page('丢失', '<h1>附件文件已丢失</h1>'), 404)
+            return
+
+        try:
+            with open(fp, 'rb') as f:
+                data = f.read()
+        except Exception:
+            self.send_html(page('读取失败', '<h1>附件读取失败</h1>'), 500)
+            return
+
+        inline = (row['mime'] or '').startswith('image/')
+        disp = 'inline' if inline else 'attachment'
+        self.send_response(200)
+        self.send_header('Content-Type', row['mime'] or 'application/octet-stream')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Content-Disposition',
+                         '%s; filename="%s"' % (disp, urllib.parse.quote(row['name'] or 'file')))
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Cache-Control', 'private, max-age=300')
+        self._sec_headers()
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except Exception:
+            pass
+
     def handle_feedback_post(self, form):
         """提交意见反馈。
 
@@ -6363,6 +6983,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         with _fb_lock:
             _fb_last[ip] = now_ts
+
+        # 绑定附件：把这条 token 名下还没归属的附件挂到刚插入的反馈上。
+        tok = (form.get('attach_token') or '').strip()[:64]
+        if tok:
+            try:
+                row = self.db.q1('SELECT MAX(id) AS m FROM feedback')
+                fid = int((row['m'] if row else 0) or 0)
+                if fid:
+                    self.db.x('UPDATE feedback_attach SET feedback_id = ? '
+                              'WHERE upload_token = ? AND feedback_id = 0', (fid, tok))
+            except Exception as e:
+                sys.stderr.write('[feedback] 绑定附件失败: %s\n' % e)
 
         self.send_html(feedback_page(
             ip, msg='收到了，谢谢反馈。管理员能看到并在这里跟进处理状态。'))
@@ -6426,11 +7058,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for r in rows:
             st = int(r['status'] or 0)
             counts[st] = counts.get(st, 0) + 1
+        items = []
+        for r in rows:
+            d = dict(r)
+            d['attachments'] = attach_list(self.db, r['id'])
+            items.append(d)
+
         self.send_json({
             'ok': True,
             'total': len(rows),
             'counts': counts,
-            'list': [dict(r) for r in rows],
+            'list': items,
         })
 
     def handle_admin_setnote(self, form):

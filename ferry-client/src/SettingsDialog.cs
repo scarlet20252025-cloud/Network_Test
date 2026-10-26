@@ -442,7 +442,7 @@ namespace Ferry
             using (var f = new Form())
             {
                 f.Text = "意见反馈";
-                f.ClientSize = new Size(460, 430);
+                f.ClientSize = new Size(460, 536);
                 f.StartPosition = FormStartPosition.CenterParent;
                 f.FormBorderStyle = FormBorderStyle.FixedDialog;
                 f.MaximizeBox = false;
@@ -500,15 +500,48 @@ namespace Ferry
                 txt.SetBounds(20, 220, 420, 120);
                 f.Controls.Add(txt);
 
+                // ── 附件区 ──
+                // 客户端也要能带图：很多问题（界面错位、报错弹窗）一句话说不清。
+                var l4 = new Label();
+                l4.Text = "截图或文件（选填，可多选）";
+                l4.SetBounds(20, 348, 420, 18);
+                l4.ForeColor = Theme.Muted;
+                l4.Font = Theme.FSmall;
+                f.Controls.Add(l4);
+
+                var btnFile = new Button();
+                btnFile.Text = "选择文件…";
+                btnFile.SetBounds(20, 370, 120, 30);
+                btnFile.FlatStyle = FlatStyle.Flat;
+                btnFile.FlatAppearance.BorderColor = Theme.Line;
+                btnFile.FlatAppearance.BorderSize = 1;
+                btnFile.BackColor = Theme.CardBg;
+                btnFile.ForeColor = Theme.Text;
+                btnFile.Font = Theme.FSmall;
+                btnFile.Cursor = Cursors.Hand;
+                f.Controls.Add(btnFile);
+
+                var lblFiles = new Label();
+                lblFiles.Text = "未选择";
+                lblFiles.SetBounds(150, 374, 290, 22);
+                lblFiles.ForeColor = Theme.Muted;
+                lblFiles.Font = Theme.FSmall;
+                lblFiles.AutoEllipsis = true;
+                f.Controls.Add(lblFiles);
+
+                // 已选文件 + 上传后拿到的 id（提交反馈时一起带上去绑定）
+                var picked = new System.Collections.Generic.List<string>();
+                var uploaded = new System.Collections.Generic.List<string>();
+
                 var msg = new Label();
-                msg.SetBounds(20, 348, 420, 20);
+                msg.SetBounds(20, 412, 420, 20);
                 msg.ForeColor = Theme.Muted;
                 msg.Font = Theme.FSmall;
                 f.Controls.Add(msg);
 
                 var btnSend = new Button();
                 btnSend.Text = "提交反馈";
-                btnSend.SetBounds(20, 376, 200, 36);
+                btnSend.SetBounds(20, 440, 200, 36);
                 btnSend.FlatStyle = FlatStyle.Flat;
                 btnSend.FlatAppearance.BorderSize = 0;
                 btnSend.BackColor = Theme.Accent;
@@ -517,9 +550,42 @@ namespace Ferry
                 btnSend.Cursor = Cursors.Hand;
                 f.Controls.Add(btnSend);
 
+                btnFile.Click += delegate
+                {
+                    using (var ofd = new OpenFileDialog())
+                    {
+                        ofd.Multiselect = true;
+                        ofd.Title = "选择要附上的截图或文件";
+                        ofd.Filter = "图片或文档|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.txt;*.log;*.json;*.zip;*.csv";
+                        if (ofd.ShowDialog(f) != DialogResult.OK) return;
+
+                        foreach (var path in ofd.FileNames)
+                        {
+                            if (picked.Count >= 6)
+                            {
+                                MessageBox.Show(f, "最多 6 个附件。", "渡口");
+                                break;
+                            }
+                            try
+                            {
+                                var fi = new FileInfo(path);
+                                if (fi.Length > 8 * 1024 * 1024)
+                                {
+                                    MessageBox.Show(f, Path.GetFileName(path) + " 超过 8 MB，跳过。", "渡口");
+                                    continue;
+                                }
+                            }
+                            catch (Exception) { continue; }
+                            picked.Add(path);
+                        }
+                        lblFiles.Text = picked.Count == 0 ? "未选择"
+                            : string.Join("、", picked.ConvertAll(Path.GetFileName).ToArray());
+                    }
+                };
+
                 var btnCancel = new Button();
                 btnCancel.Text = "取消";
-                btnCancel.SetBounds(240, 376, 200, 36);
+                btnCancel.SetBounds(240, 440, 200, 36);
                 btnCancel.FlatStyle = FlatStyle.Flat;
                 btnCancel.FlatAppearance.BorderColor = Theme.Line;
                 btnCancel.FlatAppearance.BorderSize = 1;
@@ -560,7 +626,23 @@ namespace Ferry
                     ThreadPool.QueueUserWorkItem(delegate
                     {
                         string err = "";
-                        try { err = Api.Feedback(_cfg, kind, body, contact); }
+                        try
+                        {
+                            // 先逐个上传附件，拿到 id 列表，再带着它们提交反馈。
+                            // 上传失败不阻断提交 —— 反馈正文本身比附件重要。
+                            var ids = new System.Collections.Generic.List<string>();
+                            foreach (var path in picked)
+                            {
+                                try
+                                {
+                                    var up = Api.UploadAttachment(_cfg, path);
+                                    if (up.Length > 0) ids.Add(up);
+                                }
+                                catch (Exception) { }
+                            }
+                            err = Api.Feedback(_cfg, kind, body, contact,
+                                               string.Join(",", ids.ToArray()));
+                        }
                         catch (Exception ex) { err = "提交失败：" + ex.Message; }
 
                         try
