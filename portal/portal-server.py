@@ -6147,6 +6147,34 @@ def main():
                 # 事件表只留最近 2000 条，防止无限增长
                 db.x('DELETE FROM events WHERE id NOT IN '
                      '(SELECT id FROM events ORDER BY id DESC LIMIT 2000)')
+                # 每天备份一份数据库，只留最近 7 天。
+                #
+                # 为什么在这里做：portal.db 里是全部账号的 token、授权到期时间、
+                # 密钥状态 —— 丢了就得挨个重新激活。用 sqlite 的 backup API
+                # （不是复制文件）才不会拿到写了一半的库。
+                try:
+                    _bak_dir = os.path.join(os.path.dirname(os.path.abspath(CFG['db'])), 'backup')
+                    _today = time.strftime('%Y%m%d')
+                    _dst = os.path.join(_bak_dir, 'portal-' + _today + '.db')
+                    if not os.path.exists(_dst):
+                        if not os.path.isdir(_bak_dir):
+                            os.makedirs(_bak_dir)
+                        _src = sqlite3.connect(CFG['db'])
+                        _out = sqlite3.connect(_dst)
+                        with _out:
+                            _src.backup(_out)
+                        _out.close()
+                        _src.close()
+                        # 只留 7 份
+                        _all = sorted(f for f in os.listdir(_bak_dir) if f.startswith('portal-'))
+                        for _old in _all[:-7]:
+                            try:
+                                os.remove(os.path.join(_bak_dir, _old))
+                            except Exception:
+                                pass
+                except Exception as e:
+                    sys.stderr.write('[janitor] 备份失败: %s\n' % e)
+
                 # 反馈里可能带联系方式（微信/QQ），没道理永久留着。
                 # 只保留最近 500 条 —— 个人工具的量级，够回溯很久了。
                 db.x('DELETE FROM feedback WHERE id NOT IN '
