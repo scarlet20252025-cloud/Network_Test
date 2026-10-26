@@ -123,7 +123,7 @@ namespace Ferry
             // 高度 200：四行明细最后一行在 y=180，行高 18，到 198，留 2px 余量。
             // 踩过的坑：加第四行（TUN）时忘了同步加高卡片，那一行被底边裁掉一半 ——
             // 界面看着像坏了，其实数据都对。
-            _card.SetBounds(20, 80, 480, 200);
+            _card.SetBounds(20, 80, 480, 212);
             Controls.Add(_card);
 
             _lblBig = Theme.Text2("检查中", Theme.FBig, Theme.Muted);
@@ -141,28 +141,28 @@ namespace Ferry
             // 「隧道」那行去掉了：现在只有一种模式（直连出口机的 SOCKS），
             // SSH 隧道的界面入口和显示都已移除，见 Config.cs 的说明。
 
-            _rowBridge = Row(_card, 136);
-            _rowProxy = Row(_card, 156);
+            _rowBridge = Row(_card, 128);
+            _rowProxy = Row(_card, 152);
             // 第四行：TUN 状态。默认隐藏（只在设置里勾了全局接管时才显示），
             // 避免普通用户看到一行「未开启」以为是故障。
-            _rowTun = Row(_card, 180);
-            _rowTun.SetBounds(24, 176, 352, 18);
+            _rowTun = Row(_card, 176);
+            _rowTun.SetBounds(24, 176, 352, 20);
             _rowTun.Visible = true;
 
             // 全局模式的开关摆在「全局模式」这一行右边 —— 状态和动作在同一处。
             _btnGlobal = Theme.FlatButton("开启", false);
-            _btnGlobal.SetBounds(390, 176, 70, 24);
+            _btnGlobal.SetBounds(390, 174, 70, 26);
             _btnGlobal.Font = Theme.FSmall;
             _btnGlobal.Click += delegate { OnGlobalClicked(); };
             _card.Controls.Add(_btnGlobal);
 
             // ── 激活卡：输入框直接放在主界面，不弹窗 ──
             _actCard = Theme.Card(14);
-            _actCard.SetBounds(20, 288, 480, 86);
+            _actCard.SetBounds(20, 298, 480, 84);
             Controls.Add(_actCard);
 
             _lblActTitle = Theme.Text2("输入密钥激活", Theme.FBody, Theme.Text);
-            _lblActTitle.SetBounds(20, 8, 300, 22);
+            _lblActTitle.SetBounds(20, 6, 300, 22);
             _actCard.Controls.Add(_lblActTitle);
 
             _txtCode = new TextBox();
@@ -170,7 +170,7 @@ namespace Ferry
             _txtCode.CharacterCasing = CharacterCasing.Upper;
             _txtCode.MaxLength = 16;
             _txtCode.TextAlign = HorizontalAlignment.Center;
-            _txtCode.SetBounds(20, 32, 300, 28);
+            _txtCode.SetBounds(20, 30, 300, 28);
             _txtCode.KeyDown += delegate (object s, KeyEventArgs e)
             {
                 if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; DoInlineActivate(); }
@@ -178,13 +178,13 @@ namespace Ferry
             _actCard.Controls.Add(_txtCode);
 
             _btnActivate = Theme.FlatButton("激活", true);
-            _btnActivate.SetBounds(332, 31, 128, 30);
+            _btnActivate.SetBounds(332, 29, 128, 30);
             _btnActivate.Click += delegate { DoInlineActivate(); };
             _actCard.Controls.Add(_btnActivate);
 
             _lblActHint = Theme.Text2("管理员给你的 8 位字母数字，一个密钥只能用一次。",
                 Theme.FSmall, Theme.Muted);
-            _lblActHint.SetBounds(20, 60, 440, 18);
+            _lblActHint.SetBounds(20, 58, 440, 18);
             _actCard.Controls.Add(_lblActHint);
 
             // ── 主按钮 ──
@@ -892,8 +892,9 @@ namespace Ferry
                     _updPrompted = v.Latest;
 
                     var r = MessageBox.Show(this,
-                        "发现新版本 " + v.Latest + "（当前 " + mine + "）\n\n" +
-                        "现在更新吗？安装会静默覆盖，配置和授权都不受影响。\n" +
+                        "发现新版本 " + v.Latest + "（当前 " + mine + "）\r\n\r\n" +
+                        "现在更新吗？只替换客户端本身（约 120 KB），" +
+                        "配置和授权都不受影响，装完会自动重新打开。\r\n" +
                         "选「否」就继续用当前版本，本次运行不再提醒。",
                         "有可用更新", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
                     if (r == DialogResult.Yes) DoUpdate();
@@ -923,11 +924,12 @@ namespace Ferry
         {
             var v = Api.Version(_cfg.PortalUrl);
             if (!v.Ok) { MessageBox.Show(this, "拿不到版本信息", "渡口"); return; }
-            if (MessageBox.Show(this,
-                "更新到 " + v.Latest + "？\r\n\r\n" +
-                "只替换客户端本身（约 120 KB），配置和授权都不受影响，" +
-                "更新完会自动重新打开。",
-                "更新", MessageBoxButtons.OKCancel) != DialogResult.OK) return;
+
+            // ⚠ 这里**不再弹确认框**。
+            //   CheckUpdate() 已经问过「发现新版本，现在更新吗？」，用户点「是」
+            //   才会进到 DoUpdate —— 再问一遍的结果是：用户以为点一次就够了，
+            //   第二个框弹出来时他没注意，于是「点了更新什么都没发生」。
+            //   （实测就是这个：日志停在「发现新版本」之后没有任何 DoUpdate 记录）
 
             try
             {
