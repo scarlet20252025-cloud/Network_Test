@@ -67,16 +67,28 @@ namespace Ferry
                 L("下载完成 " + len + " 字节");
                 if (len < 50 * 1024) { L("文件太小，放弃"); return; }
 
-                // 3) 改名 + 复制
+                // 3) 落新文件 → 改名 → 启用
+                //
+                // 这个顺序必须和 MainWindow.DoUpdate 完全一致，否则「自检通过」
+                // 不代表真实更新能过 —— 之前就是这里用 rename+copy（中间有窗口，
+                // 目录里短暂没有 exe），而 DoUpdate 已经改成 copy-new → move。
+                var staged = exe + ".new";
                 if (File.Exists(old)) { try { File.Delete(old); } catch (Exception) { } }
+                if (File.Exists(staged)) { try { File.Delete(staged); } catch (Exception) { } }
+
+                L("暂存新版本 " + staged);
+                File.Copy(tmp, staged, true);
+                L("暂存成功 " + new FileInfo(staged).Length + " 字节");
+
                 L("改名 " + exe + " → " + old);
                 File.Move(exe, old);
                 L("改名成功");
 
                 try
                 {
-                    File.Copy(tmp, exe, true);
-                    L("复制成功 " + new FileInfo(exe).Length + " 字节");
+                    L("启用新版本");
+                    File.Move(staged, exe);
+                    L("启用成功 " + new FileInfo(exe).Length + " 字节");
                 }
                 catch (Exception)
                 {

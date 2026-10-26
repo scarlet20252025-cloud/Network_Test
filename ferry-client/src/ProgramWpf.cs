@@ -46,6 +46,28 @@ namespace Ferry
             var appDir = AppDomain.CurrentDomain.BaseDirectory;
             var cfgPath = Path.Combine(appDir, "config.json");
 
+            // 异常处理要**最先**注册：以前它挂在「拿到单实例锁之后」，
+            // 于是启动早期（读配置、恢复备份、WPF 初始化）出的问题
+            // 一律表现为「双击没反应，日志里一个字都没有」。
+            AppDomain.CurrentDomain.UnhandledException += delegate (object s, UnhandledExceptionEventArgs e)
+            {
+                try
+                {
+                    var ex = e.ExceptionObject as Exception;
+                    File.AppendAllText(Path.Combine(appDir, "assistant.log"),
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " [崩溃] " +
+                        (ex == null ? "未知" : ex.ToString()) + Environment.NewLine,
+                        new UTF8Encoding(false));
+                }
+                catch (Exception) { }
+            };
+            AppDomain.CurrentDomain.ProcessExit += delegate
+            {
+                Trace2(appDir, "进程退出");
+            };
+
+            Trace2(appDir, "启动：参数 [" + string.Join(" ", args) + "] dir=" + appDir);
+
             // 兜底：当前目录没有 config.json，但标准安装目录里有 —— 用安装目录那份。
             // （用户可能从桌面直接双击了一个拷出来的 exe）
             if (!File.Exists(cfgPath))
@@ -64,11 +86,34 @@ namespace Ferry
                 catch (Exception) { }
             }
 
-            // 清理上次更新留下的 .old
+            // 清理上次更新留下的中间文件。
+            //
+            // .old 是「换掉的那个自己」，.new 是「还没启用的新版本」——
+            // 只在更新失败回滚/中断时才会留下。能启动到这个位置，说明
+            // 主 exe 是好的，这两个都是垃圾，清掉免得用户以为程序装重了。
             try
             {
                 var oldExe = Path.Combine(appDir, "渡口助手.exe.old");
                 if (File.Exists(oldExe)) File.Delete(oldExe);
+                var newExe = Path.Combine(appDir, "渡口助手.exe.new");
+                if (File.Exists(newExe)) File.Delete(newExe);
+            }
+            catch (Exception) { }
+
+            // .old 是「刚被替换掉的自己」，更新完立刻启动时它可能还被系统
+            // 短暂锁着（实测过一次没删掉，目录里留着 133 KB 的 .old）。
+            // 3 秒后再试一次，失败就算了 —— 下次启动还会清。
+            try
+            {
+                var oldPath = Path.Combine(appDir, "渡口助手.exe.old");
+                if (File.Exists(oldPath))
+                {
+                    new System.Threading.Timer(delegate
+                    {
+                        try { if (File.Exists(oldPath)) File.Delete(oldPath); }
+                        catch (Exception) { }
+                    }, null, 3000, System.Threading.Timeout.Infinite);
+                }
             }
             catch (Exception) { }
 
@@ -146,6 +191,7 @@ namespace Ferry
 
             if (!created)
             {
+                Trace2(appDir, "已有实例在运行，本次启动退出");
                 var h = FindWindow(null, WndTitle);
                 if (h != IntPtr.Zero)
                 {
@@ -160,18 +206,7 @@ namespace Ferry
                 return;
             }
 
-            // 未捕获异常统一记日志（静默崩溃时用户只看到「双击没反应」）
-            AppDomain.CurrentDomain.UnhandledException += delegate (object s, UnhandledExceptionEventArgs e)
-            {
-                try
-                {
-                    var ex = e.ExceptionObject as Exception;
-                    File.AppendAllText(Path.Combine(appDir, "assistant.log"),
-                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " [崩溃] " +
-                        (ex == null ? "未知" : ex.ToString()) + Environment.NewLine);
-                }
-                catch (Exception) { }
-            };
+            Trace2(appDir, "拿到单实例锁，开始建窗口");
 
             // Job Object：本进程一退出就回收 ssh / mihomo
             try { JobKeeper.Ensure(System.Diagnostics.Process.GetCurrentProcess()); }
@@ -183,7 +218,21 @@ namespace Ferry
 
             // ShutdownMode=OnExplicitShutdown 时，窗口关闭不会结束 Application —— 
             // 我们要的正是「关窗收进托盘」。
+            Trace2(appDir, "进入消息循环（借网=" + win.StartBorrowOnLoad + " 自动更新=" + win.AutoUpdateOnLoad + "）");
             app.Run(win);
+            Trace2(appDir, "消息循环结束，正常退出");
+        }
+
+        /// <summary>启动/退出日志（比 Trace 多一个 appDir 参数，供 Main 早期使用）。</summary>
+        static void Trace2(string appDir, string msg)
+        {
+            try
+            {
+                File.AppendAllText(Path.Combine(appDir, "assistant.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + msg + Environment.NewLine,
+                    new UTF8Encoding(false));
+            }
+            catch (Exception) { }
         }
 
         static bool HasArg(string[] args, string key)

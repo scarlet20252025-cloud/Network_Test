@@ -900,7 +900,25 @@ namespace Ferry
                     UpdateLog("下载完成 " + len + " 字节");
                     if (len < 50 * 1024) throw new Exception("下载到的文件不完整（" + len + " 字节）");
 
+                    // ── 换成「先落新文件、再改名」的顺序 ──
+                    //
+                    // 旧顺序是 rename(exe → .old) 再 copy(tmp → exe)：
+                    // 这两步之间有几百毫秒到几秒的窗口，目录里**没有可执行的 exe**。
+                    // 在这个窗口里进程被杀、断电、杀软拦截、磁盘满，客户端就永远
+                    // 起不来了（只有一个 .old，快捷方式指向的文件不存在）——
+                    // 用户看到的就是「更新完程序没了」，而且只能重装。
+                    //
+                    // 新顺序：先把新版本完整复制成 exe.new（同目录、同卷），
+                    // 再 rename(exe→.old)、rename(exe.new→exe)。
+                    // 两次 rename 都是 NTFS 原子操作，窗口是微秒级；
+                    // 而且任何一步失败，磁盘上都还有一份完整可执行的 exe。
+                    var staged = exe + ".new";
                     if (File.Exists(old)) { try { File.Delete(old); } catch (Exception) { } }
+                    if (File.Exists(staged)) { try { File.Delete(staged); } catch (Exception) { } }
+
+                    UpdateLog("暂存新版本 " + staged);
+                    File.Copy(tmp, staged, true);
+                    UpdateLog("暂存成功 " + new FileInfo(staged).Length + " 字节");
 
                     UpdateLog("改名 " + exe + " → " + old);
                     File.Move(exe, old);
@@ -908,9 +926,10 @@ namespace Ferry
 
                     try
                     {
-                        UpdateLog("复制新版本到位");
-                        File.Copy(tmp, exe, true);
-                        UpdateLog("复制成功 " + new FileInfo(exe).Length + " 字节");
+                        // 紧接上一步，中间不做任何别的操作
+                        UpdateLog("启用新版本");
+                        File.Move(staged, exe);
+                        UpdateLog("启用成功 " + new FileInfo(exe).Length + " 字节");
                     }
                     catch (Exception)
                     {
@@ -919,6 +938,7 @@ namespace Ferry
                     }
 
                     try { File.Delete(tmp); } catch (Exception) { }
+                    try { if (File.Exists(staged)) File.Delete(staged); } catch (Exception) { }
 
                     UpdateLog("还原代理并退出，稍后由延迟启动器拉起新版本");
                     try

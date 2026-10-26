@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "1.0.2"
+#define AppVersion "1.0.5"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -457,6 +457,19 @@ begin
       用户桌面那个重复，图标还带着 requireAdministrator 时代的盾牌，
       用户会以为是两个不同的程序。普通权限删可能被拒，删不掉就算了。 }
     DeleteFile(ExpandConstant('{commondesktop}\渡口助手.lnk'));
+
+    { 更新中途被打断（改名成功、启用新版本之前进程被杀 / 断电）会在安装目录
+      留下 渡口助手.exe.old 而没有 渡口助手.exe —— 那时客户端连启动都启动不了，
+      用户只能重装。这里只是兜底：主程序由 [Files] 正常装好，缺了就从 .old 恢复。 }
+    if not FileExists(ExpandConstant('{app}\{#AppExeName}')) then
+    begin
+      if FileExists(ExpandConstant('{app}\{#AppExeName}.old')) then
+      begin
+        CopyFile(ExpandConstant('{app}\{#AppExeName}.old'),
+                 ExpandConstant('{app}\{#AppExeName}'), False);
+        Log('主程序缺失，已从 .old 恢复');
+      end;
+    end;
     { 开机自启：写一个标记文件，让客户端启动后自己去建计划任务。
 
       为什么不在 [Run] 里直接调 `渡口助手.exe /install-autostart`：
