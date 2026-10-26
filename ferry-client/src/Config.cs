@@ -70,6 +70,24 @@ namespace Ferry
 
         public bool Activated { get { return !string.IsNullOrEmpty(Token); } }
 
+        /// <summary>
+        /// 配置的「跨卸载备份」位置：%APPDATA%\Ferry\config.backup.json。
+        ///
+        /// 为什么不能只存 exe 目录下那份：
+        ///   install 的 [UninstallDelete] 会删掉整个 {app} 目录，config.json 和
+        ///   同目录的 .bak 一起没；用户重装后 token 空了，得重新找管理员要密钥
+        ///   （真实发生过，用户为这个发过火）。%APPDATA% 不在卸载范围内。
+        /// </summary>
+        public static string RoamingBackupPath
+        {
+            get
+            {
+                var dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Ferry");
+                return Path.Combine(dir, "config.backup.json");
+            }
+        }
+
         public int SocksPort { get { return HttpPort - 1; } }
 
         public string BorrowServer
@@ -77,8 +95,36 @@ namespace Ferry
             get { return "http://127.0.0.1:" + HttpPort.ToString(CultureInfo.InvariantCulture); }
         }
 
-        public static Cfg Load(string path)
+        /// <summary>
+        /// 自愈：如果 path 处的配置没有 token，而 %APPDATA% 的跨卸载备份里有，
+        /// 就把备份写回去（并刷新同目录的 .bak）。返回 true 表示恢复了。
+        ///
+        /// 覆盖的场景：卸载后重装、装到新目录、安装器写了空 token 的新配置、
+        /// 用户手工删了 exe 目录。这几种情况下用户本来「要重新找管理员要密钥」，
+        /// 现在什么都不用做。
+        /// </summary>
+        public static bool RecoverFromRoamingBackup(string path)
         {
+            try
+            {
+                if (Load(path).Activated) return false;
+
+                var bk = RoamingBackupPath;
+                if (!File.Exists(bk)) return false;
+                if (!Load(bk).Activated) return false;
+
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
+                File.Copy(bk, path, true);
+                var again = Load(path);
+                again.Save(path);      // 顺带把同目录的 .bak 也刷新成同内容
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
+        public static Cfg Load(string path)        {
             var c = new Cfg();
             var text = ReadWithBackup(path);
             if (text == null) return c;
@@ -152,11 +198,44 @@ namespace Ferry
             // 再存一份备份。为什么：config.json 里是**激活令牌**，丢了用户就得
             // 重新找管理员要密钥（真实发生过一次，用户直接炸了）。
             // 备份只在「保存成功」时刷新，所以它永远是至少能用一次的那份。
+            //
+            // 但有一个例外：如果**这次要写的内容没有 token**，而旧备份里有，
+            // 就不能覆盖 —— 那意味着读配置时出了岔子（文件损坏/被占用），
+            // 内存里是默认值，拿它去冲备份等于把唯一还能用的那份也毁掉。
             try
             {
-                File.WriteAllText(path + ".bak", body, new UTF8Encoding(false));
+                var bkPath = path + ".bak";
+                bool keepOldBak = false;
+                if (string.IsNullOrEmpty(Token) && File.Exists(bkPath))
+                {
+                    try
+                    {
+                        var oldBak = File.ReadAllText(bkPath, Encoding.UTF8);
+                        if (oldBak.IndexOf("\"token\": \"\"", StringComparison.Ordinal) < 0)
+                            keepOldBak = true;
+                    }
+                    catch (Exception) { }
+                }
+                if (!keepOldBak) File.WriteAllText(bkPath, body, new UTF8Encoding(false));
             }
             catch (Exception) { }
+
+            // 再存第三份，放到 %APPDATA%\Ferry（不在安装目录里）。
+            //
+            // 前两份都在 {app} 目录下：卸载时 [UninstallDelete] 把整个目录删掉，
+            // 它们一起没。这份是**卸载/重装后能自愈**的唯一保证。
+            // 只在有 token 时写 —— 否则「刚装好、还没激活」的空配置会把好备份冲掉。
+            if (!string.IsNullOrEmpty(Token))
+            {
+                try
+                {
+                    var bk = RoamingBackupPath;
+                    var dir = Path.GetDirectoryName(bk);
+                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                    File.WriteAllText(bk, body, new UTF8Encoding(false));
+                }
+                catch (Exception) { }
+            }
         }
 
         /// <summary>

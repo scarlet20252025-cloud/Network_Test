@@ -1,3 +1,63 @@
+## v0.14.1 — 2026-10-26
+
+> 客户端 1.0.2：**卸载 / 重装之后不用再重新填密钥**。
+
+### 现象
+
+用户反馈：「卸载重启，或者更新，有时候还是会出现密钥丢失需要重新填」。
+
+### 根因
+
+激活令牌只存在 `config.json` 里，而这个文件和 `.bak` 都在安装目录。
+安装器的卸载段是这么写的：
+
+```
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"     ← 整个目录删掉
+```
+
+所以「卸载 → 重装」必然丢激活。另外两个场景也会踩到：
+
+- 老版本（0.9.2 时代）是 `PrivilegesRequired=admin` 安装，配置落在**另一个
+  管理员账户**的 `%LOCALAPPDATA%\Ferry` 下；换成 per-user 之后读不到那份；
+- 装到新目录时，安装器写进来的是「token 为空」的新配置 —— 界面直接显示未激活。
+
+### 修法：三层，任何一层活下来就够了
+
+| 层 | 在哪 | 做什么 |
+|---|---|---|
+| ① 写备份 | `Cfg.Save` | 每次保存配置时，额外写一份到 **`%APPDATA%\Ferry\config.backup.json`**（不在卸载范围内） |
+| ② 启动自愈 | `Cfg.RecoverFromRoamingBackup` | 主配置没有 token、而备份有 → 自动复制回来并刷新 `.bak`，日志写「已从备份恢复激活信息」 |
+| ③ 安装器自愈 | `installer/ferry.iss` `ssPostInstall` | 卸载后直接重装（客户端还没启动过）也能恢复：查同一份备份，有 token 就 `CopyFile` 回来 |
+
+两个刻意的边界：
+
+- **只在有 token 时写备份**。否则「刚装好、还没激活」的空配置会把好备份冲掉。
+- **主配置的 `.bak` 也有保护**：如果这次要写的内容没有 token、而旧 `.bak` 里有，
+  就保留旧的。这一条防的是「配置读坏了 → 内存里是默认值 → 用户点了保存 →
+  唯一能用的那份备份被空配置覆盖」。
+- 卸载前（`/uninstall`）也会主动 Save 一次，保证备份是最新的。
+
+### 验证
+
+`tools/verify-cfg-recovery.ps1` —— 16 项断言，在测试机上跑（会临时占用
+真实的 `%APPDATA%\Ferry\config.backup.json`，脚本用 `finally` 原样还原）：
+
+```
+PASS  Save writes the roaming backup
+PASS  config gone after uninstall
+PASS  RecoverFromRoamingBackup returns true
+PASS  token restored / account ip restored / .bak restored too
+PASS  no restore when backup has no token
+PASS  empty save keeps token in .bak
+PASS  Load does not fall back to .bak on empty token
+PASS  startup recovery still saves it
+ALL PASS
+```
+
+同时把「更新不碰配置」也钉住了：测试机从 1.0.1 走真实 `/update` 升到 1.0.2，
+更新后 `config.json` **逐字节不变**（`token kept = True`、`cfg equal = True`）。
+
 ## v0.14.0 — 2026-10-26
 
 > 客户端重写：WinForms → **WPF**（1.0.1）。界面不再手算任何一个像素。

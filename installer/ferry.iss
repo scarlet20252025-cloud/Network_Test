@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "1.0.1"
+#define AppVersion "1.0.2"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -173,6 +173,8 @@ var
   AccountIP: string;
   FetchedCfg: string;
   FetchError: string;
+  RoamCfg: string;
+  RoamStr: AnsiString;
 
 { ── 从自身文件名解析 IP：Ferry-Setup-10.141.59.235.exe ──────────── }
 { 从文件名解析 IPv4。Ferry-Setup-10.141.59.235.exe → 10.141.59.235
@@ -490,6 +492,26 @@ begin
         if JsonStr(ExistingStr, 'token') <> '' then
         begin
           Log('现有 config.json 含激活令牌，保留不动（重装不丢激活）');
+          exit;
+        end;
+      end;
+    end;
+
+    { 卸载重装 / 换目录安装：安装目录里的配置已经没了（[UninstallDelete] 删的），
+      或者装进来的是不含 token 的新配置。而客户端每次保存都会往
+      %APPDATA%\Ferry\config.backup.json 写一份完整配置 —— 那个目录不在
+      卸载范围内。有 token 就整份恢复，用户不用重新找管理员要密钥。
+      （用户反馈过「卸载重启、或者更新，有时候还是要重填密钥」。） }
+    RoamCfg := ExpandConstant('{userappdata}\Ferry\config.backup.json');
+    if FileExists(RoamCfg) then
+    begin
+      RoamStr := '';
+      if LoadStringFromFile(RoamCfg, RoamStr) then
+      begin
+        if JsonStr(string(RoamStr), 'token') <> '' then
+        begin
+          CopyFile(RoamCfg, CfgPath, False);
+          Log('已从 %APPDATA%\Ferry\config.backup.json 恢复激活信息');
           exit;
         end;
       end;

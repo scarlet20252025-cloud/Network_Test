@@ -39,6 +39,7 @@
 | `wireguard/` | UDP 中继与 wg 相关 | UDP 通路 |
 | `tools/` | 验证脚本（大多可独立跑） | 加验证、排查 |
 | `tools/render-ui.ps1` | **界面截图**（送到 10.113.66.6 渲染再拉回） | 改了界面之后 |
+| `tools/verify-cfg-recovery.ps1` | **配置自愈**验证（卸载/重装后令牌能不能找回） | 动过 Config.cs / 安装器 |
 | `docs/` | 原理与踩坑（**先读**） | 每次踩新坑 |
 
 ## 三、本地怎么跑
@@ -105,9 +106,9 @@ ssh xt 'C:\ferry-update-test\渡口助手.exe /update'
 
 `version.json` 不用手写：门户会从 `dist/Ferry-Setup-*.exe` 里推出最新版本。
 
-## 五、动手前必须知道的 12 条（每条都真栽过）
+## 五、动手前必须知道的 13 条（每条都真栽过）
 
-> 这 12 条是「不知道就会重复犯错」的。每条后面标了踩坑编号，
+> 这 13 条是「不知道就会重复犯错」的。每条后面标了踩坑编号，
 > 详细经过在 `docs/踩坑记录.md`。
 
 ### 一、进程与生命周期
@@ -183,6 +184,17 @@ ssh xt 'C:\ferry-update-test\渡口助手.exe /update'
     一定要用浏览器控制台或 CDP 跑一遍，别只 curl 看 HTML ——
     结构测试全过、页面照样是死的（函数名笔误、脚本没注入）。
     → 踩坑 48 / 57
+
+### 五、凭证与配置
+
+13. **激活令牌不能只存在安装目录里**。`[UninstallDelete]` 是
+    `filesandordirs; Name: "{app}"` —— 卸载会把 `config.json` 和同目录的
+    `.bak` 一起删掉，用户就得重新找管理员要密钥（真实发生过）。
+    现在有三层：`Cfg.Save` 额外写 `%APPDATA%\Ferry\config.backup.json`（不在卸载
+    范围）、启动时 `Cfg.RecoverFromRoamingBackup` 自愈、安装器 `ssPostInstall`
+    也查这份备份。两条反直觉的边界写在 `Config.cs` 的注释里：
+    **只在有 token 时写备份**、**空 token 的保存不覆盖有 token 的 `.bak`**。
+    → 踩坑 62，验证 `tools/verify-cfg-recovery.ps1`
 
 ---
 

@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows;
 
@@ -77,6 +78,25 @@ namespace Ferry
                 DoSilentUninstall(cfgPath, appDir);
                 return;
             }
+
+            // ── 激活自愈：卸载 / 重装 / 换目录之后把 token 找回来 ──
+            //
+            // 用户反馈过：「卸载重启，或者更新，有时候还是会丢密钥，要重新填」。
+            // 根因有三条，这里补最后一条：
+            //   ① 安装器的 [UninstallDelete] 删掉整个 {app} 目录 → config.json 和
+            //      同目录的 .bak 一起没（这一条靠 %APPDATA% 的那份备份兜底）；
+            //   ② 老版本是 admin 安装，配置落在**另一个管理员账户**的 AppData 下，
+            //      换到 per-user 后读不到（已经在下面 cfgPath 的兜底里处理）；
+            //   ③ 装到新目录时安装器写进来的是空 token 的新配置 → 界面「未激活」。
+            //
+            // 只要用户曾经保存过一次配置，%APPDATA%\Ferry\config.backup.json 里
+            // 就有完整令牌；这里自动补回去，用户不需要重新要密钥。
+            try
+            {
+                if (Cfg.RecoverFromRoamingBackup(cfgPath))
+                    Trace("已从备份恢复激活信息（账号 " + Cfg.Load(cfgPath).AccountIp + "）");
+            }
+            catch (Exception) { }
 
             // ── 自启开关 ──
             if (HasArg(args, "/install-autostart") || HasArg(args, "-install-autostart"))
@@ -173,8 +193,30 @@ namespace Ferry
             return false;
         }
 
+        /// <summary>启动早期写日志（此时 MainWindow 还没建好）。</summary>
+        static void Trace(string msg)
+        {
+            try
+            {
+                var p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assistant.log");
+                File.AppendAllText(p,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + msg + Environment.NewLine,
+                    new UTF8Encoding(false));
+            }
+            catch (Exception) { }
+        }
+
         static void DoSilentUninstall(string cfgPath, string appDir)
         {
+            // 卸载前先把激活信息备份到 %APPDATA%\Ferry —— 安装器随后会删掉
+            // 整个 {app} 目录（[UninstallDelete]），那份备份是重装后自愈的唯一依据。
+            try
+            {
+                var cfg0 = Cfg.Load(cfgPath);
+                if (cfg0.Activated) cfg0.Save(cfgPath);
+            }
+            catch (Exception) { }
+
             try
             {
                 var cfg = Cfg.Load(cfgPath);
