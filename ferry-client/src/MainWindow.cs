@@ -46,7 +46,7 @@ namespace Ferry
         Border _card;
         TextBlock _lblActTitle, _lblActHint;
         TextBox _txtCode;
-        Button _btnActivate, _btnOn, _btnOff, _btnRefresh, _btnSettings, _btnUpd, _btnGlobal;
+        Button _btnActivate, _btnOn, _btnOff, _btnRefresh, _btnSettings, _btnUpd, _btnGlobal, _btnClash;
         TextBox _log;
         Border _actCard;
         StackPanel _mainStack;
@@ -320,6 +320,15 @@ namespace Ferry
             _btnRefresh.Click += delegate { RefreshUi(); Log("已刷新"); };
             Grid.SetColumn(_btnRefresh, 0);
             subRow.Children.Add(_btnRefresh);
+
+            // 一键把渡口作为一个 SOCKS5 节点写进 Clash 的全局扩展配置。
+            // 中间这一列本来是空的，正好放它，不挤占「刷新 / 设置」的位置。
+            _btnClash = MakeButton("接入 Clash", false, 0);
+            _btnClash.FontSize = Palette.FsSmall;
+            _btnClash.Padding = new Thickness(22, 6, 22, 6);
+            _btnClash.Click += delegate { DoClashMerge(); };
+            Grid.SetColumn(_btnClash, 1);
+            subRow.Children.Add(_btnClash);
 
             _btnSettings = MakeButton("设置", false, 0);
             _btnSettings.FontSize = Palette.FsSmall;
@@ -919,6 +928,15 @@ namespace Ferry
             catch (Exception) { }
             Log("以管理员身份重启…（UAC 上点「是」）");
             Elevator.RestartElevated("/allow-wait");
+        }
+
+        void DoClashMerge()
+        {
+            int port = _rt != null ? _rt.SocksPort : _cfg.SocksPort;
+            var msg = ClashMerge.Install(port);
+            Log("接入 Clash（端口 " + port + "）：" + (msg.Length > 50 ? msg.Substring(0, 50) + "…" : msg));
+            MessageBox.Show(this, msg, "接入 Clash",
+                MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
         void OpenSettings()
