@@ -173,7 +173,7 @@ namespace Ferry
                 if (!ReadExact(ns, first, 1)) return;
 
                 if (first[0] == 0x05)
-                    HandleSocks5(ns, first[0]);
+                    HandleSocks5(ns, first[0], client.Client.RemoteEndPoint as IPEndPoint);
                 else
                     HandleHttp(ns, first[0]);
             }
@@ -188,7 +188,7 @@ namespace Ferry
 
         // ── SOCKS5（客户端 → 我）──────────────────────────────
 
-        void HandleSocks5(NetworkStream ns, byte ver)
+        void HandleSocks5(NetworkStream ns, byte ver, IPEndPoint clientEp)
         {
             // 我们已经读了 VER，接着读 NMETHODS + METHODS
             var buf = new byte[1];
@@ -233,7 +233,15 @@ namespace Ferry
             if (!ReadExact(ns, pb, 2)) return;
             int port = (pb[0] << 8) | pb[1];
 
-            if (cmd != 0x01) { ReplySocks5(ns, 0x07); return; } // 只支持 CONNECT
+            // RFC 1928：0x01 = CONNECT，0x03 = UDP ASSOCIATE。
+            // 远端 SOCKS5 服务器从 v2 起就支持 UDP ASSOCIATE 了，本地这一跳以前
+            // 直接回「命令不支持」—— 所以「节点模式」「游戏加速」一直没 UDP 可用。
+            if (cmd == 0x03)
+            {
+                StartUdpAssociate(ns, clientEp);
+                return;
+            }
+            if (cmd != 0x01) { ReplySocks5(ns, 0x07); return; } // 其余命令不支持
 
             Socket upstream = null;
             try
@@ -245,6 +253,210 @@ namespace Ferry
             }
             catch (Exception) { try { ReplySocks5(ns, 0x01); } catch (Exception) { } }
             finally { try { if (upstream != null) upstream.Close(); } catch (Exception) { } }
+        }
+
+        /// <summary>
+        /// SOCKS5 UDP ASSOCIATE（RFC 1928 CMD=0x03）。
+        ///
+        /// 链路：客户端 → 本地中继(127.0.0.1:随机) → 上游 SOCKS5 分配的 UDP 端点 → 目标。
+        ///
+        /// **为什么本地要再向上游发一次 ASSOCIATE**：上游（`ferry-socks5-server.py`）
+        /// 不是固定监听一个 UDP 端口，而是**每建立一条 ASSOCIATE 就新开一个随机 UDP
+        /// socket**，把端口放在 BND 里告诉你。所以直接把报文往 1080 发是没人收的
+        /// （实测：收到 ICMP port unreachable）。本地这一跳必须同时当「服务端」和
+        /// 「客户端」：对上给客户端一个端口，对下向上游要一个端口。
+        ///
+        /// 两个要点：
+        ///   ① 只放行「建立关联的那个客户端地址」——否则就是一个开放 UDP 中继，
+        ///      同一局域网任何人都能拿它当出口；
+        ///   ② 客户端 TCP 控制连接一断就回收（RFC 要求，也防止崩溃后中继一直挂着）。
+        /// </summary>
+        void StartUdpAssociate(NetworkStream ns, IPEndPoint clientEp)
+        {
+            Socket upCtrl = null, clientSock = null, remoteSock = null;
+            try
+            {
+                // ① 先向上游要一个 UDP 端点
+                IPEndPoint upEp;
+                upCtrl = AssociateUpstream(_socksPort, _socksHost, out upEp, 8000);
+                if (upCtrl == null)
+                {
+                    _log("UDP 关联失败：上游不支持或连不上 " + _socksHost + ":" + _socksPort);
+                    ReplySocks5(ns, 0x01);
+                    return;
+                }
+
+                // ② 给客户端准备本地中继端口
+                clientSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                clientSock.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                int relayPort = ((IPEndPoint)clientSock.LocalEndPoint).Port;
+
+                remoteSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                remoteSock.Bind(new IPEndPoint(IPAddress.Any, 0));
+
+                var bnd = new byte[] { 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1,
+                                       (byte)(relayPort >> 8), (byte)(relayPort & 0xFF) };
+                ns.Write(bnd, 0, bnd.Length);
+                ns.Flush();
+                _log("UDP 关联 " + clientEp + " → 127.0.0.1:" + relayPort + " ⇒ 上游 " + upEp);
+
+                var cs = clientSock; var rs = remoteSock;
+                var ctrl = upCtrl;
+                bool stop = false;
+
+                // 客户端发 UDP 用的端口和它 TCP 控制连接的端口**不是同一个**
+                // （TCP 是它连我们时随机选的，UDP 又另选一个）。回包必须发给
+                // 实际收到包的那个地址，否则客户端永远收不到 —— 实测踩过：
+                // 用 TCP 的 clientEp 回包时，客户端干等到超时。
+                IPEndPoint udpPeer = null;
+
+                var upThread = new Thread(delegate ()
+                {
+                    var buf = new byte[65535];
+                    while (!stop && _running)
+                    {
+                        try
+                        {
+                            EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                            int n = cs.ReceiveFrom(buf, ref from);
+                            var fe = from as IPEndPoint;
+                            // 只接受关联的客户端（同 IP 即可，端口由客户端自己决定）
+                            if (fe != null && fe.Address.Equals(clientEp.Address) && n > 0)
+                            {
+                                udpPeer = fe;          // 记下真实 UDP 源地址
+                                rs.SendTo(buf, 0, n, SocketFlags.None, upEp);
+                            }
+                        }
+                        catch (Exception) { break; }
+                    }
+                });
+                upThread.IsBackground = true;
+                upThread.Start();
+
+                var downThread = new Thread(delegate ()
+                {
+                    var buf = new byte[65535];
+                    while (!stop && _running)
+                    {
+                        try
+                        {
+                            EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                            int n = rs.ReceiveFrom(buf, ref from);
+                            var peer = udpPeer ?? clientEp;
+                            if (n > 0) cs.SendTo(buf, 0, n, SocketFlags.None, peer);
+                        }
+                        catch (Exception) { break; }
+                    }
+                });
+                downThread.IsBackground = true;
+                downThread.Start();
+
+                // 阻塞在客户端的控制连接上：它一关，关联就结束
+                try
+                {
+                    var sink = new byte[16];
+                    while (ns.Read(sink, 0, sink.Length) > 0) { }
+                }
+                catch (Exception) { }
+
+                stop = true;
+                try { cs.Close(); } catch (Exception) { }
+                try { rs.Close(); } catch (Exception) { }
+                try { ctrl.Close(); } catch (Exception) { }
+                _log("UDP 关联结束：" + clientEp);
+            }
+            catch (Exception)
+            {
+                try { if (clientSock != null) clientSock.Close(); } catch (Exception) { }
+                try { if (remoteSock != null) remoteSock.Close(); } catch (Exception) { }
+                try { if (upCtrl != null) upCtrl.Close(); } catch (Exception) { }
+            }
+        }
+
+        /// <summary>
+        /// 向上游 SOCKS5 发 UDP ASSOCIATE，返回远端分配的 UDP 端点。
+        /// 返回的 Socket 是**控制连接**，必须保持打开 —— 关掉它远端的 UDP 中继就回收了。
+        /// </summary>
+        static Socket AssociateUpstream(int socksPort, string socksHost, out IPEndPoint udpEp, int timeoutMs)
+        {
+            udpEp = null;
+            Socket s = null;
+            try
+            {
+                IPAddress up = null;
+                if (!IPAddress.TryParse(socksHost, out up))
+                {
+                    foreach (var a in Dns.GetHostAddresses(socksHost))
+                        if (a.AddressFamily == AddressFamily.InterNetwork) { up = a; break; }
+                }
+                if (up == null) return null;
+
+                s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                s.NoDelay = true;
+                var ar = s.BeginConnect(new IPEndPoint(up, socksPort), null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(timeoutMs)) { s.Close(); return null; }
+                s.EndConnect(ar);
+
+                var sns = new NetworkStream(s, false);
+                sns.Write(new byte[] { 0x05, 0x01, 0x00 }, 0, 3);
+                var r = new byte[2];
+                if (!ReadExact(sns, r, 2) || r[0] != 0x05) { s.Close(); return null; }
+
+                // CMD=0x03，DST 填 0.0.0.0:0 —— 「我不知道自己会从哪个端口发」
+                sns.Write(new byte[] { 0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, 0, 10);
+
+                var head = new byte[4];
+                if (!ReadExact(sns, head, 4) || head[1] != 0x00) { s.Close(); return null; }
+
+                string bhost; int bport;
+                if (!ReadSocksAddr(sns, head[3], out bhost, out bport) || bport == 0)
+                {
+                    s.Close();
+                    return null;
+                }
+
+                IPAddress bip;
+                if (!IPAddress.TryParse(bhost, out bip) || bip.Equals(IPAddress.Any)) bip = up;
+                udpEp = new IPEndPoint(bip, bport);
+                return s;
+            }
+            catch (Exception)
+            {
+                try { if (s != null) s.Close(); } catch (Exception) { }
+                return null;
+            }
+        }
+
+        /// <summary>读 SOCKS5 回复里的地址部分（ATYP 已在 head[3]）。</summary>
+        static bool ReadSocksAddr(NetworkStream sns, byte atyp, out string host, out int port)
+        {
+            host = ""; port = 0;
+            if (atyp == 0x01)
+            {
+                var a = new byte[4];
+                if (!ReadExact(sns, a, 4)) return false;
+                host = new IPAddress(a).ToString();
+            }
+            else if (atyp == 0x03)
+            {
+                var l = new byte[1];
+                if (!ReadExact(sns, l, 1)) return false;
+                var d = new byte[l[0]];
+                if (l[0] > 0 && !ReadExact(sns, d, l[0])) return false;
+                host = Encoding.ASCII.GetString(d);
+            }
+            else if (atyp == 0x04)
+            {
+                var a = new byte[16];
+                if (!ReadExact(sns, a, 16)) return false;
+                host = new IPAddress(a).ToString();
+            }
+            else return false;
+
+            var pb = new byte[2];
+            if (!ReadExact(sns, pb, 2)) return false;
+            port = (pb[0] << 8) | pb[1];
+            return true;
         }
 
         static void ReplySocks5(NetworkStream ns, byte rep)
