@@ -118,7 +118,6 @@ namespace Ferry
 
             _numInterval = new NumericUpDownAdapter(_cfg.NetCheckSec, 10, 300, 5, 90);
             ivRow.Children.Add(_numInterval.Box);
-
             ivRow.Children.Add(new TextBlock
             {
                 Text = "秒",
@@ -127,6 +126,29 @@ namespace Ferry
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(8, 0, 0, 0)
             });
+
+            // 「接入 Clash」：小、灰、没有边框，靠在这一行的右端。
+            // 需要的人会找到（Clash 的图标就是一只猫），不需要的人当它不存在。
+            // 重复点不会重复写配置 —— 已经接入而且端口没变时只弹一句提示。
+            var catBtn = new Button
+            {
+                Content = "🐱",
+                FontSize = 13,
+                Foreground = Palette.MutedB,
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(3, 0, 3, 0),
+                Cursor = System.Windows.Input.Cursors.Hand,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(16, 0, 0, 0),
+                ToolTip = "接入 Clash：自动在 Clash 的扩展配置里加一个 SOCKS5 节点（可重复点，不会重复创建）"
+            };
+            catBtn.Click += delegate
+            {
+                var msg = ClashMerge.Install(_cfg.SocksPort);
+                MessageBox.Show(this, msg, "接入 Clash", MessageBoxButton.OK, MessageBoxImage.Information);
+            };
+            ivRow.Children.Add(catBtn);
 
             _lblHint = new TextBlock
             {
