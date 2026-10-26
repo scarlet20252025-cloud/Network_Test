@@ -4638,6 +4638,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # 登录后的门户页作废：密钥已经改到软件里，网页不再有「登录」这件事。
                 # 老用户的书签直接带回首页，别让他们看到「下载 ferry-*.cmd」那种过时内容。
                 self.redirect('/')
+            elif path == '/download-client':
+                self.handle_download_client()
             elif path == '/download-cmd':
                 self.handle_download_cmd()
             elif path.startswith('/download/version/'):
@@ -4902,6 +4904,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if inv:
                 note = inv['note'] or ''
         self.send_html(portal_page(cli, note))
+
+    def handle_download_client(self):
+        """只发客户端本体（约 120 KB），不发安装包。
+
+        为什么需要这个端点：自动更新走安装包要趟一堆坑 ——
+        Job Object 会杀掉安装进程、/CLOSEAPPLICATIONS 会和托盘程序死锁、
+        [Run] 的 silent 语义容易写错、旧版进程占着文件还删不掉。
+        而 99% 的更新只改客户端逻辑，mihomo.exe / wintun.dll 几乎不动。
+
+        所以自动更新改成：下载这个 exe → 客户端退出后由 .cmd 覆盖 → 重新启动。
+        不碰安装程序、不要 UAC、不涉及卸载注册表。
+
+        首次安装仍然用安装包（它还要放 mihomo/wintun）。
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        exe = None
+        for d in (os.path.join(here, '..', 'dist'), os.path.join(here, 'dist')):
+            p = os.path.normpath(os.path.join(d, '渡口助手.exe'))
+            if os.path.isfile(p):
+                exe = p
+                break
+        if exe is None:
+            self.send_json({'ok': False, 'error': '客户端尚未构建'}, 404)
+            return
+
+        with open(exe, 'rb') as f:
+            data = f.read()
+
+        ver = str(read_version_manifest().get('latest', '0.0.0'))
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/vnd.microsoft.portable-executable')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        # 客户端用它核对「拿到的到底是不是新版本」，避免半截文件被当成成功
+        self.send_header('X-Ferry-Version', ver)
+        self.send_header('X-Ferry-Bytes', str(len(data)))
+        self.end_headers()
+        CHUNK = 65536
+        try:
+            for i in range(0, len(data), CHUNK):
+                self.wfile.write(data[i:i + CHUNK])
+        except Exception:
+            pass
+        self.db.log('download_client', self.client_ip(), 'v' + ver)
 
     def handle_download_cmd(self):
         """.cmd 一键安装：双击后自动下载 exe 并启动，全程不碰浏览器下载通道。

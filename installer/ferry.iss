@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "0.9.15"
+#define AppVersion "0.9.17"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -369,6 +369,14 @@ begin
   begin
     Exec(OldExe, '/stop', '', SW_HIDE, ewWaitUntilTerminated, R);
     Sleep(800);
+  end;
+
+  { 检测两次，中间等 2 秒。
+    为什么：/stop 本身也是一个「渡口助手」进程，它杀完主进程后要过一会儿才退出。
+    只查一次会把「正在退出的自己」当成「用户还没退出」，于是中止安装 —— 实测踩过。 }
+  if ProcessStillRunning() then
+  begin
+    Sleep(2000);
   end;
 
   if ProcessStillRunning() then

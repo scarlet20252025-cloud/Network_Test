@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -901,36 +902,70 @@ namespace Ferry
         /// <summary>已经弹过提示的版本号。同一个版本不重复弹。</summary>
         string _updPrompted = "";
 
+        /// <summary>
+        /// 更新：**只替换客户端本体**，不跑安装包。
+        ///
+        /// 为什么放弃安装包这条路（0.9.16 起）：
+        /// 自动更新走 Inno 要趟一串坑 —— Job Object 会杀掉安装进程、
+        /// /CLOSEAPPLICATIONS 会和托盘程序死锁、[Run] 的 silent 语义容易写错、
+        /// 旧版进程占着文件还删不掉。而 99% 的更新只改客户端逻辑，
+        /// mihomo.exe / wintun.dll 几乎不动。
+        ///
+        /// 现在的链路：
+        ///   下载 dist/渡口助手.exe（约 120 KB）→ 写一个替换脚本 →
+        ///   WMI 起脚本（脱离 Job）→ 自己退出 → 脚本等文件可写、覆盖、重新启动
+        ///
+        /// 首次安装仍然用安装包（它还要放 mihomo/wintun 和建卸载项）。
+        /// </summary>
         void DoUpdate()
         {
             var v = Api.Version(_cfg.PortalUrl);
             if (!v.Ok) { MessageBox.Show(this, "拿不到版本信息", "渡口"); return; }
-            if (MessageBox.Show(this, "下载并安装 " + v.Latest + "？\n\n安装程序会静默覆盖现有版本，配置和授权不受影响。",
+            if (MessageBox.Show(this,
+                "更新到 " + v.Latest + "？\r\n\r\n" +
+                "只替换客户端本身（约 120 KB），配置和授权都不受影响，" +
+                "更新完会自动重新打开。",
                 "更新", MessageBoxButtons.OKCancel) != DialogResult.OK) return;
+
             try
             {
-                var url = v.Url.StartsWith("http") ? v.Url : _cfg.PortalUrl.TrimEnd('/') + v.Url;
-                var tmp = Path.Combine(Path.GetTempPath(), "Ferry-Setup-" + v.Latest + ".exe");
-                var wc = new System.Net.WebClient();
-                wc.Proxy = null;
-                wc.DownloadFile(url, tmp);
-                // ⚠ 不要传 /CLOSEAPPLICATIONS。
-                //   Inno 收到它会用 Restart Manager 去「礼貌地」关闭占用文件的程序，
-                //   而我们的客户端在 OnFormClosing 里 cancel（缩到托盘）——
-                //   RM 等不到关闭，安装就在静默模式下**静默失败**：
-                //   用户点了「是」，下载完成，然后什么都没发生，版本还是旧的。
-                //   （实测日志：手动用 /SILENT /NORESTART 装就成功，带这个参数就失败）
-                //   关闭旧客户端由安装器的 InitializeSetup 调 /stop 负责，它会先还原系统代理。
-                var psi = new ProcessStartInfo(tmp, "/SILENT /NORESTART");
-                // ⚠ 必须 UseShellExecute = true：
-                //   否则安装包会被 JobKeeper 的 Job Object 收进去，而本进程
-                //   紧接着 RealQuit() 退出 —— Windows 把整个 Job 杀掉，
-                //   安装包还没开始解压就没了。用户看到的就是「点了是，然后无事发生」。
-                //   （0.9.2 的自动更新失败就是这个原因，实测复现过）
-                psi.UseShellExecute = true;
-                Process.Start(psi);
-                Log("已启动安装程序，本程序即将退出");
-                Thread.Sleep(600);
+                var url = _cfg.PortalUrl.TrimEnd('/') + "/download-client";
+                var tmp = Path.Combine(Path.GetTempPath(), "ferry-client-new.exe");
+                if (File.Exists(tmp)) { try { File.Delete(tmp); } catch (Exception) { } }
+
+                using (var wc = new System.Net.WebClient())
+                {
+                    wc.Proxy = null;
+                    wc.DownloadFile(url, tmp);
+                }
+
+                var len = new FileInfo(tmp).Length;
+                if (len < 50 * 1024)
+                {
+                    MessageBox.Show(this, "下载到的文件不完整（" + len + " 字节），稍后再试。", "更新");
+                    return;
+                }
+
+                var bat = Path.Combine(Path.GetTempPath(), "ferry-update.cmd");
+                File.WriteAllText(bat, BuildUpdateScript(), Encoding.Default);
+
+                Log("已下载 " + v.Latest + "（" + (len / 1024) + " KB），替换后自动重启…");
+
+                // 脱离 Job 起脚本；WMI 不行就退回直接启动（会在退出时被 Job 杀掉，
+                // 但至少试过 —— 这条兜底只对「Job 没建起来」的极端情况有意义）。
+                if (!Elevator.StartDetached("cmd.exe /c \"" + bat + "\""))
+                {
+                    try
+                    {
+                        var psi = new ProcessStartInfo("cmd.exe", "/c \"" + bat + "\"");
+                        psi.UseShellExecute = true;
+                        psi.WindowStyle = ProcessWindowStyle.Hidden;
+                        Process.Start(psi);
+                    }
+                    catch (Exception) { }
+                }
+
+                Thread.Sleep(400);
                 RealQuit();
             }
             catch (Exception e)
@@ -939,6 +974,41 @@ namespace Ferry
             }
         }
 
+        /// <summary>
+        /// 替换脚本（GBK + chcp 936，否则中文乱码）。
+        ///
+        /// 为什么不先检测进程再复制：`tasklist` 的输出受系统语言和编码影响，
+        /// `find` 匹配中文进程名在不同代码页下会假失败。
+        /// 直接「复制 → 失败就等 1 秒重试」更笨但更可靠，最多等 15 秒。
+        /// </summary>
+        static string BuildUpdateScript()
+        {
+            return string.Join("\r\n", new string[] {
+                "@echo off",
+                "chcp 936 >nul 2>&1",
+                "setlocal",
+                "set \"DST=%LOCALAPPDATA%\\Ferry\\渡口助手.exe\"",
+                "set \"NEW=%TEMP%\\ferry-client-new.exe\"",
+                "set /a n=0",
+                ":retry",
+                "copy /Y \"%NEW%\" \"%DST%\" >nul 2>&1",
+                "if not errorlevel 1 goto done",
+                "set /a n+=1",
+                "if %n% lss 15 (",
+                "  timeout /t 1 /nobreak >nul",
+                "  goto retry",
+                ")",
+                "goto fail",
+                ":done",
+                "start \"\" \"%DST%\"",
+                "del \"%NEW%\" >nul 2>&1",
+                "exit /b 0",
+                ":fail",
+                "msg * \"渡口更新失败：客户端文件被占用。请手动关闭后重新打开。\"",
+                "exit /b 1",
+                ""
+            });
+        }
         // ── 刷新 ────────────────────────────────────────────────
 
         /// <summary>

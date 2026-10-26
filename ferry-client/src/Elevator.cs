@@ -47,6 +47,25 @@ namespace Ferry
         ///   · 再由它 Start-Process -Verb RunAs，提权才真的生效
         ///   · 整个过程中转进程和 GUI 无关，加 -WindowStyle Hidden 不闪窗
         /// </summary>
+        /// <summary>
+        /// 用 WMI 起一个与本进程**完全无关**的进程（父是 WmiPrvSE，不在我们的 Job 里）。
+        /// 返回 false 表示 WMI 不可用，调用方自己决定怎么退化。
+        /// </summary>
+        public static bool StartDetached(string commandLine)
+        {
+            try
+            {
+                using (var mc = new System.Management.ManagementClass("Win32_Process"))
+                {
+                    var p = mc.GetMethodParameters("Create");
+                    p["CommandLine"] = commandLine;
+                    var o = mc.InvokeMethod("Create", p, null);
+                    return o != null && Convert.ToInt32(o["ReturnValue"]) == 0;
+                }
+            }
+            catch (Exception) { return false; }
+        }
+
         public static void RestartElevated(string extraArgs)
         {
             string exe = Application.ExecutablePath;
