@@ -460,6 +460,8 @@ namespace Ferry
                 if (r != MessageBoxResult.Yes) return;
                 try { FerryCore.RestoreDirect(_cfg, _appDir); _rt.Stop(); _rt = null; } catch (Exception) { }
             }
+            // 用户主动退出 = 结束使用，记成直连；下次打开不要自己又去借网。
+            SaveLastState(false);
             if (_tray != null) { _tray.Visible = false; _tray.Dispose(); }
             Application.Current.Shutdown();
         }
@@ -513,6 +515,48 @@ namespace Ferry
                 CheckUpdate();
             };
             updDelay.Start();
+
+            // 恢复上次的状态：更新 / 手动重启 / 开机自启都走这里。
+            // /start 是显式要求，优先级最高；否则看上次离开时是不是在借网。
+            if ((StartBorrowOnLoad || WasBorrowingLastTime()) && _cfg.Activated)
+            {
+                var restore = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(800) };
+                restore.Tick += delegate
+                {
+                    restore.Stop();
+                    if (_rt == null && !_busy) DoStart();
+                };
+                restore.Start();
+            }
+        }
+
+        // ── 「上次是什么状态」：借网 / 直连 ──
+        //
+        // 重启或更新之后要回到用户离开时的状态：他在借网，新实例就自己接上；
+        // 他停在直连，就别自作主张去借（那会偷偷占出口额度、也可能让他以为在借）。
+        //
+        // 存在独立小文件里，不塞 config.json —— 那是用户的配置，不该被频繁改写，
+        // 也不该因为「改了个端口」就顺手把借网状态一起改掉。
+        string LastStatePath { get { return Path.Combine(_appDir, "last-state.txt"); } }
+
+        void SaveLastState(bool borrowing)
+        {
+            try
+            {
+                File.WriteAllText(LastStatePath, borrowing ? "borrowing" : "direct",
+                    new UTF8Encoding(false));
+            }
+            catch (Exception) { }
+        }
+
+        bool WasBorrowingLastTime()
+        {
+            try
+            {
+                return File.Exists(LastStatePath) &&
+                       File.ReadAllText(LastStatePath).Trim() == "borrowing";
+            }
+            catch (Exception) { return false; }
         }
 
         /// <summary>
@@ -747,6 +791,7 @@ namespace Ferry
                         Log("系统代理已切到 " + _rt.BorrowServer);
                         if (exitIp.Length > 0) { _exitVia = exitIp; Log("出口 IP：" + exitIp); }
                         else Log("出口探测失败（不影响使用，可能是远端暂时不通）");
+                        SaveLastState(true);      // 下次启动/更新/开机自启要回到借网
                     }
                     RefreshUi();
                 }));
@@ -768,6 +813,7 @@ namespace Ferry
                     SetBusy(false);
                     Log("已恢复直连");
                     _exitVia = "";
+                    SaveLastState(false);     // 用户主动停在直连，下次启动别再自作主张借网
                     RefreshUi();
                 }));
             });
