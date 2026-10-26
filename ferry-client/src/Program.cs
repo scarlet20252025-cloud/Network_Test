@@ -102,6 +102,14 @@ namespace Ferry
                 return;
             }
 
+            // 上次自动更新会把旧 exe 改名成 .old（运行中无法覆盖），这里顺手清掉。
+            try
+            {
+                var oldExe = Path.Combine(appDir, "渡口助手.exe.old");
+                if (File.Exists(oldExe)) File.Delete(oldExe);
+            }
+            catch (Exception) { }
+
             bool created;
             _mutex = new Mutex(true, @"Local\FerryClient", out created);
 

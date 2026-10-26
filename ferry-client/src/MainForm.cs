@@ -938,18 +938,25 @@ namespace Ferry
             var v = Api.Version(_cfg.PortalUrl);
             if (!v.Ok) { MessageBox.Show(this, "拿不到版本信息", "渡口"); return; }
 
-            // ⚠ 这里**不再弹确认框**。
-            //   CheckUpdate() 已经问过「发现新版本，现在更新吗？」，用户点「是」
-            //   才会进到 DoUpdate —— 再问一遍的结果是：用户以为点一次就够了，
-            //   第二个框弹出来时他没注意，于是「点了更新什么都没发生」。
-            //   （实测就是这个：日志停在「发现新版本」之后没有任何 DoUpdate 记录）
+            // 只下载、不跑安装包、也不靠外部 .cmd —— 全程在进程内完成：
+            //
+            //   ① 把**正在运行的自己**改名成 渡口助手.exe.old（NTFS 允许重命名运行中的 exe）
+            //   ② 把新 exe 复制回原名
+            //   ③ 用 WMI 起新进程（脱离本进程的 Job，否则退出时会被一起回收）
+            //   ④ 自己退出；.old 在下次启动时删掉
+            //
+            // 为什么不再用 .cmd 中转：实测过一次「脚本成功删掉了临时文件、但没把进程
+            // 拉起来」的情况，排查成本很高（日志、临时文件、msg 弹窗都要看）。
+            // 现在每一步都在进程内，失败能当场回滚并告诉用户哪一步断了。
+
+            var exe = Application.ExecutablePath;
+            var old = exe + ".old";
+            var tmp = Path.Combine(Path.GetTempPath(), "ferry-client-new.exe");
 
             try
             {
                 var url = _cfg.PortalUrl.TrimEnd('/') + "/download-client";
-                var tmp = Path.Combine(Path.GetTempPath(), "ferry-client-new.exe");
                 if (File.Exists(tmp)) { try { File.Delete(tmp); } catch (Exception) { } }
-
                 using (var wc = new System.Net.WebClient())
                 {
                     wc.Proxy = null;
@@ -963,34 +970,60 @@ namespace Ferry
                     return;
                 }
 
-                var bat = Path.Combine(Path.GetTempPath(), "ferry-update.cmd");
-                File.WriteAllText(bat, BuildUpdateScript(), Encoding.Default);
+                // 上次更新如果没删掉 .old，先清掉（那时它已经不在运行了）
+                if (File.Exists(old)) { try { File.Delete(old); } catch (Exception) { } }
 
-                Log("已下载 " + v.Latest + "（" + (len / 1024) + " KB），替换后自动重启…");
+                // ① 自己改名。运行中的 exe 可以被重命名，但不能被覆盖。
+                File.Move(exe, old);
 
-                // 脱离 Job 起脚本；WMI 不行就退回直接启动（会在退出时被 Job 杀掉，
-                // 但至少试过 —— 这条兜底只对「Job 没建起来」的极端情况有意义）。
-                if (!Elevator.StartDetached("cmd.exe /c \"" + bat + "\""))
+                // ② 新版本就位
+                try
+                {
+                    File.Copy(tmp, exe, true);
+                }
+                catch (Exception)
+                {
+                    // 回滚，别把用户留在「程序没了」的状态
+                    try { File.Move(old, exe); } catch (Exception) { }
+                    throw;
+                }
+
+                // ③ 起新进程。WMI 起的不在本进程的 Job 里，不会被回收。
+                Log("已更新到 " + v.Latest + "，正在重启…");
+                // ⚠ WMI 的 Win32_Process.Create 不认「整个命令行被引号包住」的写法
+                //   （返回码 9 = Path Not Found）。走 cmd /c start 让它自己拆引号。
+                bool started = Elevator.StartDetached(
+                    "cmd.exe /c start \"\" \"" + exe + "\"");
+                if (!started)
                 {
                     try
                     {
-                        var psi = new ProcessStartInfo("cmd.exe", "/c \"" + bat + "\"");
+                        var psi = new ProcessStartInfo(exe);
                         psi.UseShellExecute = true;
-                        psi.WindowStyle = ProcessWindowStyle.Hidden;
+                        psi.WorkingDirectory = _appDir;
                         Process.Start(psi);
                     }
                     catch (Exception) { }
                 }
 
-                Thread.Sleep(400);
+                try { File.Delete(tmp); } catch (Exception) { }
+
+                // ④ 让出位置：先还原代理再退，别留死端口
+                Thread.Sleep(300);
                 RealQuit();
             }
             catch (Exception e)
             {
-                MessageBox.Show(this, "下载失败：" + e.Message, "更新");
+                // 任何一步失败都要能把程序还原回可用状态
+                try
+                {
+                    if (!File.Exists(exe) && File.Exists(old)) File.Move(old, exe);
+                }
+                catch (Exception) { }
+                MessageBox.Show(this, "更新失败：" + e.Message +
+                    "\r\n\r\n程序已保持原状，可以继续使用。", "更新");
             }
         }
-
         /// <summary>
         /// 替换脚本（GBK + chcp 936，否则中文乱码）。
         ///
