@@ -103,7 +103,7 @@ namespace Ferry
             title.SetBounds(24, 16, 120, 28);
             Controls.Add(title);
 
-            var sub = Theme.Text2("断网时借一台能上网的内网主机中转流量", Theme.FSmall, Theme.Muted);
+            var sub = Theme.Text2("内网应急接入 · 断网时借一台能出网的主机中转", Theme.FSmall, Theme.Muted);
             sub.SetBounds(24, 44, 300, 18);
             Controls.Add(sub);
 
@@ -138,9 +138,11 @@ namespace Ferry
             _lblQuota.SetBounds(24, 92, 430, 20);
             _card.Controls.Add(_lblQuota);
 
-            _rowTunnel = Row(_card, 120);
-            _rowBridge = Row(_card, 140);
-            _rowProxy = Row(_card, 160);
+            // 「隧道」那行去掉了：现在只有一种模式（直连出口机的 SOCKS），
+            // SSH 隧道的界面入口和显示都已移除，见 Config.cs 的说明。
+
+            _rowBridge = Row(_card, 136);
+            _rowProxy = Row(_card, 156);
             // 第四行：TUN 状态。默认隐藏（只在设置里勾了全局接管时才显示），
             // 避免普通用户看到一行「未开启」以为是故障。
             _rowTun = Row(_card, 180);
@@ -1136,12 +1138,12 @@ namespace Ferry
             else if (!_hasNet)
             {
                 SetText(_lblBig, "无网络", Theme.Bad);
-                SetText(_lblDesc, "本机连不上网 —— 试试开启渡口。", Theme.Muted);
+                SetText(_lblDesc, "本机暂时连不上外网 —— 点「开始借网」借用出口主机。", Theme.Muted);
             }
             else
             {
                 SetText(_lblBig, "直连", Theme.Text);
-                SetText(_lblDesc, "正常使用本机网络。断网时点「开始借网」。", Theme.Muted);
+                SetText(_lblDesc, "正在用本机网络。需要时点「开始借网」借用出口主机。", Theme.Muted);
             }
 
             // 明细行
@@ -1150,15 +1152,7 @@ namespace Ferry
             // 踩过的坑：直连模式压根不建 SSH 隧道（_tunnel 是 null），
             // 而旧逻辑只要 tunnelUp=false 又 runtimeUp=true 就显示「重连中…」——
             // 用户看到永远在重连，以为坏了，其实一切正常，只是不需要隧道。
-            if (_cfg.DirectSocks)
-            {
-                SetText(_rowTunnel, "隧道        直连模式（不走 SSH）", Theme.Muted);
-            }
-            else
-            {
-                SetText(_rowTunnel, "隧道        " + (tunnelUp ? "已连接（端口 " + socksPort + "）"
-                        : (runtimeUp ? "重连中…" : "未连接")), tunnelUp ? Theme.Text : Theme.Muted);
-            }
+            // 「隧道」行已移除（只剩直连模式）。
 
             SetText(_rowBridge, "本地代理    " + (bridgeUp ? "运行中（端口 " + httpPort + "）" : "未运行"),
                     bridgeUp ? Theme.Text : Theme.Muted);

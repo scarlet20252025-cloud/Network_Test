@@ -1252,8 +1252,8 @@ def download_page(detected_ip=''):
   <div class="dl-hero">
     <div class="dl-hero-l">
       <h1>下载渡口客户端</h1>
-      <p>内网里某台机器出不去时，借一台能出网的主机做应急出口。<br>
-         装一次，之后点一下就能接通 &mdash;&mdash; 不用改任何网络配置。</p>
+      <p>断网了、手上的活还没做完 &mdash;&mdash; 借一台能出网的主机做应急出口。<br>
+         装一次，之后点一下就能接通，不用改任何网络配置。</p>
       <div class="dl-actions">
         <a class="btn btn-main" href="/download-cmd">&#9889; 一键安装</a>
         <a class="btn btn-ghost" href="/download">直接下载 .exe</a>
@@ -1451,11 +1451,11 @@ def landing_page(online_now=0):
 
 <div class="hero">
   <div class="badge">Phase 2 &#183; 稳定版</div>
-  <h1>内网里有机器出不去？<br><span class="g">借一台能上网的主机做出口</span></h1>
+  <h1>网断了，手上的活还没完？<br><span class="g">借一台能出网的主机顶一下</span></h1>
   <p class="tag">
-    账号外网权限受限、校园网临时故障、机房只开了一台机器 &mdash;&mdash;
-    只要局域网还通，就能借一台能出网的主机做应急出口：装一次，
-    点一下接通，不用改任何网络配置。
+    作业还没交、代码还没推、资料查到一半 &mdash;&mdash; 断网偏偏都挑这种时候。
+    只要局域网还通，就能借一台能出网的主机做应急出口：装一次，点一下接通，
+    把眼前的事先做完，不用等网络恢复。
   </p>
   <div class="cta">
     <a class="btn btn-main" href="/download-page">前往下载</a>
@@ -1469,16 +1469,17 @@ def landing_page(online_now=0):
 </div>
 
 <div class="sec">
-  <div class="ph"><i></i><h2>这些时候最有用</h2></div>
-  <p class="pd">不是日常必备，是「刚好卡住」的那一下 &mdash;&mdash; 三个最常见的场景。</p>
+  <div class="ph"><i></i><h2>这些时候救急</h2></div>
+  <p class="pd">不是日常必备，是「事情做到一半」的那一下 &mdash;&mdash; 三个最常见的场景。</p>
 </div>
 
 <div class="fgrid">
   <div class="fcard scc">
     <div class="ico">&#9203;</div>
-    <h3>临时出不去，急着用网</h3>
-    <p>账号权限到期、网络临时故障、宿舍网线还没通 &mdash;&mdash; 偏偏要交作业、查资料、赶论文。
-       先借一台能出网的主机顶过去：装一次，之后每次点一下就好，也不用抱着电脑到处找热点。</p>
+    <h3>断网了，事情还没做完</h3>
+    <p>作业要交、代码要推、论文查到一半 &mdash;&mdash; 偏偏这时候断网。
+       先借一台能出网的主机把眼前的事做完：装一次，之后每次点一下就好，
+       不用等网络恢复，也不用抱着电脑到处找热点。</p>
     <span class="tg">&#9679; 一分钟接上</span>
   </div>
   <div class="fcard scc">
@@ -1505,8 +1506,8 @@ def landing_page(online_now=0):
 <div class="fgrid">
   <div class="fcard">
     <div class="ico">&#8646;</div>
-    <h3>断网时仍能上网</h3>
-    <p>删掉默认路由模拟断网后，直连全部失败，经渡口访问 github / 百度 / b 站 全部正常。实测 20 秒采样 4/4。</p>
+    <h3>断网期间照常工作</h3>
+    <p>把默认路由删掉模拟彻底断网后，直连全部失败，经渡口访问常用站点全部正常。实测 20 秒采样 4/4。</p>
     <span class="tg">&#9679; 已验证</span>
   </div>
   <div class="fcard">
@@ -1602,7 +1603,7 @@ def landing_page(online_now=0):
        速度上限由服务端按 IP 下发，改本地配置绕不过去。</div>
   </details>
   <details>
-    <summary>出口那台机器关机 / 断网了怎么办？</summary>
+    <summary>作为出口的那台主机关机 / 断网了怎么办？</summary>
     <div class="ans">借网就断了 &mdash;&mdash; 它是整条链路的关键，这一点没办法绕。客户端会检测到并提示，
        点「停止并恢复直连」就能回到本地网络。想长期稳定，出口机最好设成开机自启、别随手关机。</div>
   </details>
