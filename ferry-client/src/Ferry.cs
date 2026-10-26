@@ -44,6 +44,22 @@ namespace Ferry
             catch (Exception) { return false; }
         }
 
+        /// <summary>系统代理是否用的是「自动配置脚本」(PAC)。Clash / 部分加速器会用这种模式，
+        /// 这时 ProxyServer 是空的 —— 只查 ProxyServer 会误判成「没人占用系统代理」。</summary>
+        public static string ProxyAutoConfig()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(RegPath))
+                {
+                    if (k == null) return "";
+                    var v = k.GetValue("AutoConfigURL");
+                    return v == null ? "" : Convert.ToString(v);
+                }
+            }
+            catch (Exception) { return ""; }
+        }
+
         public static string ProxyServer()
         {
             try

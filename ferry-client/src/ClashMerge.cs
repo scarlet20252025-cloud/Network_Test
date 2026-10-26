@@ -82,9 +82,34 @@ namespace Ferry
             catch (Exception) { return 0; }
         }
 
+        static bool Listening(int port)
+        {
+            try
+            {
+                using (var c = new System.Net.Sockets.TcpClient())
+                {
+                    var t = c.ConnectAsync(System.Net.IPAddress.Loopback, port);
+                    return t.Wait(80) && c.Connected;   // 别在 UI 线程上等太久：最多 6×80ms
+                }
+            }
+            catch (Exception) { return false; }
+        }
+
+        /// <summary>
+        /// 实际在监听的端口。配置里写的是 10800，但被别的程序占用时客户端会往后顺延，
+        /// 那时把 10800 写进 Clash 就是个死端口 —— 所以先探一下谁真的在听。
+        /// </summary>
+        public static int DetectPort(int preferred)
+        {
+            for (int p = preferred; p < preferred + 6; p++)
+                if (Listening(p)) return p;
+            return preferred;   // 一个都没在听（还没开始借网）就用配置值
+        }
+
         /// <summary>写入 / 更新节点、组、规则。返回给用户看的说明。</summary>
         public static string Install(int socksPort)
         {
+            socksPort = DetectPort(socksPort);
             var f = MergePath();
             if (f == null) return ManualHelp(socksPort);
 

@@ -38,6 +38,12 @@ namespace Ferry
         long _connTotal, _connActive, _bytesUp, _bytesDown;
         long _connRejected;
 
+        /// <summary>同时存在的 UDP 关联数。每条关联要 2 个线程 + 2 个 socket，
+        /// 不设上限的话一个坏掉的客户端（反复重连不停）能把线程刷爆。
+        /// 32 条足够覆盖「游戏 + 语音 + 几个 P2P」的并发。</summary>
+        int _udpAssoc;
+        const int MaxUdpAssoc = 32;
+
         /// <summary>
         /// 同时处理的连接上限。
         ///
@@ -272,6 +278,19 @@ namespace Ferry
         ///   ② 客户端 TCP 控制连接一断就回收（RFC 要求，也防止崩溃后中继一直挂着）。
         /// </summary>
         void StartUdpAssociate(NetworkStream ns, IPEndPoint clientEp)
+        {
+            if (Interlocked.Increment(ref _udpAssoc) > MaxUdpAssoc)
+            {
+                Interlocked.Decrement(ref _udpAssoc);
+                _log("UDP 关联数已达上限 " + MaxUdpAssoc + "，拒绝新关联（" + clientEp + "）");
+                ReplySocks5(ns, 0x07);
+                return;
+            }
+            try { UdpAssociateCore(ns, clientEp); }
+            finally { Interlocked.Decrement(ref _udpAssoc); }
+        }
+
+        void UdpAssociateCore(NetworkStream ns, IPEndPoint clientEp)
         {
             Socket upCtrl = null, clientSock = null, remoteSock = null;
             try

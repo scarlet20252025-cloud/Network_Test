@@ -550,19 +550,26 @@ namespace Ferry
         // 用户在自己的 Clash 里把 127.0.0.1:<socks> 加成一个 SOCKS5 节点即可。
         bool _nodeMode = false;
         bool _weSetProxy = false;
+        int _proxyFixTimes = 0;   // 「纠正系统代理」的次数上限，防和别的代理软件死循环
 
         /// <summary>系统代理是否已被别的程序（Clash / 加速器）占着。</summary>
         bool OtherProxyActive()
         {
             try
             {
+                // PAC 模式：Clash / 部分加速器用「自动配置脚本」而不是固定端口。
+                // 这时 ProxyServer 是空的，只看它就会误判成「没人占」，然后把用户的
+                // PAC 覆盖掉，规则全失效。所以见到 PAC 就当「被别人占着」。
+                if (!string.IsNullOrEmpty(FerryCore.ProxyAutoConfig())) return true;
+
                 if (!FerryCore.ProxyEnabled()) return false;
                 var srv = FerryCore.ProxyServer();
                 if (string.IsNullOrEmpty(srv)) return false;
-                var ours = "127.0.0.1:" + _cfg.HttpPort;
-                var ours2 = "127.0.0.1:" + _cfg.SocksPort;
-                if (srv.IndexOf(ours, StringComparison.OrdinalIgnoreCase) >= 0) return false;
-                if (srv.IndexOf(ours2, StringComparison.OrdinalIgnoreCase) >= 0) return false;
+
+                // 是不是我们上次设的？端口可能因为被占用而顺延过（FindFree 往后找 40 个），
+                // 所以按范围判断，不能只比 SocksPort / HttpPort 两个值。
+                for (int p = _cfg.SocksPort; p < _cfg.SocksPort + 40; p++)
+                    if (srv.IndexOf("127.0.0.1:" + p, StringComparison.OrdinalIgnoreCase) >= 0) return false;
                 return true;
             }
             catch (Exception) { return false; }
@@ -789,6 +796,7 @@ namespace Ferry
 
             // 每次启动都重新判断：用户可能刚开了 Clash，也可能刚关掉。
             _nodeMode = OtherProxyActive();
+            _proxyFixTimes = 0;
             if (_nodeMode)
                 Log("检测到系统代理已被其他程序占用 → 只提供 SOCKS 端口，不去抢（节点模式）");
 
@@ -1179,10 +1187,24 @@ namespace Ferry
             if (!_nodeMode && _weSetProxy && runtimeUp && proxyOn && bridgeUp &&
                 proxySrv != borrowServer && proxySrv.StartsWith("http://127.0.0.1:"))
             {
-                try { FerryCore.SetProxy(true, borrowServer); } catch (Exception) { }
-                Log("系统代理指错了地方 " + proxySrv + " → " + borrowServer + "，已纠正");
-                proxySrv = borrowServer;
-                borrowing = true;
+                // 限次：如果用户中途开了 Clash/加速器，两边会每秒互相改回来（死循环）。
+                // 纠正 3 次还被人改走，就说明这局不归我们管 —— 让出位置，切成节点模式。
+                if (_proxyFixTimes < 3)
+                {
+                    _proxyFixTimes++;
+                    try { FerryCore.SetProxy(true, borrowServer); } catch (Exception) { }
+                    Log("系统代理指错了地方 " + proxySrv + " → " + borrowServer + "，已纠正");
+                    proxySrv = borrowServer;
+                    borrowing = true;
+                }
+                else if (_proxyFixTimes == 3)
+                {
+                    _proxyFixTimes++;
+                    _nodeMode = true;
+                    Log("系统代理被反复改走 —— 已停止纠错并转为节点模式。" +
+                        "你可能开着 Clash/加速器，它才是系统代理的主人；" +
+                        "需要走渡口出口的话，在它里面加 SOCKS5 127.0.0.1:" + socksPort + "。");
+                }
             }
 
             // 激活区
