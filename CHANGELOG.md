@@ -1,3 +1,82 @@
+## v0.14.20 — 2026-10-27
+
+> 客户端 1.0.23：**域名判定不再依赖 DNS** —— 修掉「转来转去」。
+
+### 现象
+
+1.0.22 的日志（用户截图）：
+
+```
+20:23:39 国内目标连不上，改走本机代理：114.28.148.16
+20:23:49 国内目标连不上，改走本机代理：223.6.6.6
+20:24:12 本机代理连不上，改走渡口：gateway.ooz.cn
+20:24:13 本机代理连不上，改走渡口：m701.music.126.net
+20:25:18 国内目标连不上，改走本机代理：223.5.5.5
+```
+
+两类错判，方向相反：
+
+- **纯国内域名被判境外**（`m701.music.126.net` 是网易云音乐的 CDN）→ 交给
+  Clash → Clash 连不上 → 回退渡口；
+- **DNS 服务器的 IP 被判国内**（223.5.5.5 / 223.6.6.6 / 114.x）→ 走渡口 →
+  远端连不上 53 端口 → 回退 Clash。
+
+另一个可见的副作用：出口 IP 显示成了 `116.23.158.149`（电信），而真实借网
+出口是 `218.107.0.47`（联通）—— 因为出口探测用的 `myip.ipip.net` 也被判成
+境外，交给 Clash 了。
+
+### 根因：这个假设在 TUN 下不成立
+
+1.0.22 的修法是「过滤 fake-ip，再用 223.5.5.5 重新解析」。但：
+
+```
+TUN 的 dns-hijack: any:53
+  → 客户端自己发的 DNS 查询（UDP 到 223.5.5.5）也被 mihomo 接管
+  → 回来的还是 198.18.x.x（fake-ip）
+  → 过滤掉 → 空 → 判「境外」
+```
+
+**只要 TUN 劫持着 53 端口，「本地解析出真实 IP」这件事就永远做不到。**
+所以无论怎么调 ResolveLocal，域名判定都会全军覆没。
+
+### 修法：域名按域名判
+
+| 目标 | 怎么判 |
+|---|---|
+| IP 字面量 | 查 APNIC 段表（准确，不需要解析） |
+| 域名 | 查内置的国内域名后缀表（`.cn` + 常见国内站点/CDN） |
+
+纯字符串比较，微秒级，不碰 DNS，不受 TUN 影响。
+
+判错的代价不对称，所以表只收「确定是国内」的：
+
+- 国内域名判成境外 → 交给用户的 Clash，它的 GEOIP 规则会走直连，**能通**，多一跳；
+- 境外域名判成国内 → 走渡口出口，**必然打不开**。
+
+### 顺带
+
+`ipip.net` / `3322.net` / `ip138.com` 加进白名单 —— 出口探测用的是
+`myip.ipip.net`，它被判境外时，界面上显示的就不是借网出口，而是用户自己
+Clash 的出口（这次就显示成了电信）。
+
+### 验证
+
+```
+PASS  m701.music.126.net is domestic
+PASS  m801.music.126.net is domestic
+PASS  gateway.ooz.cn is domestic
+PASS  music.163.com is domestic
+PASS  www.baidu.com is domestic
+PASS  api.weixin.qq.com is domestic
+PASS  www.google.com is foreign
+PASS  github.com is foreign
+PASS  encrypted-tbn0.gstatic.com is foreign
+PASS  notbaidu.com is NOT domestic (no dot boundary)
+PASS  baidu.com.evil.com does not match
+PASS  fake-ip is foreign
+ALL PASS
+```
+
 ## v0.14.19 — 2026-10-27
 
 > 客户端 1.0.22：**修 1.0.21 引入的「全网变慢」**（国内也慢）。

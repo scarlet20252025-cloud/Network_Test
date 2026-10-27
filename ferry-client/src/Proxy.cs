@@ -620,20 +620,80 @@ namespace Ferry
             IPAddress ip;
             if (IPAddress.TryParse(host, out ip))
             {
-                // fake-ip 只是个占位符，不含地理信息。把它当国内等于把所有域名
-                // 都送去渡口；当境外也只是多绕一跳。选后者。
+                // fake-ip 只是占位符，不含地理信息。当国内等于把所有域名送去
+                // 渡口（那是 1.0.21 的「全网变慢」），所以一律当境外。
                 if (IsFakeIp(ip)) return false;
                 return CnIpRanges.Contains(ip);
             }
 
-            var addrs = ResolveLocal(host);
-            if (addrs == null || addrs.Count == 0)
-                return false;    // 解析不出来 → 当境外（交给用户的代理）
+            return IsDomesticDomain(host);
+        }
 
-            foreach (var a in addrs)
-                if (CnIpRanges.Contains(a)) return true;
+        /// <summary>
+        /// 域名是不是国内站点 —— **只查后缀表，不做 DNS 解析**。
+        ///
+        /// 为什么不能解析：TUN 开着 `dns-hijack: any:53`，客户端自己发的 DNS
+        /// 查询（不管问系统 DNS 还是直接问 223.5.5.5）也会被 mihomo 接管，
+        /// 回来的永远是 fake-ip。所以「本地解析出真实 IP 再判断」在 TUN 模式下
+        /// **根本不可能成功**，只会把所有域名都判成境外，然后
+        /// Clash 连不上 → 回退渡口 → 再超时一次，日志里就是「转来转去」。
+        ///
+        /// 判错的代价不对称（见文件头），所以这张表只收「确定是国内」的。
+        /// </summary>
+        static bool IsDomesticDomain(string host)
+        {
+            string h = host.ToLowerInvariant();
+            if (h.EndsWith(".cn") || h == "cn") return true;
+
+            foreach (var d in CnDomains)
+            {
+                if (h.Length < d.Length) continue;
+                if (h == d) return true;
+                if (h.EndsWith(d, StringComparison.Ordinal) &&
+                    h[h.Length - d.Length - 1] == '.')
+                    return true;
+            }
             return false;
         }
+
+        /// <summary>
+        /// 国内的常见域名后缀。加新条目的标准：**去掉它会有大量用户访问不到**。
+        /// 宁可漏（漏了只是多绕一跳 Clash），也不要错收（错了直接打不开）。
+        /// </summary>
+        static readonly string[] CnDomains = new string[]
+        {
+            // 头部互联网
+            "baidu.com", "bdstatic.com", "bdimg.com", "bdurl.net",
+            "qq.com", "gtimg.com", "qpic.cn", "qlogo.cn", "tencent.com",
+            "weixin.com", "qcloud.com", "myqcloud.com", "tencentcloudapi.com",
+            "taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "aliyuncs.com",
+            "alipay.com", "aliyuncs.net", "taobaocdn.com",
+            "jd.com", "360buyimg.com", "3.cn",
+            "bilibili.com", "hdslb.com", "biliapi.net", "bilivideo.com",
+            "163.com", "126.net", "127.net", "netease.com", "126.com",
+            "music.163.com", "youdao.com",
+            "sohu.com", "sina.com", "sina.cn", "weibo.com", "weibo.cn",
+            "zhihu.com", "zhimg.com", "csdn.net", "gitee.com", "cnblogs.com",
+            "360.cn", "360safe.com", "qhimg.com", "qihoo.com",
+            "xiaomi.com", "mi.com", "miui.com", "huawei.com", "hicloud.com",
+            "douyin.com", "bytedance.com", "toutiao.com", "pstatp.com",
+            "ixigua.com", "snssdk.com", "byteimg.com",
+            "iqiyi.com", "youku.com", "douban.com", "doubanio.com",
+            "meituan.com", "dianping.com", "ctrip.com", "12306.cn",
+            "ele.me", "alibaba.com", "1688.com", "alimama.com",
+            "kuaishou.com", "kwaicdn.com", "yximgs.com",
+            "xunlei.com", "pconline.com.cn", "zol.com.cn",
+            "lagou.com", "zhipin.com", "58.com", "ganji.com",
+            "autohome.com.cn", "dongchedi.com", "mafengwo.cn",
+            "cnzz.com", "umeng.com", "jomodns.com", "tanzhen.com",
+            // 出口探测用的就是 myip.ipip.net —— 它在白名单里，探测才会走渡口，
+            // 显示出来的才是真实的借网出口（否则会显示成用户自己 Clash 的出口）。
+            "ipip.net", "3322.net", "ip138.com",
+            // 开发者/工具
+            "aliyuncdn.com", "getui.com", "growingio.com",
+            "umengcloud.com", "dcore.org.cn",
+        };
+
 
         /// <summary>
         /// 这是不是 mihomo / Clash 的 fake-ip 地址（198.18.0.0/15）？
