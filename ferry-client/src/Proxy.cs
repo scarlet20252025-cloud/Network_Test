@@ -560,9 +560,22 @@ namespace Ferry
         /// 代理挂掉时如果每条都写一行日志，日志文件几分钟就几 MB，真正的错误反而
         /// 被冲掉了。去重之后「某个目标一直走不通」这件事仍然看得见。
         /// </summary>
+        static string RootDomain(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return host;
+            int dot = host.LastIndexOf('.');
+            if (dot <= 0) return host;
+            int prev = host.LastIndexOf('.', dot - 1);
+            if (prev < 0) return host;
+            return host.Substring(prev + 1);
+        }
+
         void LogOnce(string what, string key)
         {
-            string id = what + "|" + key;
+            // 按一级域名去重：一次开几十个页面时，同一类问题会以几十个不同
+            // 子域名的形式出现（img1.cdn.example.com / img2.cdn.example.com…），
+            // 按完整 host 去重等于没去重，表刷满 500 条后又从头开始刷屏。
+            string id = what + "|" + RootDomain(key);
             lock (_loggedOnce)
             {
                 if (_loggedOnce.Contains(id)) return;
@@ -585,17 +598,17 @@ namespace Ferry
             IPAddress ip;
             if (IPAddress.TryParse(host, out ip))
             {
-                // 已经是 fake-ip 了：绝对不能传给上游 —— 那是 mihomo 内部编号，
-                // 远端拿到它只会连到一个不存在的地址。
-                return IsFakeIp(ip) ? host : host;
+                // 已经是 IP 了，原样返回。
+                // （fake-ip 也是 IP —— 但调用方传进来的 host 如果是 fake-ip，
+                //  说明上游没还原域名，这种情况只能原样交给上游处理。）
+                return host;
             }
 
+            // ResolveLocal 内部已经滤掉 fake-ip 了，所以这里拿到的要么是真实
+            // 地址，要么是空。注意 TUN 模式下**永远是空**（DNS 被 hijack），
+            // 于是退回域名 —— 这正是我们想要的：让远端或 Clash 自己解析。
             var addrs = ResolveLocal(host);
             if (addrs == null || addrs.Count == 0) return host;
-
-            // 解析出来是 fake-ip 就保留域名，让上游（或 TUN 那层）自己解析
-            foreach (var a in addrs)
-                if (IsFakeIp(a)) return host;
 
             return addrs[0].ToString();
         }
@@ -645,21 +658,23 @@ namespace Ferry
             string h = host.ToLowerInvariant();
             if (h.EndsWith(".cn") || h == "cn") return true;
 
-            foreach (var d in CnDomains)
+            // 从左往右剥标签，每剥一次查一次表：
+            //   m701.music.126.net → music.126.net → 126.net（命中）
+            //   baidu.com → 一次就命中
+            // 比线性扫 130 条 EndsWith 快得多，而且「点的边界」天然正确
+            // （notbaidu.com 剥出来是 com，不会误命中 baidu.com）。
+            string probe = h;
+            for (int guard = 0; guard < 8; guard++)
             {
-                if (h.Length < d.Length) continue;
-                if (h == d) return true;
-                if (h.EndsWith(d, StringComparison.Ordinal) &&
-                    h[h.Length - d.Length - 1] == '.')
-                    return true;
+                if (_cnDomainSet.Contains(probe)) return true;
+                int dot = probe.IndexOf('.');
+                if (dot < 0) break;
+                probe = probe.Substring(dot + 1);
             }
             return false;
         }
 
-        /// <summary>
-        /// 国内的常见域名后缀。加新条目的标准：**去掉它会有大量用户访问不到**。
-        /// 宁可漏（漏了只是多绕一跳 Clash），也不要错收（错了直接打不开）。
-        /// </summary>
+        /// <summary>白名单的哈希版本。启动时建一次，之后每个连接只查 1~3 次。</summary>
         static readonly string[] CnDomains = new string[]
         {
             // 头部互联网
@@ -692,7 +707,35 @@ namespace Ferry
             // 开发者/工具
             "aliyuncdn.com", "getui.com", "growingio.com",
             "umengcloud.com", "dcore.org.cn",
+            // 云存储 / CDN（用户实际会遇到，漏了就是「图片加载慢」）
+            "ksyun.com", "ksyuncs.com", "myqcloud.com", "cos.ap-guangzhou.myqcloud.com",
+            "aliyuncs.com", "oss-cn-hangzhou.aliyuncs.com", "bcebos.com",
+            "bytecdntp.com", "douyinvod.com", "ixiguavideo.com", "pstatp.com",
+            "qhres.com", "qhmsg.com", "360pany.com",
+            // 更多日常站点
+            "pinduoduo.com", "yangkeduo.com", "xiaohongshu.com", "xhscdn.com",
+            "kuaishou.com", "kwai.com", "didiglobal.com", "xiaojukeji.com",
+            "wps.cn", "wps.com", "kdocs.com", "youdao.com", "xunlei.com",
+            "mail.qq.com", "foxmail.com", "dingtalk.com", "feishu.cn",
+            "larksuite.com", "yuque.com", "jianshu.com", "segmentfault.com",
+            "oschina.net", "51cto.com", "runoob.com", "w3school.com.cn",
+            "tencentgames.com", "game.qq.com", "wegame.com", "smoba.com",
+            "kingsoft.com", "cmcm.com", "cheetahmobile.com",
         };
+
+        static readonly HashSet<string> _cnDomainSet = BuildCnDomainSet();
+
+        static HashSet<string> BuildCnDomainSet()
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var d in CnDomains) set.Add(d);
+            return set;
+        }
+
+        /// <summary>
+        /// 国内的常见域名后缀。加新条目的标准：**去掉它会有大量用户访问不到**。
+        /// 宁可漏（漏了只是多绕一跳 Clash），也不要错收（错了直接打不开）。
+        /// </summary>
 
 
         /// <summary>

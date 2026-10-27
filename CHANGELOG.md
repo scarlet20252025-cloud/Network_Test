@@ -1,3 +1,75 @@
+## v0.14.21 — 2026-10-27
+
+> 客户端 1.0.24：分流的收尾优化 + 两处真 bug。新增 `docs/分流架构.md`。
+
+### 一、新增技术文档 `docs/分流架构.md`
+
+分流这块前后错了五次，每次错的方式都不一样，但**都没有留下「为什么这么设计」的
+完整记录**，导致下一个版本很容易又改回去。补一份：
+
+- 三层结构图（TUN / 本地代理 / 上游），各层只做什么、不做什么
+- 判定真相表（IP / fake-ip / 域名 / IPv6 各按什么判）
+- **三条硬约束**：TUN 下拿不到真实 DNS、必须 PROCESS-NAME 防环、分流只能做一次
+- 六次尝试的演进史（每版当时的逻辑「看起来都对」）
+- 判错代价对照表（为什么一律往「境外」错）
+- 怎么验证、要跑哪些脚本
+
+AGENTS.md 的文档索引和「五条硬规则」都已经指向它。
+
+### 二、两个真 bug
+
+**① 静态字段初始化顺序**（我在 1.0.24 自己引入的）
+
+```csharp
+static readonly HashSet<string> _cnDomainSet = BuildCnDomainSet();  // 先
+static readonly string[] CnDomains = new string[] { ... };           // 后
+```
+
+C# 静态字段按**声明顺序**初始化，`BuildCnDomainSet()` 执行时 `CnDomains`
+还是 null → 类型初始化抛异常。已经把数组挪到前面。
+（这个坑在项目里记过一次 —— 静态字段顺序。）
+
+**② 后缀匹配漏掉了完整域名**
+
+第一版写成「只查最后一个点之后的部分」：
+
+```csharp
+int dot = h.LastIndexOf('.');
+while (dot > 0) { if (set.Contains(h.Substring(dot + 1))) ... }
+```
+
+`baidu.com` 只会去查 `com`，**永远匹配不到 `baidu.com`**。
+改成从左往右剥标签、每剥一次查一次表：
+
+```
+m701.music.126.net → music.126.net → 126.net（命中）
+baidu.com          → 一次就命中
+```
+
+测试里那条 `PASS uppercase matches` 抓出来的 —— 如果没有那条断言，
+这个 bug 会表现为「所有 .com 的国内站都判境外」。
+
+### 三、优化
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| 白名单匹配 | 每条连接线性扫 130 条 `EndsWith` | 哈希表，最多 8 次查找 |
+| `LogOnce` 去重键 | 完整 host（`img1.a.com` / `img2.a.com` 各算一条，表刷满 500 就清空重刷） | 一级域名（`a.com`），同类问题只记一次 |
+| `PreferIp` | 有个同值三元 `IsFakeIp(ip) ? host : host` + 一段死循环 | 清理，注释写清楚「TUN 下必然退回域名」 |
+| 白名单条目 | 约 90 条 | 约 130 条（补了金山云/抖音视频/腾讯云 COS/小红书/拼多多/滴滴/WPS/飞书等） |
+
+### 四、验证
+
+```
+域名判定（22 项）      ALL PASS
+fake-ip 与 TUN 规则    ALL PASS
+场景矩阵（5 场景）     ALL PASS
+生命周期（22 项）      ALL PASS
+```
+
+发版前把生成的 `tun-config.yaml` 交给 mihomo 自己校验：
+`test is successful`。
+
 ## v0.14.20 — 2026-10-27
 
 > 客户端 1.0.23：**域名判定不再依赖 DNS** —— 修掉「转来转去」。
