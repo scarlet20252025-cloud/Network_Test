@@ -810,10 +810,17 @@ namespace Ferry
             }
 
             // 每次启动都重新判断：用户可能刚开了 Clash，也可能刚关掉。
-            _nodeMode = !_forceTakeover && OtherProxyActive();
+            //
+            // 但「用户勾了全局模式」是更高优先级的意图 —— 那时必须接管系统代理，
+            // 否则浏览器还指着 Clash，而 TUN 又把 Clash 的出站吞掉，两边都不通。
+            // TUN 模式下接管系统代理不叫「抢」：停止时会原样还原。
+            bool globalWanted = _cfg.UseTun && Elevator.IsAdmin();
+            _nodeMode = !_forceTakeover && !globalWanted && OtherProxyActive();
             _proxyFixTimes = 0;
             if (_nodeMode)
                 Log("系统代理已由其它程序管理，本次不接管（只提供本地端口）");
+            else if (globalWanted && OtherProxyActive())
+                Log("全局模式：接管系统代理（原设置已备份，停止时会还原）");
 
             SetBusy(true);
             Log("启动隧道与代理…");
@@ -823,8 +830,9 @@ namespace Ferry
                 // 节点模式不分流：用户已经把渡口当节点加进自己的 Clash 了，
                 // 再把境外流量送回 Clash 会成环（Clash → 渡口 → Clash）。
                 rt.AllowSplit = !_nodeMode;
-                // 节点模式也不启用 TUN：两个都想「接管全部流量」会打架。
-                rt.AllowTun = !_nodeMode;
+                // TUN 能不能开，只看「有没有别的 TUN 在抢路由」，
+                // 和系统代理归谁无关（那是两个层面的东西）。
+                rt.AllowTun = true;
                 var err = rt.Start();
                 string exitIp = "";
                 if (err.Length == 0)
@@ -861,6 +869,10 @@ namespace Ferry
                                 " / HTTP " + _rt.HttpPort);
                         else
                             Log("系统代理已切到 " + _rt.BorrowServer);
+                        if (_rt.TunRunning)
+                            Log("全局转发已生效：所有程序（含游戏 / UDP）都走渡口");
+                        else if (_rt.TunSkipped)
+                            Log("全局转发未启用：" + _rt.TunSkipReason);
                         if (exitIp.Length > 0) { _exitVia = exitIp; Log("出口 IP：" + exitIp); }
                         else Log("出口探测失败（不影响使用，可能是远端暂时不通）");
                         SaveLastState(true);      // 下次启动/更新/开机自启要回到借网
@@ -1394,6 +1406,7 @@ namespace Ferry
                 // 否则「被主动跳过」会一直显示成「正在启用…」（永远卡住）。
                 var terr = rt != null ? rt.TunError : "";
                 bool skipped = rt != null && rt.TunSkipped;
+                var why = rt != null ? rt.TunSkipReason : "";
                 if (!string.IsNullOrEmpty(terr))
                 {
                     _rowTun.Text = "全局模式    启用失败：" + terr;
@@ -1401,8 +1414,8 @@ namespace Ferry
                 }
                 else if (skipped)
                 {
-                    _rowTun.Text = "全局模式    未接管（系统代理归其它程序）";
-                    _rowTun.Foreground = Palette.MutedB;
+                    _rowTun.Text = "全局模式    未启用：" + why;
+                    _rowTun.Foreground = Palette.WarnB;
                 }
                 else
                 {

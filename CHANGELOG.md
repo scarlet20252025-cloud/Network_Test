@@ -1,3 +1,98 @@
+## v0.14.16 — 2026-10-27
+
+> 客户端 1.0.19：**全局模式真正能开了**。之前它被「系统代理归谁管」这件事挡着，
+> 等于把核心功能废掉了。
+
+### 我错在哪
+
+用户原话：
+
+> 我需要渡口做借网，方便断网的时候使用完整的功能，全局转发才能实现这一点，
+> 你把它交给代理软件管理，我这里完全判断不了全局是否生效。
+
+1.0.9 起我引入了一个 `_nodeMode`：检测到系统代理被 Clash 占着，就退让成
+「只提供本地端口」，并且顺手把 TUN 也禁了：
+
+```csharp
+_nodeMode = OtherProxyActive();   // Clash 占着系统代理 → 节点模式
+rt.AllowTun = !_nodeMode;         // 节点模式 → 不许开 TUN
+```
+
+结果是：**只要用户开着 Clash，渡口就永远不能全局接管**。
+界面就一直停在「全局模式 正在启用…」。
+
+**错在把两个不同层面的东西绑在一起**：
+
+| | 管什么 | 冲突对象 |
+|---|---|---|
+| 系统代理 | 应用层，只有认代理的程序走 | 另一个也写系统代理的程序（Clash / 加速器） |
+| TUN | 网卡层，抢默认路由，所有程序都走 | 另一个也在抢默认路由的 TUN |
+
+Clash 只开系统代理（`tun.enable: false`）时，和渡口的 TUN **完全不冲突**。
+我却把「系统代理被占」当成了「不能开 TUN」。
+
+### 现在的行为
+
+**全局模式（勾了就是最高优先级）**：
+
+```
+用户勾了全局模式 + 是管理员
+  → 不管系统代理归谁，都接管（原值备份，停止时还原）
+  → 开 TUN（除非检测到另一个 TUN 真的在抢默认路由）
+  → 所有程序（浏览器 / 游戏 / UDP / 不认代理的软件）都走渡口
+```
+
+**普通借网（没勾全局模式）**：维持原样 —— 系统代理被占就退让成节点模式。
+
+### 另外一个关键修正：怎么判断「别的 TUN 在抢路由」
+
+第一版按网卡名字判（带 `tunnel` 就算），测试机上一跑就返回 `etgame`
+（游戏加速器的虚拟网卡）。但加速器通常只接管特定进程，**不抢默认路由** ——
+按名字判会把「开着加速器」误判成「不能开全局」，又变成卡住。
+
+改成问系统一个实在的问题：
+
+```csharp
+GetBestInterface(8.8.8.8)   // 去公网实际会走哪块网卡？
+```
+
+那块网卡是 TUN 类才拦；还是物理网卡就说明没被抢。测试机验证：
+`OtherTunAdapter() = (none)`（etgame 挂着但没抢默认路由，正确放过）。
+
+### 界面能明确看到状态了
+
+| 情况 | 显示 |
+|---|---|
+| TUN 真的在跑 | `全局模式 已开启（UDP / 游戏都走渡口）` |
+| 被另一个 TUN 挡住 | `全局模式 未启用：另一个 TUN 正在接管（xxx）` |
+| 启动失败 | `全局模式 启用失败：<具体原因>` |
+| 没勾 | `全局模式 未开启` |
+
+日志也会写清楚：`全局转发已生效：所有程序（含游戏 / UDP）都走渡口`。
+
+### 验证
+
+```
+PASS  AllowTun no longer bound to node mode
+PASS  AllowTun is unconditionally true
+PASS  global mode takes priority over node mode
+PASS  TunSkipReason exposed for UI
+PASS  runtime checks for other TUN
+PASS  old misleading message removed
+PASS  runtime starts with UseTun=true + AllowTun=false
+PASS  TUN did not start when disallowed
+PASS  TunSkipped is true
+PASS  skip reason is non-empty
+ALL PASS
+```
+
+生命周期 22 项 + 分流 5 项回归全过。
+
+### 关于火绒
+
+1.0.18 已经把 exe 从 325 KB 瘦回 152 KB（那段 54 KB 的 base64 是误判源头）。
+1.0.19 是 153 KB，和 1.0.12（151 KB，从没被报过）基本一致。
+
 ## v0.14.15 — 2026-10-27
 
 > 客户端 1.0.18：**修掉火绒误报**（exe 从 325KB 瘦回 152KB）+ 全局模式不再卡住。

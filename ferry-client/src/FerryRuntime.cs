@@ -90,20 +90,29 @@ namespace Ferry
         public bool AllowSplit = true;
 
         /// <summary>
-        /// 是否允许启用 TUN（全局接管）。
+        /// 是否允许启用 TUN（全局接管）。默认允许。
         ///
-        /// 节点模式下必须设成 false：节点模式的语义是「我只开一个端口，你把流量送过来」，
-        /// 而 TUN 是「我抢默认路由，所有流量归我」。两个同时启用会：
-        ///   ① 和用户本来开着的 Clash/加速器 TUN 抢路由，两边打架；
-        ///   ② 让「不接管系统代理」这句日志变成谎话，用户完全搞不清谁在管流量。
+        /// 这里**不再**由「系统代理是否被别人占用」决定 —— 那是两回事：
+        ///   · 系统代理是应用层的，只影响认代理的程序；
+        ///   · TUN 是网卡层的，抢的是默认路由。
+        /// Clash 只开系统代理（tun.enable: false）时，和渡口的 TUN 完全不冲突，
+        /// 之前的写法让「开着 Clash」= 「永远不能全局接管」，直接把核心功能废掉了。
+        ///
+        /// 真正的冲突只有一种：**别的 TUN 网卡也在抢路由**。
+        /// 那个由 TunMode.OtherTunAdapter() 检测，检测到就跳过并说明原因。
         /// </summary>
         public bool AllowTun = true;
+
+        /// <summary>被跳过时的原因（给界面显示用）。</summary>
+        public string TunSkipReason { get { return _tunSkipReason; } }
+        string _tunSkipReason = "";
 
         public string Start()
         {
             if (_running) return "";
 
             _tunSkipped = false;
+            _tunSkipReason = "";
             _tunError = "";
 
             // SOCKS 和 HTTP 要连续两个空闲端口。先找 SOCKS，再找 HTTP（跳过刚占的）。
@@ -227,7 +236,17 @@ namespace Ferry
             if (_cfg.UseTun && !AllowTun)
             {
                 _tunSkipped = true;
-                _log("全局接管未启用：系统代理已由其它程序管理，避免和它抢流量");
+                _tunSkipReason = "已被要求不启用";
+                _log("全局接管未启用：本次运行被要求不接管");
+            }
+            else if (_cfg.UseTun && TunMode.OtherTunAdapter() != null)
+            {
+                // 真正会打架的情况：另一个 TUN 也在抢默认路由
+                var other = TunMode.OtherTunAdapter();
+                _tunSkipped = true;
+                _tunSkipReason = "另一个 TUN 正在接管（" + other + "）";
+                _log("全局接管未启用：检测到 " + other +
+                     " 也在抢默认路由，两个 TUN 会互相覆盖。关掉它再点一次全局模式。");
             }
             else if (_cfg.UseTun)
             {

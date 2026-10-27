@@ -700,6 +700,58 @@ namespace Ferry
             return false;
         }
 
+        [System.Runtime.InteropServices.DllImport("iphlpapi.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        static extern int GetBestInterface(uint destAddr, out uint bestIfIndex);
+
+        /// <summary>
+        /// 找出「别的程序已经在抢默认路由」的 TUN 网卡，没有就返回 null。
+        ///
+        /// 为什么不能只看网卡名字：游戏加速器（etgame / UU / 迅游）都会建一块
+        /// tunnel 网卡，但它们通常只接管特定进程的流量，**不抢默认路由**。
+        /// 按名字判会把「开着加速器」误判成「不能开全局模式」—— 又变成
+        /// 「全局模式一直卡住」。
+        ///
+        /// 所以问系统一个实在的问题：**去公网（8.8.8.8）实际会走哪块网卡？**
+        /// 如果那块网卡是 TUN 类，说明默认路由真被抢了；还是物理网卡就说明没抢。
+        ///
+        /// 注意这里**不看系统代理**：系统代理是应用层的东西（只有认代理的程序走），
+        /// 和 TUN 不冲突。Clash 只开系统代理、不开 TUN 时，渡口完全可以开 TUN。
+        /// </summary>
+        public static string OtherTunAdapter()
+        {
+            try
+            {
+                // 8.8.8.8 只是个「随便一个公网地址」的占位，不会真发包
+                uint dest = BitConverter.ToUInt32(new byte[] { 8, 8, 8, 8 }, 0);
+                uint ifIndex;
+                if (GetBestInterface(dest, out ifIndex) != 0 || ifIndex == 0) return null;
+
+                foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                    if (ni.GetIPProperties() == null) continue;
+
+                    bool isDefault;
+                    try { isDefault = ni.GetIPProperties().GetIPv4Properties().Index == (int)ifIndex; }
+                    catch (Exception) { continue; }
+                    if (!isDefault) continue;
+
+                    var name = (ni.Name ?? "").ToLowerInvariant();
+                    var desc = (ni.Description ?? "").ToLowerInvariant();
+                    if (name.Contains("ferrytun")) return null;   // 就是我们自己
+
+                    bool looksTun =
+                        desc.Contains("wintun") || desc.Contains("tun ") ||
+                        desc.Contains("tap-windows") || desc.Contains("wireguard") ||
+                        desc.Contains("clash") || desc.Contains("mihomo") ||
+                        desc.Contains("sing-box") || name.Contains("wintun");
+                    return looksTun ? ni.Name : null;
+                }
+            }
+            catch (Exception) { }
+            return null;
+        }
+
         /// <summary>网卡是否以任何形式存在（含 Disabled）。清理残留时用这个判据。</summary>
         public static bool AdapterPresent(string name)
         {
