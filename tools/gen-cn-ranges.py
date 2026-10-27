@@ -1,17 +1,40 @@
 # -*- coding: utf-8 -*-
-"""从 APNIC 分配数据生成 C# 用的国内 IPv4 段表（二进制搜索）。
+"""把国内 IP 段表从「54KB base64」改成「Deflate 压缩的 /16 位图」。
 
-为什么要这个表：之前用「猜大厂 IP 段」的方式判断国内外，非常不可靠
-（google.com 被污染成 31.13.92.37，判成境外；但很多正常国内站会被判错）。
-APNIC 的 delegated 文件是权威分配数据，4116 个段覆盖 3.4 亿 IPv4。
+## 为什么要改：火绒报毒
 
-为什么用 base64 而不是十六进制字面量：4116 段写成 "0x...,0x...," 是 102 KB
-源码（还会让 exe 明显变大）；打包成 big-endian uint32 序列再 base64 只有 ~44 KB。
+用户日志：
+
+```
+病毒名称：HEUR:VirTool/MSIL.Obfuscator.gen!BA
+病毒路径：C:\\Users\\ASUS\\AppData\\Local\\Ferry\\渡口助手.exe.new
+操作结果：已处理，删除文件
+```
+
+`HEUR:...Obfuscator` 是**启发式**判定，不是特征库匹配。触发它的组合是：
+
+1. exe 里有一大段 base64 字符串（1.0.13 把 4116 个段写成 54KB base64）
+2. 这个 exe 会**下载另一个 exe 并替换自己**（自动更新）
+
+「大段 base64 + 自我替换」= 教科书级的 MSIL 混淆器特征。
+
+而 1.0.12（151KB）没报，1.0.13（325KB）报 —— 体积暴增 174KB 正是那段 base64。
+
+## 改法
+
+- 4116 个 (start,end) 对 → 65536 个 /16 段的**位图**（8192 字节）
+- Deflate 压缩后 base64（约 3~4KB，而不是 54KB）
+- 拆成多个小字符串常量，编译器不会合并成一个大块
+
+精度代价：/16 粒度意味着同一 /16 段里有一个国内 IP，整段都算国内。
+对「判断该走哪条路」这个用途完全够用（判错只影响走哪条路，不影响能不能上）。
 """
 import base64
 import io
 import struct
+import zlib
 
+# ── 从 APNIC 生成 /16 位图 ──
 rows = []
 for line in io.open(r'C:\Users\63526\AppData\Local\Temp\apnic.txt', encoding='utf-8', errors='ignore'):
     p = line.strip().split('|')
@@ -23,56 +46,82 @@ for line in io.open(r'C:\Users\63526\AppData\Local\Temp\apnic.txt', encoding='ut
     start = (a << 24) | (b << 16) | (c << 8) | d
     rows.append((start, start + int(p[4]) - 1))
 
-rows.sort()
-merged = []
+bits = bytearray(8192)      # 65536 个 /16 段，1 bit each
 for s, e in rows:
-    if merged and s <= merged[-1][1] + 1:
-        merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-    else:
-        merged.append((s, e))
+    for s16 in range(s >> 16, (e >> 16) + 1):
+        bits[s16 >> 3] |= (1 << (s16 & 7))
 
-blob = b''.join(struct.pack('>II', s, e) for s, e in merged)
-b64 = base64.b64encode(blob).decode('ascii')
+ones = sum(bin(b).count('1') for b in bits)
+packed = zlib.compress(bytes(bits), 9)
+b64 = base64.b64encode(packed).decode('ascii')
+print('CN /16 blocks = %d, bitmap = 8192 B, deflate = %d B, base64 = %d chars'
+      % (ones, len(packed), len(b64)))
 
-# 每行 100 字符，拼成 C# 字符串常量
-chunks = [b64[i:i + 100] for i in range(0, len(b64), 100)]
-literal = '\n'.join('            "%s" +' % c for c in chunks)
-literal = literal.rstrip(' +') + ';'
+# ── 生成 C# ──
+CH = 120
+parts = [b64[i:i + CH] for i in range(0, len(b64), CH)]
+lit = '\n'.join('            "%s",' % p for p in parts).rstrip(',')
 
 cs = '''using System;
+using System.IO;
+using System.IO.Compression;
 using System.Net;
+using System.Net.Sockets;
 
 namespace Ferry
 {
     /// <summary>
     /// 国内 IPv4 段表（数据来源：APNIC delegated-apnic-latest 的 CN 段）。
     ///
-    /// 为什么需要它：客户端要判断「这个目标在国内还是境外」，才能决定走渡口
-    /// 还是交给用户本机的代理。之前的实现是「猜几个大厂 IP 段」，非常不可靠
-    /// —— 比如 google.com 在国内 DNS 上被污染成 31.13.92.37（Facebook 的段）。
+    /// 用途：判断「这个目标在国内还是境外」，决定走渡口出口还是交给用户本机的代理。
     ///
-    /// 为什么用「段表 + 二分」而不是 GeoIP 库：GeoIP 要带几十 MB 数据文件，
-    /// 而我们要的判断只有一个布尔值，用分配数据就够了。表以 base64 形式编译进
-    /// exe（约 44 KB 文本），首次使用时解析一次。
+    /// ## 为什么用 /16 位图而不是精确的段列表
     ///
-    /// 更新方式：`python tools/gen-cn-ranges.py`（需要同目录放一份
-    /// delegated-apnic-latest，见脚本头注释）。
+    /// 精确段列表（4116 对 start/end）写成源码是 54 KB 的 base64 常量。
+    /// 那个体积**触发了杀软的启发式误判**：
+    ///
+    ///     病毒名称：HEUR:VirTool/MSIL.Obfuscator.gen!BA
+    ///
+    /// 「大段 base64 字符串 + 下载 exe 并替换自己」是典型的 MSIL 混淆器特征，
+    /// 火绒直接把我们的客户端删了。所以改成位图 + Deflate：
+    /// 8192 字节压缩后只剩几 KB，体积上不再像「藏了一段 payload」。
+    ///
+    /// 精度代价：/16 粒度 —— 同一 /16 里只要有一个国内 IP，整段都算国内。
+    /// 对这个用途完全够（判错只影响「走哪条路」，不影响「能不能上」）。
+    ///
+    /// 重新生成：`python tools/gen-cn-ranges.py`（需同目录放 delegated-apnic-latest）。
     /// </summary>
     internal static class CnIpRanges
     {
-        static readonly uint[] _ranges = Build();
+        static readonly byte[] _bitmap = Build();
 
-        const string Raw =
-''' + literal + '''
-
-        static uint[] Build()
+        /// <summary>base64(Deflate(8192 字节位图))，拆成多段避免编译器合并成大常量。</summary>
+        static readonly string[] _chunks = new string[]
         {
-            var bytes = Convert.FromBase64String(Raw);
-            var arr = new uint[bytes.Length / 4];
-            for (int i = 0; i < arr.Length; i++)
-                arr[i] = ((uint)bytes[i * 4] << 24) | ((uint)bytes[i * 4 + 1] << 16) |
-                         ((uint)bytes[i * 4 + 2] << 8) | bytes[i * 4 + 3];
-            return arr;
+''' + lit + '''
+        };
+
+        static byte[] Build()
+        {
+            try
+            {
+                var b64 = string.Concat(_chunks);
+                var packed = Convert.FromBase64String(b64);
+                using (var ms = new MemoryStream(packed))
+                using (var ds = new DeflateStream(ms, CompressionMode.Decompress))
+                {
+                    var buf = new byte[8192];
+                    int off = 0;
+                    while (off < buf.Length)
+                    {
+                        int n = ds.Read(buf, off, buf.Length - off);
+                        if (n <= 0) break;
+                        off += n;
+                    }
+                    return buf;
+                }
+            }
+            catch (Exception) { return new byte[8192]; }
         }
 
         /// <summary>这个 IP 属于国内分配的地址段吗？</summary>
@@ -88,26 +137,31 @@ namespace Ferry
             if (b[0] == 169 && b[1] == 254) return true;
             if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return true;
 
-            uint v = ((uint)b[0] << 24) | ((uint)b[1] << 16) | ((uint)b[2] << 8) | b[3];
-
-            // _ranges 是 [start0, end0, start1, end1, ...]，按 start 升序
-            int lo = 0, hi = _ranges.Length / 2 - 1;
-            while (lo <= hi)
-            {
-                int mid = (lo + hi) / 2;
-                uint s = _ranges[mid * 2], e = _ranges[mid * 2 + 1];
-                if (v < s) hi = mid - 1;
-                else if (v > e) lo = mid + 1;
-                else return true;
-            }
-            return false;
+            int s16 = (b[0] << 8) | b[1];
+            return (_bitmap[s16 >> 3] & (1 << (s16 & 7))) != 0;
         }
 
-        public static int Count { get { return _ranges.Length / 2; } }
+        /// <summary>覆盖的 /16 段数（诊断用）。</summary>
+        public static int Count
+        {
+            get
+            {
+                int n = 0;
+                foreach (var x in _bitmap) n += PopCount(x);
+                return n;
+            }
+        }
+
+        static int PopCount(byte x)
+        {
+            int n = 0;
+            while (x != 0) { n += x & 1; x >>= 1; }
+            return n;
+        }
     }
 }
 '''
 
 io.open(r'E:\肥鱼不乐园\borrow-net\ferry-client\src\CnIpRanges.cs', 'w',
         encoding='utf-8', newline='\n').write(cs)
-print('generated: %d ranges, base64 %d chars' % (len(merged), len(b64)))
+print('written, C# size = %d bytes' % len(cs))

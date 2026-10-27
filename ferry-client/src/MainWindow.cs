@@ -509,10 +509,8 @@ namespace Ferry
             _hbTimer.Tick += delegate { SendHeartbeat(); };
             _hbTimer.Start();
 
-            // 清掉 1.0.9~1.0.12 遗留的 Clash 配置块。
-            // 那段配置会劫持国内流量到渡口端口，渡口没借网时国内站全打不开
-            // —— 用户实测过「外网能开、国内全死」。这里补救一次。
-            ClashCleanup.CleanLegacy(Log);
+            // 注：1.0.15 曾在这里清理旧版写进 Clash 的配置块。
+            // 1.0.18 起去掉 —— 只有极少数人导过那份配置，没必要每次启动都动别人的文件。
 
             _licTimer = new DispatcherTimer { Interval = TimeSpan.FromHours(6) };
             _licTimer.Tick += delegate { CheckLicense(false); CheckUpdate(); };
@@ -1392,12 +1390,19 @@ namespace Ferry
             }
             else if (wantTun && runtimeUp && !tunUp)
             {
-                // 有权限、正在借网，但 TUN 还没起来（启动中或失败）
+                // 有权限、正在借网，但 TUN 没在跑。三种情况必须分开显示，
+                // 否则「被主动跳过」会一直显示成「正在启用…」（永远卡住）。
                 var terr = rt != null ? rt.TunError : "";
+                bool skipped = rt != null && rt.TunSkipped;
                 if (!string.IsNullOrEmpty(terr))
                 {
                     _rowTun.Text = "全局模式    启用失败：" + terr;
                     _rowTun.Foreground = Palette.BadB;
+                }
+                else if (skipped)
+                {
+                    _rowTun.Text = "全局模式    未接管（系统代理归其它程序）";
+                    _rowTun.Foreground = Palette.MutedB;
                 }
                 else
                 {

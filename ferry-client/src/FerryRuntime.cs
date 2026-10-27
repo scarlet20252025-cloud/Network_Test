@@ -49,6 +49,16 @@ namespace Ferry
 
         /// <summary>TUN 是否在跑（全局接管模式）。</summary>
         public bool TunRunning { get { return _tun != null && _tun.Running; } }
+
+        /// <summary>
+        /// TUN 是「被主动跳过」而不是「启动失败」。
+        ///
+        /// 为什么需要区分：界面原来只看 TunError 是否为空 ——
+        /// 跳过的场景下没有错误信息，于是一直显示「正在启用…」，永远卡住。
+        /// 用户看到的就是「全局模式一直卡在正在启用」。
+        /// </summary>
+        public bool TunSkipped { get { return _tunSkipped; } }
+        bool _tunSkipped = false;
         /// <summary>TUN 启动失败的原因。空字符串 = 没失败或没开。</summary>
         public string TunError { get { return _tunError; } }
         string _tunError = "";
@@ -92,6 +102,9 @@ namespace Ferry
         public string Start()
         {
             if (_running) return "";
+
+            _tunSkipped = false;
+            _tunError = "";
 
             // SOCKS 和 HTTP 要连续两个空闲端口。先找 SOCKS，再找 HTTP（跳过刚占的）。
             _socksPort = ProxyServer.FindFree(Math.Max(10800, _cfg.SocksPort), 40);
@@ -213,6 +226,7 @@ namespace Ferry
             //   本身（浏览器/下载）不依赖它。所以只记 TunError，不 return。
             if (_cfg.UseTun && !AllowTun)
             {
+                _tunSkipped = true;
                 _log("全局接管未启用：系统代理已由其它程序管理，避免和它抢流量");
             }
             else if (_cfg.UseTun)
