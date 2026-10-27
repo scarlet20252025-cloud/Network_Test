@@ -31,12 +31,23 @@ namespace Ferry
 
         const string TaskName = "FerryClientAutostart";
 
+        /// <summary>主窗口的「立即更新」。设置窗拿到它就能直接把更新做完，
+        /// 不用再让用户「回主界面点那个按钮」。</summary>
+        readonly Action<string> _onUpdate;
+
         public SettingsWindow(Cfg cfg, string cfgPath, string appDir, Action onUninstall)
+            : this(cfg, cfgPath, appDir, onUninstall, null)
+        {
+        }
+
+        public SettingsWindow(Cfg cfg, string cfgPath, string appDir, Action onUninstall,
+                              Action<string> onUpdate)
         {
             _cfg = cfg;
             _cfgPath = cfgPath;
             _appDir = appDir;
             _onUninstall = onUninstall;
+            _onUpdate = onUpdate;
 
             BuildUi();
         }
@@ -287,6 +298,16 @@ namespace Ferry
 
         // ── 保存 ──
 
+        /// <summary>把界面上的选项写进配置并落盘（不关窗、不设 DialogResult）。</summary>
+        void SaveSettingsOnly()
+        {
+            _cfg.AutoBorrow = _chkAutoBorrow.IsChecked == true;
+            _cfg.StartMinimized = _chkMinimized.IsChecked == true;
+            _cfg.AutoReconnect = _chkReconnect.IsChecked == true;
+            _cfg.NetCheckSec = _numInterval.Value;
+            try { _cfg.Save(_cfgPath); } catch (Exception) { }
+        }
+
         void SaveAll()
         {
             _cfg.AutoBorrow = _chkAutoBorrow.IsChecked == true;
@@ -396,7 +417,14 @@ namespace Ferry
                 {
                     var mine = typeof(SettingsWindow).Assembly.GetName().Version.ToString(3);
                     _lblVer.Text = "当前版本 " + mine;
-                    if (!v.Ok) { MessageBox.Show(this, "拿不到版本信息", "更新"); return; }
+                    if (!v.Ok)
+                    {
+                        MessageBox.Show(this,
+                            "连不上门户（" + _cfg.PortalUrl + "）。\r\n\r\n" +
+                            "如果正在借网，先断开再试；也可能是门户临时不可用。",
+                            "检查更新");
+                        return;
+                    }
                     if (Api.CompareVer(v.Latest, mine) <= 0)
                     {
                         MessageBox.Show(this, "已经是最新版本（" + mine + "）", "检查更新");
@@ -405,12 +433,25 @@ namespace Ferry
                     var r = MessageBox.Show(this,
                         "发现新版本 " + v.Latest + "（当前 " + mine + "）\r\n\r\n现在更新吗？",
                         "有可用更新", MessageBoxButton.YesNo, MessageBoxImage.Information);
-                    if (r == MessageBoxResult.Yes)
+                    if (r != MessageBoxResult.Yes) return;
+
+                    if (_onUpdate == null)
                     {
+                        // 没有回调（比如将来别处复用了这个窗口）——至少把话说清楚
                         MessageBox.Show(this,
-                            "请在主界面点「更新 " + v.Latest + "」按钮完成更新。",
+                            "请回主界面点「更新 " + v.Latest + "」按钮。",
                             "更新");
+                        return;
                     }
+
+                    // 更新前先把设置落盘 —— 更新会让进程退出、新版本重读配置文件，
+                    // 不保存的话用户刚改的选项就丢了。
+                    SaveSettingsOnly();
+
+                    // 直接更新：更新全程在后台线程，设置窗关掉也不影响。
+                    // 关掉设置窗是因为更新成功后进程会退出、由新版本接管。
+                    Close();
+                    _onUpdate(v.Latest);
                 }));
             });
         }

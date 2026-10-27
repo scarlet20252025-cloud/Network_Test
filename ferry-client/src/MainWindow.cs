@@ -934,7 +934,7 @@ namespace Ferry
 
         void OpenSettings()
         {
-            var dlg = new SettingsWindow(_cfg, _cfgPath, _appDir, DoUninstall);
+            var dlg = new SettingsWindow(_cfg, _cfgPath, _appDir, DoUninstall, DoUpdate);
             dlg.Owner = this;
             if (dlg.ShowDialog() != true) return;
             _slow.Interval = TimeSpan.FromSeconds(Math.Max(10, _cfg.NetCheckSec));
