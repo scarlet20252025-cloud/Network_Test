@@ -144,6 +144,29 @@ namespace Ferry
             // （以前这里会另外 FindFree 一个端口，但根本没监听它，日志里那个号是假的）。
             if (_cfg.DirectSocks) _socksPort = _httpPort;
             _proxy = new ProxyServer(_httpPort, upstreamPort, upstreamHost, _log);
+
+            // ④ 分流：用户本来就在用 Clash/加速器的话，境外交给它，渡口只管国内。
+            //
+            // 为什么这么做：用户往往已经有一套翻墙代理。渡口接管系统代理之后，
+            // 「墙外」也走渡口出口 —— 而渡口是校内主机，出不去，结果是「借网之后
+            // 反而上不了网」。反过来让渡口不接管，用户又得手动配节点，每个 Clash
+            // 客户端写法都不一样（Verge 是 Merge.yaml，CFW 是 Parsers，绿色版
+            // 路径还不固定），教不会也没法自动化。
+            //
+            // 所以让渡口自己分流：国内目标走渡口，其余交给用户那个代理。他什么都
+            // 不用配，Clash 照常开着就行。
+            int clashPort = FerryCore.DetectLocalProxy(_httpPort);
+            if (clashPort > 0)
+            {
+                _proxy.SetForeignProxy(clashPort, "127.0.0.1");
+                _log("检测到本机代理 127.0.0.1:" + clashPort +
+                     "：国内流量走渡口，境外交给它（不需要在它里面加节点）");
+            }
+            else
+            {
+                _log("没检测到其它代理：全部流量走渡口");
+            }
+
             if (!_proxy.Start())
             {
                 _proxy = null;

@@ -141,12 +141,14 @@ namespace Ferry
                 Cursor = System.Windows.Input.Cursors.Hand,
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(16, 0, 0, 0),
-                ToolTip = "接入 Clash：自动在 Clash 的扩展配置里加一个 SOCKS5 节点（可重复点，不会重复创建）"
+                ToolTip = "Clash 说明：一般不需要配置，渡口会自己分流（点开看细节）"
             };
             catBtn.Click += delegate
             {
-                var msg = ClashMerge.Install(_cfg.SocksPort);
-                MessageBox.Show(this, msg, "接入 Clash", MessageBoxButton.OK, MessageBoxImage.Information);
+                // 只显示说明，**不改任何文件**。理由见 ClashMerge 的注释：
+                // 每个用户的 Clash 客户端不一样，写配置文件是无底洞，写错了还会毁人家的配置。
+                MessageBox.Show(this, ClashMerge.Help(_cfg.SocksPort), "Clash 说明",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
             };
             ivRow.Children.Add(catBtn);
 

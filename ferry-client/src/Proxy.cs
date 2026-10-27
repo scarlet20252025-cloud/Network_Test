@@ -33,6 +33,19 @@ namespace Ferry
         readonly string _socksHost;
         readonly Action<string> _log;
 
+        /// <summary>
+        /// 用户自己的 Clash 的 SOCKS 端口（0 = 没有，不做分流）。
+        ///
+        /// 为什么要它：用户往往已经有一套翻墙代理（Clash/Verge/加速器）。渡口借网时
+        /// 会把系统代理抢过来，结果他连「墙外」也用渡口的出口 —— 而渡口是校内主机，
+        /// 出不去。反过来让渡口完全不接管，用户又得手动配节点，每个客户端写法还不一样。
+        ///
+        /// 折中：渡口照常接管系统代理，但**只把国内流量走渡口**，境外的交给用户
+        /// 原本就在用的那个代理。这样他什么都不用配，Clash 照常开着就行。
+        /// </summary>
+        int _clashPort;
+        string _clashHost = "127.0.0.1";
+
         TcpListener _listener;
         volatile bool _running;
         long _connTotal, _connActive, _bytesUp, _bytesDown;
@@ -68,6 +81,13 @@ namespace Ferry
             _socksPort = socksPort;
             _socksHost = string.IsNullOrEmpty(socksHost) ? "127.0.0.1" : socksHost;
             _log = log ?? delegate { };
+        }
+
+        /// <summary>设置「境外流量交给谁」。port=0 表示不分流（全部走渡口）。</summary>
+        public void SetForeignProxy(int port, string host)
+        {
+            _clashPort = port;
+            if (!string.IsNullOrEmpty(host)) _clashHost = host;
         }
 
         public int Port { get { return _listenPort; } }
@@ -252,7 +272,7 @@ namespace Ferry
             Socket upstream = null;
             try
             {
-                upstream = ConnectSocks(_socksPort, host, port, 8000, _socksHost);
+                upstream = ConnectSmart(host, port, 8000);
                 if (upstream == null) { ReplySocks5(ns, 0x05); return; }
                 ReplySocks5(ns, 0x00);
                 Pump(ns, new NetworkStream(upstream, true));
@@ -486,6 +506,179 @@ namespace Ferry
 
         // ── HTTP 代理（客户端 → 我）───────────────────────────
 
+        // ══════════════════ 分流：国内走渡口，境外交给用户的 Clash ══════════════════
+
+        /// <summary>
+        /// 按目标决定走哪条上游。连不上就换另一条（互为兜底），所以任何一侧挂了
+        /// 都不至于整个断网。
+        /// </summary>
+        Socket ConnectSmart(string host, int port, int timeoutMs)
+        {
+            bool cn = IsDomestic(host);
+
+            if (_clashPort <= 0)
+                return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+
+            if (cn)
+            {
+                var s1 = ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+                if (s1 != null) return s1;
+                _log("国内目标连不上，改走本机代理：" + host);
+                return ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
+            }
+
+            var s2 = ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
+            if (s2 != null) return s2;
+            _log("本机代理连不上，改走渡口：" + host);
+            return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+        }
+
+        /// <summary>
+        /// 这个目标是「国内」的吗？
+        ///
+        /// 判据刻意做得粗糙且保守：**只有明确解析得到国内 IP 才算国内**。
+        /// 因为判错的代价不对称 —— 把国内站判成境外，走 Clash 也还是能上（慢一点）；
+        /// 把墙外站判成国内，走渡口就永远打不开。
+        /// </summary>
+        bool IsDomestic(string host)
+        {
+            IPAddress ip;
+            if (IPAddress.TryParse(host, out ip))
+                return IsDomesticIp(ip);
+
+            // 域名：问国内 DNS。解析得到 → 这域名在国内是通的 → 走渡口。
+            // 解析不到（被墙的域名在国内 DNS 上通常也是空的或污染）→ 交给 Clash。
+            var addrs = ResolveCn(host);
+            if (addrs == null || addrs.Count == 0) return false;
+            foreach (var a in addrs)
+                if (IsDomesticIp(a)) return true;
+            return false;
+        }
+
+        static readonly string[] CnDns = new string[] { "223.5.5.5", "119.29.29.29", "114.114.114.114" };
+
+        static List<IPAddress> ResolveCn(string host)
+        {
+            foreach (var dns in CnDns)
+            {
+                try
+                {
+                    var req = BuildDnsQuery(host);
+                    var ep = new IPEndPoint(IPAddress.Parse(dns), 53);
+                    using (var u = new System.Net.Sockets.UdpClient())
+                    {
+                        u.Client.ReceiveTimeout = 1200;
+                        u.Send(req, req.Length, ep);
+                        var from = new IPEndPoint(IPAddress.Any, 0);
+                        var resp = u.Receive(ref from);
+                        var got = ParseDnsAnswers(resp);
+                        if (got.Count > 0) return got;
+                    }
+                }
+                catch (Exception) { }
+            }
+            return null;
+        }
+
+        static byte[] BuildDnsQuery(string host)
+        {
+            var ms = new MemoryStream();
+            ms.Write(new byte[] { 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, 0, 12);
+            foreach (var part in host.Split('.'))
+            {
+                var b = Encoding.ASCII.GetBytes(part);
+                if (b.Length > 63) b = new byte[0];
+                ms.WriteByte((byte)b.Length);
+                ms.Write(b, 0, b.Length);
+            }
+            ms.Write(new byte[] { 0, 0, 0x01, 0, 0x01 }, 0, 5);
+            return ms.ToArray();
+        }
+
+        static List<IPAddress> ParseDnsAnswers(byte[] resp)
+        {
+            var list = new List<IPAddress>();
+            try
+            {
+                if (resp == null || resp.Length < 12) return list;
+                int qd = (resp[4] << 8) | resp[5];
+                int an = (resp[6] << 8) | resp[7];
+                int p = 12;
+                for (int i = 0; i < qd; i++)
+                {
+                    while (p < resp.Length && resp[p] != 0)
+                        p += (resp[p] & 0xC0) == 0xC0 ? 2 : resp[p] + 1;
+                    if (p < resp.Length && resp[p] == 0) p++;
+                    p += 4;
+                }
+                for (int i = 0; i < an && p + 12 <= resp.Length; i++)
+                {
+                    if ((resp[p] & 0xC0) == 0xC0) p += 2;
+                    else { while (p < resp.Length && resp[p] != 0) p += resp[p] + 1; p++; }
+                    if (p + 10 > resp.Length) break;
+                    int type = (resp[p] << 8) | resp[p + 1];
+                    int rdlen = (resp[p + 8] << 8) | resp[p + 9];
+                    p += 10;
+                    if (type == 1 && rdlen == 4 && p + 4 <= resp.Length)
+                        list.Add(new IPAddress(new byte[] { resp[p], resp[p + 1], resp[p + 2], resp[p + 3] }));
+                    p += rdlen;
+                }
+            }
+            catch (Exception) { }
+            return list;
+        }
+
+        /// <summary>
+        /// 粗判「这个 IP 是不是国内」。不追求精确（那要 GeoIP 库，几十 MB），
+        /// 只把「几乎肯定不是国内」的排掉：私网、保留段、以及已知的境外大块。
+        /// 剩下的当作国内 —— 因为判成国内的代价（走渡口）对国内站是**正确**的，
+        /// 而真正的墙外站基本都是 Cloudflare/Google/AWS 这些一眼能认的段。
+        /// </summary>
+        static bool IsDomesticIp(IPAddress ip)
+        {
+            if (ip.AddressFamily != AddressFamily.InterNetwork) return false;
+            var b = ip.GetAddressBytes();
+
+            // 私网 / 回环 / 链路本地 / 保留：都当国内（直连语义）
+            if (b[0] == 10 || b[0] == 127) return true;
+            if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true;
+            if (b[0] == 192 && b[1] == 168) return true;
+            if (b[0] == 169 && b[1] == 254) return true;
+            if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return true;
+            if (b[0] >= 224) return true;
+
+            // 已知境外大块（这些段里的服务在国内基本要翻墙，或者翻墙更快）
+            if (b[0] == 8 && b[1] == 8) return false;                       // 8.8.8.8
+            if (b[0] == 1 && b[1] == 1) return false;                        // 1.1.1.1
+            if (b[0] == 104 && b[1] >= 16 && b[1] <= 31) return false;       // Cloudflare
+            if (b[0] == 172 && b[1] == 67) return false;                     // Cloudflare
+            if (b[0] == 162 && b[1] == 159) return false;                    // Cloudflare
+            if (b[0] == 142 && b[1] == 250) return false;                    // Cloudflare
+            if (b[0] == 188 && b[1] == 114) return false;                    // Cloudflare DNS
+            if (b[0] == 31 && b[1] >= 13 && b[1] <= 14) return false;        // 31.13.x  Facebook
+            if (b[0] == 157 && b[1] == 240) return false;                    // Facebook
+            if (b[0] == 74 && b[1] >= 86 && b[1] <= 125) return false;       // Facebook
+            if (b[0] == 216 && b[1] == 58) return false;                     // Google
+            if (b[0] == 142 && b[1] >= 250 && b[1] <= 251) return false;     // Google
+            if (b[0] == 34 && b[1] >= 64 && b[1] <= 128) return false;       // Google Cloud
+            if (b[0] == 35 && b[1] >= 184 && b[1] <= 255) return false;      // Google Cloud
+            if (b[0] == 13 && b[1] >= 32 && b[1] <= 35) return false;        // AWS
+            if (b[0] == 52 && b[1] >= 0 && b[1] <= 95) return false;         // AWS
+            if (b[0] == 54 && b[1] >= 64 && b[1] <= 255) return false;       // AWS
+            if (b[0] == 18 && b[1] >= 128 && b[1] <= 255) return false;      // AWS
+            if (b[0] == 151 && b[1] == 101) return false;                    // Discord
+            if (b[0] == 162 && b[1] == 125) return false;                    // Discord
+            if (b[0] == 199 && b[1] == 232) return false;                    // GitHub
+            if (b[0] == 140 && b[1] == 82) return false;                     // GitHub
+            if (b[0] == 185 && b[1] == 199) return false;                    // GitHub
+            if (b[0] == 91 && b[1] == 108) return false;                     // Telegram
+            if (b[0] == 149 && b[1] == 154) return false;                    // Telegram
+            if (b[0] == 66 && b[1] == 220) return false;                     // Wikipedia
+            if (b[0] == 208 && b[1] == 80) return false;                     // Wikipedia
+
+            return true;
+        }
+
         void HandleHttp(NetworkStream ns, byte firstByte)
         {
             var header = ReadHeader(ns, firstByte, 65536);
@@ -532,7 +725,7 @@ namespace Ferry
             Socket upstream = null;
             try
             {
-                upstream = ConnectSocks(_socksPort, host, port, 8000, _socksHost);
+                upstream = ConnectSmart(host, port, 8000);
                 if (upstream == null)
                 {
                     var err = Encoding.ASCII.GetBytes(

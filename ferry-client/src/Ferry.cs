@@ -459,6 +459,26 @@ namespace Ferry
         }
 
         /// <summary>
+        /// 找出「本机另一个代理」的 SOCKS/混合端口（用户自己的 Clash/加速器）。
+        /// 返回 0 表示没有。
+        ///
+        /// 为什么要排除 excludePort：那个是我们自己的入口端口，不能把自己当上游。
+        ///
+        /// 探测顺序按「装的人最多」排。全部用 200ms 超时，加起来最多 1 秒多一点，
+        /// 而且只在开始借网时跑一次。
+        /// </summary>
+        public static int DetectLocalProxy(int excludePort)
+        {
+            var ports = new int[] { 7897, 7890, 7891, 10808, 10809, 1080, 2080, 8889, 1087, 7899 };
+            foreach (var p in ports)
+            {
+                if (p == excludePort) continue;
+                if (PortOpen(p, 200)) return p;
+            }
+            return 0;
+        }
+
+        /// <summary>
         /// 取当前出口 IP。走本机代理端口拿到的就是远端出口，
         /// 不走代理就是本机公网出口 —— 这个对比是「借网到底生效没有」的唯一硬证据。
         /// </summary>
