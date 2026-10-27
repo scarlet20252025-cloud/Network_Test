@@ -1,3 +1,85 @@
+## v0.14.29 — 2026-10-28
+
+> 客户端 1.0.32：TUN 的 DNS 劫持收窄到网关地址 —— 修「开了 Clash 节点全部 Timeout」。
+
+### 现象
+
+装完 1.0.31（防回环例外已无条件写入）后打开 Clash Verge，**47 个节点全部 Timeout**，
+界面上一个可用的都没有。国内访问正常（baidu 200/0.17s）。
+
+查 Clash 内核（`verge-mihomo.exe`，pid 36048）的实际连接：
+
+```
+Established 198.18.0.22   7826
+Established 198.18.0.23    443
+FinWait2    198.18.0.6     443
+```
+
+**目标全是 `198.18.0.x`** —— 那是渡口 TUN 的 fake-ip。也就是说：
+Clash 解析机场节点域名时，拿到的是假地址，然后拿着假地址去连机场。
+
+### 根因：`dns-hijack: any:53` 把朋友也一起劫了
+
+```
+Clash 解析 6.1.9.6.6.i.h.d...qpon  → 系统/TUN 的 DNS 被劫持 → 198.18.0.22
+Clash 连 198.18.0.22:7826          → 进 TUN → PROCESS-NAME 命中 → DIRECT
+DIRECT 到 198.18.0.22              → 根本没有这台主机 → Timeout
+```
+
+PROCESS-NAME 放行是对的，但放行到假地址没有意义。1.0.31 修好了「规则没生成」，
+这一层是它没覆盖到的（当时 CHANGELOG 里就把 `dns-hijack` 标成残余风险）。
+
+### 改法：只劫持 TUN 网关
+
+```yaml
+tun:
+  dns-hijack:
+    - 198.18.0.2:53     # 原来是 any:53
+```
+
+mihomo 把系统 DNS 指到 TUN 网关（198.18.0.2），所以劫持这一个地址就够系统解析用；
+用户自己配了 DNS 的程序（Clash 的 `default-nameserver: 223.5.5.5…`、DoH）不再被拦，
+它们的查询按规则 `NETWORK,udp` 走 `ferry-udp` → 远端中继 → 拿真实答案。
+
+### 实测对照（测试机 10.113.66.6，上游用 pcs 的真实 socks5 relay）
+
+```
+dns-hijack: any:53
+    Resolve-DnsName www.baidu.com -Server 223.5.5.5  ->  198.18.0.4      (fake-ip)
+
+dns-hijack: 198.18.0.2:53
+    Resolve-DnsName www.baidu.com -Server 223.5.5.5  ->  2408:8756:...   (真实地址)
+    Resolve-DnsName www.baidu.com -Server 198.18.0.2 ->  198.18.0.4      (fake-ip，系统路径不变)
+```
+
+日志佐证：
+
+```
+[UDP] 198.18.0.1:53743 --> 223.5.5.5:53 match Network(udp) using ferry-udp-group[ferry-udp]
+```
+
+### 代价（如实写）
+
+1. **非系统 DNS 的查询现在要过隧道**：几十毫秒额外延迟，且占用渡口的 UDP 中继。
+   但只有「显式配了自己 DNS 的程序」会走这条（Clash、DoH 客户端），
+   普通程序仍用系统 DNS → fake-ip → mihomo 本地解析，不占隧道。
+2. **mihomo 的 sniffing 是关着的**，所以经隧道的那条路在上游只拿得到 IP，
+   分流从「域名后缀表」降级成「IP 段表」。对 Clash 这种本来就是代理的流量没影响，
+   但如果有人把浏览器 DNS 也指到公网，判定精度会降一档。
+
+### 验证
+
+- `tools/verify-tunconfig.cs` 增加两项断言：`dns-hijack` 必须是 `198.18.0.2:53`、
+  且**不能**出现 `any:53`。共 21 项 ALL PASS。
+- 生成的配置过 `mihomo -t`。
+- 对照实验见上。
+
+### 这一轮该记住的
+
+**「放行」和「放行到哪」是两件事。** 1.0.31 让 Clash 的出站走 DIRECT，方向对；
+但它的目标是 fake-ip，DIRECT 到假地址等于没放行。看日志时不能只看「规则命中了」
+就收工 —— 要接着看**它连的是哪个地址、那个地址是不是真的**。
+
 ## v0.14.28 — 2026-10-28
 
 > 客户端 1.0.31：TUN 的防回环例外**不再依赖「启动那一瞬间检测到 Clash」**。

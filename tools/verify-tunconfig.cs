@@ -51,6 +51,8 @@ static class TunCfgCheck
         Ok(yaml.Contains("- PROCESS-NAME,clash-verge.exe,DIRECT"), "A: clash-verge with .exe");
         Ok(yaml.Contains("- PROCESS-NAME,verge-mihomo.exe,DIRECT"), "A: verge-mihomo with .exe");
         Ok(yaml.Contains("MATCH,ferry"), "A: MATCH,ferry fallback");
+        Ok(yaml.Contains("- 198.18.0.2:53"), "A: dns-hijack narrowed to tun gateway");
+        Ok(!yaml.Contains("- any:53"), "A: no blanket any:53 hijack (would break Clash DNS)");
         Ok(yaml.Contains("- NETWORK,udp,ferry-udp-group"), "A: UDP goes to ferry-udp-group");
         Ok(yaml.Contains("IP-CIDR,127.0.0.0/8,DIRECT,no-resolve"), "A: loopback direct");
         Ok(!yaml.Contains("clash-local"), "A: no removed clash-local proxy");
