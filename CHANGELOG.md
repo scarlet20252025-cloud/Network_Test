@@ -1,3 +1,48 @@
+## v0.14.7 — 2026-10-27
+
+> 客户端 1.0.11：**Clash for Windows 用户也能一键接入了**。
+
+有用户反馈：用 Clash for Windows（CFW）时，小猫按钮不识别配置、什么也没做。
+
+原因是 1.0.9 只认 Verge 系（Clash Verge / Rev / Nyanpasu）的 `Merge.yaml`，
+CFW 没有这个机制 —— 它走的是另一套：**Parser**（一个 JS 脚本，订阅加载时被调用，
+在内存里改 proxies/groups/rules，订阅更新也不会丢）。
+
+### 现在的行为
+
+| 你的客户端 | 小猫按钮做什么 |
+|---|---|
+| Clash Verge / Rev / Nyanpasu | 写 `profiles\Merge.yaml`（1.0.9 起） |
+| **Clash for Windows** | 写 `%USERPROFILE%\.config\clash\parserserry.js`，并在 `profiles.yaml` 的每个订阅条目上挂 `parsers: [ferry]` |
+| 其它 / 没装 | 不写任何文件，只弹一份按客户端分类的手动说明 |
+
+CFW 的 `profiles.yaml` 是它自己的状态文件，改坏了 CFW 起不来，所以：
+
+- 动之前先备份成 `profiles.yaml.bak-ferry`
+- 只做最小文本插入（在条目末尾加两行 `parsers:` / `- ferry`）
+- 已经有 `parsers` 的条目跳过，重复点不会重复挂
+- 一个条目都没挂上时，返回的是「Parser 已写好，但没找到可挂的订阅」+ 手动步骤
+
+`Country.mmdb` 那种「装过但没配置」的残留目录会被忽略，不会被当成 CFW。
+
+### 验证
+
+测试机（10.113.66.6）造了两条订阅的 profiles.yaml，8 项断言全过：
+
+```
+PASS  parser js written
+PASS  js carries the port
+PASS  js adds the ferry node
+PASS  profiles.yaml patched
+PASS  both profiles got ferry (got 2)
+PASS  backup created
+PASS  second call does not duplicate
+```
+
+**未验证**：真实 CFW 客户端加载这个 Parser 的效果（测试机没装 CFW）。
+Parser 的接口按 CFW 官方约定写（`function parse(proxies, groups, rules)`），
+如果某个版本的 CFW 报 Parser 错误，把报错发出来再调。
+
 ## v0.14.6 — 2026-10-27
 
 > 客户端 1.0.10：一次针对「潜在 bug」的复查，修掉 5 个还没被踩到的问题。

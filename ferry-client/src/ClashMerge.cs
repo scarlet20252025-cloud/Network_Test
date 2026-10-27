@@ -82,6 +82,87 @@ namespace Ferry
             catch (Exception) { return 0; }
         }
 
+        // ── Clash for Windows（CFW）──────────────────────────────
+        //
+        // CFW 没有 Verge 那种 Merge 层。它给的官方扩展点是 **Parser**：
+        // 一个 JS 脚本，订阅加载时被调用，可以在内存里改 proxies/groups/rules，
+        // 订阅更新也不会丢。所以 CFW 要写两样东西：
+        //   ①  %USERPROFILE%\.config\clash\parserserry.js
+        //   ②  在 profiles.yaml 的每个条目上加 parsers: [ferry]
+        //
+        // 「加 parsers 列表」这一步必须改 profiles.yaml —— 而它是 CFW 自己的状态
+        // 文件，改坏了 CFW 会起不来。所以：先备份、只做最小文本插入、失败就还原。
+        static string CfwDir()
+        {
+            var up = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var p = Path.Combine(up, ".config", "clash");
+            if (!Directory.Exists(p)) return null;
+            // 有 config.yaml 或 profiles.yaml 才算真的在用（只有 Country.mmdb 的是残留）
+            if (File.Exists(Path.Combine(p, "profiles.yaml")) ||
+                File.Exists(Path.Combine(p, "config.yaml"))) return p;
+            return null;
+        }
+
+        static string CfwParserJs(int socksPort)
+        {
+            var js = new StringBuilder();
+            js.AppendLine("// 渡口：由渡口助手自动写入（删掉这个文件 + profiles.yaml 里的 ferry 即可取消）");
+            js.AppendLine("function parse(proxies, groups, rules) {");
+            js.AppendLine("  var socks = " + socksPort + ";");
+            js.AppendLine("  var has = proxies.some(function (p) { return p.name === \"渡口\"; });");
+            js.AppendLine("  if (!has) {");
+            js.AppendLine("    proxies.unshift({ name: \"渡口\", type: \"socks5\", server: \"127.0.0.1\", port: socks, udp: true });");
+            js.AppendLine("    groups.unshift({ name: \"国内出口\", type: \"fallback\", proxies: [\"渡口\", \"DIRECT\"],");
+            js.AppendLine("      url: \"http://connect.rom.miui.com/generate_204\", interval: 60 });");
+            js.AppendLine("    rules.unshift(\"GEOIP,CN,国内出口\");");
+            js.AppendLine("  }");
+            js.AppendLine("  return { proxies: proxies, groups: groups, rules: rules };");
+            js.AppendLine("}");
+            return js.ToString();
+        }
+
+        /// <summary>给 profiles.yaml 的每个条目补上 parsers: [ferry]。返回改动条数。</summary>
+        static int PatchProfilesYaml(string path)
+        {
+            if (!File.Exists(path)) return 0;
+            var lines = File.ReadAllLines(path);
+            var outp = new StringBuilder();
+            int patched = 0;
+            bool inItem = false;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                var ln = lines[i];
+                outp.AppendLine(ln);
+
+                // 条目开头：形如 "  - uid: xxx"
+                if (ln.TrimStart().StartsWith("- ") && ln.Contains("uid:")) inItem = true;
+
+                bool lastOfItem = inItem && !string.IsNullOrWhiteSpace(ln) &&
+                                  ln.TrimStart().StartsWith("- ") == false &&
+                                  (i + 1 >= lines.Length || lines[i + 1].TrimStart().StartsWith("- ") || lines[i + 1].Trim().Length == 0);
+                if (lastOfItem)
+                {
+                    inItem = false;
+                    // 已经有 parsers 就不再重复加
+                    var hasParsers = false;
+                    for (int j = i; j >= 0 && j > i - 30; j--)
+                        if (lines[j].TrimStart().StartsWith("parsers:")) { hasParsers = true; break; }
+                    if (!hasParsers)
+                    {
+                        outp.AppendLine("    parsers:");
+                        outp.AppendLine("      - ferry");
+                        patched++;
+                    }
+                }
+            }
+            if (patched == 0) return 0;
+
+            var bak = path + ".bak-ferry";
+            if (!File.Exists(bak)) File.Copy(path, bak, true);
+            File.WriteAllText(path, outp.ToString(), new UTF8Encoding(false));
+            return patched;
+        }
+
         static bool Listening(int port)
         {
             try
@@ -111,7 +192,13 @@ namespace Ferry
         {
             socksPort = DetectPort(socksPort);
             var f = MergePath();
-            if (f == null) return ManualHelp(socksPort);
+            if (f == null)
+            {
+                // 没有 Verge 系 → 试试 Clash for Windows
+                var cfw = CfwDir();
+                if (cfw != null) return InstallCfw(cfw, socksPort);
+                return ManualHelp(socksPort);
+            }
 
             string text = "";
             try { if (File.Exists(f)) text = File.ReadAllText(f); } catch (Exception) { }
@@ -179,6 +266,40 @@ namespace Ferry
                    "  · 节点「渡口」= SOCKS5 127.0.0.1:" + socksPort + "（带 UDP）\n" +
                    "  · 分组「国内出口」= 渡口优先，没借网时自动走直连\n" +
                    "  · 规则：国内 IP 走「国内出口」，境外仍走你原来的节点";
+        }
+
+        static string InstallCfw(string cfwDir, int socksPort)
+        {
+            try
+            {
+                var pdir = Path.Combine(cfwDir, "parsers");
+                if (!Directory.Exists(pdir)) Directory.CreateDirectory(pdir);
+                var jsPath = Path.Combine(pdir, "ferry.js");
+                File.WriteAllText(jsPath, CfwParserJs(socksPort), new UTF8Encoding(false));
+
+                int n = PatchProfilesYaml(Path.Combine(cfwDir, "profiles.yaml"));
+
+                if (n == 0)
+                    return "已写好 Clash for Windows 的 Parser：\n" + jsPath + "\n\n" +
+                           "但没有在 profiles.yaml 里找到可挂载的订阅条目。\n" +
+                           "手动启用一下：CFW → Profiles → 右键你的订阅 → Edit，在末尾加两行：\n" +
+                           "    parsers:\n" +
+                           "      - ferry\n" +
+                           "然后点一下该订阅让它重新加载。";
+
+                return "已接入 Clash for Windows（改动了 " + n + " 个订阅条目）\n\n" +
+                       "  写入：" + jsPath + "\n" +
+                       "  备份：profiles.yaml.bak-ferry\n\n" +
+                       "去 CFW 里点一下当前订阅（或重启 CFW）让它重新加载。\n\n" +
+                       "生效后会多出：节点「渡口」= SOCKS5 127.0.0.1:" + socksPort + "、" +
+                       "分组「国内出口」（渡口优先，没借网时自动直连）、规则 GEOIP,CN → 国内出口。\n\n" +
+                       "取消接入：删掉 parsers\ferry.js，并用 profiles.yaml.bak-ferry 覆盖回 profiles.yaml。";
+            }
+            catch (Exception e)
+            {
+                return "写入 Clash for Windows 配置失败：" + e.Message + "\n\n" +
+                       "可以手动加一个节点：SOCKS5 127.0.0.1:" + socksPort + "（打开 UDP）";
+            }
         }
 
         /// <summary>没找到支持的客户端时，给一份能照做的手动说明。</summary>
