@@ -300,28 +300,7 @@ namespace Ferry
             sb.AppendLine("    server: " + udpHost);
             sb.AppendLine("    port: " + udpPort.ToString());
             sb.AppendLine("    udp: true");
-            if (_clashPort > 0)
-            {
-                sb.AppendLine();
-                sb.AppendLine("  # 用户自己正在跑的那个代理（Clash / v2rayN …）。");
-                sb.AppendLine("  # 渡口出口到不了境外，境外流量得让它来出 —— 这是它能正常");
-                sb.AppendLine("  # 翻墙、而我们只管借网的关键。");
-                sb.AppendLine("  - name: clash-local");
-                sb.AppendLine("    type: socks5");
-                sb.AppendLine("    server: 127.0.0.1");
-                sb.AppendLine("    port: " + _clashPort.ToString());
-                sb.AppendLine("    udp: true");
-            }
             sb.AppendLine();
-            if (_clashPort > 0)
-            {
-                sb.AppendLine("rule-providers:");
-                sb.AppendLine("  cn:");
-                sb.AppendLine("    type: file");
-                sb.AppendLine("    behavior: classical");
-                sb.AppendLine("    path: ./cn-cidr.txt");
-                sb.AppendLine();
-            }
             sb.AppendLine("proxy-groups:");
             sb.AppendLine("  - name: ferry");
             sb.AppendLine("    type: select");
@@ -329,12 +308,6 @@ namespace Ferry
             sb.AppendLine("  - name: ferry-udp-group");
             sb.AppendLine("    type: select");
             sb.AppendLine("    proxies: [ferry-udp]");
-            if (_clashPort > 0)
-            {
-                sb.AppendLine("  - name: overseas");
-                sb.AppendLine("    type: select");
-                sb.AppendLine("    proxies: [clash-local, DIRECT]");
-            }
             sb.AppendLine();
             sb.AppendLine("rules:");
             if (_clashPort > 0)
@@ -358,25 +331,17 @@ namespace Ferry
             sb.AppendLine("  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve");
             sb.AppendLine("  # UDP 单独分流：只有 ferry-udp 能承载");
             sb.AppendLine("  - NETWORK,udp,ferry-udp-group");
-            if (_clashPort > 0)
-            {
-                // 已知的「/16 里混了境外地址」例外：位图是 /16 粒度，而 APNIC
-                // 是 /24 级分配。1.1.0.0/16 整个被标成国内，但 1.1.1.0/24 是
-                // Cloudflare 的 —— 不排除掉就会把 Cloudflare DNS 送去渡口，
-                // 而渡口出口到不了它。
-                sb.AppendLine("  - IP-CIDR,1.1.1.0/24,overseas,no-resolve");
-                sb.AppendLine("  - IP-CIDR,8.8.8.0/24,overseas,no-resolve");
-                sb.AppendLine("  - IP-CIDR,8.8.4.0/24,overseas,no-resolve");
-                sb.AppendLine("  - IP-CIDR,9.9.9.0/24,overseas,no-resolve");
-                sb.AppendLine("  # 国内 IP 走渡口（段表见 cn-cidr.txt，由客户端启动时生成）");
-                sb.AppendLine("  - RULE-SET,cn,ferry");
-                sb.AppendLine("  # 其余（境外）交给用户自己的代理，它才出得去");
-                sb.AppendLine("  - MATCH,overseas");
-            }
-            else
-            {
-                sb.AppendLine("  - MATCH,ferry");
-            }
+            // 规则保持极简：把「分流」全部交给本地代理。
+            //
+            // 为什么这一层不按 IP 分：TUN 开着 fake-ip，域名进 TUN 时是
+            // 198.18.x.x，要匹配 IP-CIDR 就得先解析 —— 等于**每个新域名多一次
+            // DNS 查询**，而且用的是国内 DNS，墙外域名拿到的是污染地址，
+            // 判定本身就错。本地代理那边拿得到域名、有缓存，比这里准。
+            //
+            // 这一层只做两件事：翻墙客户端自己的出站放行直连（否则
+            // Clash 连机场会被自己的 TUN 抓走 → 转一圈回 Clash，成环），
+            // 其余全部交给本地代理。
+            sb.AppendLine("  - MATCH,ferry");
             return sb.ToString();
         }
 
@@ -411,24 +376,8 @@ namespace Ferry
             _configPath = Path.Combine(_appDir, "tun-config.yaml");
             _fatalError = null;
 
-            // 检测到本机代理时才需要国内段表（全走渡口的旧路径用不上）。
-            if (_clashPort > 0)
-            {
-                try
-                {
-                    var cnPath = Path.Combine(_appDir, "cn-cidr.txt");
-                    File.WriteAllText(cnPath, CnIpRanges.AsCidrRules(),
-                        new System.Text.UTF8Encoding(false));
-                    _log("已生成国内 IP 段表：" + cnPath);
-                }
-                catch (Exception ex)
-                {
-                    // 生成失败就别用分流规则了，退回「全部走渡口」——
-                    // 否则 mihomo 找不到 rule-provider 会拒绝启动，用户直接断网。
-                    _log("生成国内段表失败（" + ex.Message + "），本次全部流量走渡口");
-                    _clashPort = 0;
-                }
-            }
+            // 不再生成 cn-cidr.txt（分流已移到本地代理层，这里只做流量转发）。
+            // 旧文件继续存在也无害，不主动删 —— 那是用户目录里的东西。
 
             // 启动前先清掉残留的 FerryTun 网卡。
             //

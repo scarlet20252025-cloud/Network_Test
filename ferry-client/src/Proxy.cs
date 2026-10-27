@@ -541,16 +541,16 @@ namespace Ferry
                 var s1 = ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
                 if (s1 != null) return s1;
                 LogOnce("国内目标连不上，改走本机代理", host);
-                return ConnectSocks(_clashPort, PreferIp(host), port, timeoutMs, _clashHost);
+                return ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
             }
 
-            // 境外：交给用户本机的代理。域名先本地解析成 IP 再传下去 ——
-            // 用户那个代理多半也把域名丢给上游解析，而墙外域名的解析结果在
-            // 这条链路上不可信；本地拿到什么就传什么，至少是我们自己看到的地址。
-            var s2 = ConnectSocks(_clashPort, PreferIp(host), port, timeoutMs, _clashHost);
+            // 境外：交给用户本机的代理，**传原始域名**。
+            // 不能用 PreferIp：国内 DNS 解析墙外域名拿到的是污染地址，
+            // 传过去 Clash 就会去连那个假 IP（明明它自己有干净的解析）。
+            var s2 = ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
             if (s2 != null) return s2;
             LogOnce("本机代理连不上，改走渡口", host);
-            return ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
+            return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
         }
 
         /// <summary>
@@ -619,14 +619,19 @@ namespace Ferry
         {
             IPAddress ip;
             if (IPAddress.TryParse(host, out ip))
-                return IsFakeIp(ip) || CnIpRanges.Contains(ip);
+            {
+                // fake-ip 只是个占位符，不含地理信息。把它当国内等于把所有域名
+                // 都送去渡口；当境外也只是多绕一跳。选后者。
+                if (IsFakeIp(ip)) return false;
+                return CnIpRanges.Contains(ip);
+            }
 
             var addrs = ResolveLocal(host);
             if (addrs == null || addrs.Count == 0)
                 return false;    // 解析不出来 → 当境外（交给用户的代理）
 
             foreach (var a in addrs)
-                if (IsFakeIp(a) || CnIpRanges.Contains(a)) return true;
+                if (CnIpRanges.Contains(a)) return true;
             return false;
         }
 
@@ -655,21 +660,66 @@ namespace Ferry
         /// 不做 DoH：用户来借网的前提就是「上不了网」，DoH 在这种环境下也不通；
         /// 而借网期间系统 DNS 走校园网，解析国内域名没问题。
         /// </summary>
+        /// <summary>
+        /// 本地解析域名，带缓存。**过滤掉 fake-ip**。
+        ///
+        /// 为什么要滤掉：TUN 开着 fake-ip 时系统 DNS 被 mihomo 接管，任何域名都
+        /// 解析成 198.18.x.x。那个地址里没有任何地理信息 —— 拿它去查 CN 段表，
+        /// 结论永远是「不是国内」，再被 IsFakeIp 特判成「是国内」，就把所有境外
+        /// 域名都送进了渡口出口，每个都白等一次超时（1.0.21 的「全网变慢」）。
+        ///
+        /// 为什么必须有缓存：分流是**每条连接**都要判一次。浏览器开一个页面几十条
+        /// 连接，没有缓存就是几十次 DNS 查询，页面自然慢半拍。
+        /// </summary>
         static List<IPAddress> ResolveLocal(string host)
         {
+            lock (_dnsCache)
+            {
+                CacheEntry hit;
+                if (_dnsCache.TryGetValue(host, out hit) && hit.Expires > DateTime.UtcNow)
+                    return hit.Addrs;
+            }
+
             var list = new List<IPAddress>();
             try
             {
                 foreach (var a in Dns.GetHostAddresses(host))
-                    if (a.AddressFamily == AddressFamily.InterNetwork) list.Add(a);
+                    if (a.AddressFamily == AddressFamily.InterNetwork && !IsFakeIp(a))
+                        list.Add(a);
             }
             catch (Exception) { }
-            if (list.Count > 0) return list;
 
-            var cn = ResolveCn(host);
-            if (cn != null && cn.Count > 0) return cn;
+            // 系统 DNS 被 TUN 接管（只给 fake-ip）时，只能自己去问。
+            if (list.Count == 0)
+            {
+                var cn = ResolveCn(host);
+                if (cn != null)
+                    foreach (var a in cn)
+                        if (!IsFakeIp(a)) list.Add(a);
+            }
+
+            lock (_dnsCache)
+            {
+                if (_dnsCache.Count > 4000) _dnsCache.Clear();   // 别无限长
+                _dnsCache[host] = new CacheEntry
+                {
+                    Addrs = list,
+                    // 解析失败也缓存，但只缓存 30 秒：失败多半是临时抖动，
+                    // 缓太久会让「刚恢复的站点」一直被判境外。
+                    Expires = DateTime.UtcNow.AddSeconds(list.Count > 0 ? 300 : 30)
+                };
+            }
             return list;
         }
+
+        class CacheEntry
+        {
+            public List<IPAddress> Addrs;
+            public DateTime Expires;
+        }
+
+        static readonly Dictionary<string, CacheEntry> _dnsCache =
+            new Dictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase);
 
 
 

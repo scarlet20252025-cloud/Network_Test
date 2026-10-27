@@ -1,3 +1,94 @@
+## v0.14.19 — 2026-10-27
+
+> 客户端 1.0.22：**修 1.0.21 引入的「全网变慢」**（国内也慢）。
+
+### 现象
+
+1.0.21 装上去之后：
+
+> 为什么感觉网速明显变慢了，或者加载有点慢，不只是外网，国内网页也是
+
+日志里满屏同一句话：
+
+```
+国内目标连不上，改走本机代理：www.google.com
+国内目标连不上，改走本机代理：encrypted-tbn0.gstatic.com
+国内目标连不上，改走本机代理：chatgpt.com
+国内目标连不上，改走本机代理：ep2.adtrafficquality.google
+```
+
+也就是说：**每一个境外域名都被判成了国内**，先撞一次渡口（等超时）→
+失败 → 再走 Clash。一个页面几十条连接，每条都白等一次超时。
+国内网页也慢，是因为页面里嵌了大量境外资源（字体、统计、CDN）。
+
+### 根因链（1.0.21 的错）
+
+```csharp
+// 1.0.21 的 IsDomestic
+foreach (var a in addrs)
+    if (IsFakeIp(a) || CnIpRanges.Contains(a)) return true;
+```
+
+TUN 开着 `enhanced-mode: fake-ip`（198.18.0.0/16），系统 DNS 被 mihomo 接管：
+
+```
+IsDomestic("www.google.com")
+  → ResolveLocal → Dns.GetHostAddresses → 198.18.x.x（fake-ip）
+  → IsFakeIp(a) == true → 判「国内」 → 走渡口 → 必然失败 → 回退 Clash
+```
+
+`IsFakeIp` 是 1.0.16 加的，本意是「别把假 IP 传给上游」，把它当「国内」是错的：
+**fake-ip 里没有任何地理信息，它就是个占位符。**
+
+同一个错误还有两处：
+
+- 在 TUN 层用 `RULE-SET,cn`（1151 条 `IP-CIDR`）做分流 —— 但 fake-ip 下域名
+  进 TUN 时是 198.18.x.x，要匹配 IP-CIDR 就得先解析，**每个新域名多一次 DNS
+  查询**，而且用的是国内 DNS，墙外域名拿到的是污染地址，判定本身就是错的。
+- `ConnectSmart` 的境外分支也走 `PreferIp`，把国内 DNS 的污染结果传给 Clash，
+  Clash 就去连那个假 IP（明明它自己有干净的解析）。
+
+### 修法
+
+| 改动 | 为什么 |
+|---|---|
+| `ResolveLocal` 过滤 fake-ip；全被滤掉时改用 223.5.5.5 重新解析 | 系统 DNS 被接管时只能自己问 |
+| `IsDomestic`：fake-ip 一律**不算**国内 | 占位符没有地理信息 |
+| `ConnectSmart` 境外分支**传原始域名**，不 `PreferIp` | 污染地址传给 Clash 等于让它去连假 IP |
+| 加 DNS 缓存（成功 300 秒 / 失败 30 秒） | 分流是每条连接都要判的，没缓存等于每条连接发一次 DNS 查询 |
+| TUN 规则回到 `MATCH,ferry`，删掉 `RULE-SET,cn`、`clash-local`、`rule-providers` | 分流统一在本地代理做，那一层拿得到域名、有缓存 |
+| 保留 `PROCESS-NAME,...,DIRECT` 9 条 | 翻墙客户端自己的出站要被放行，否则 Clash 连机场被 TUN 抓走成环 |
+
+修完的分工：
+
+```
+浏览器 → (fake-ip) → TUN → mihomo（只转发，不看目标）
+                            └─ 翻墙客户端进程 → DIRECT（防环）
+                            └─ 其余 → MATCH,ferry → 本地代理
+                                                          ↓
+                                          本地代理：国内 → 渡口（传 IP）
+                                                    境外 → Clash（传域名）
+```
+
+### 验证
+
+```
+PASS  fake-ip IP is NOT domestic
+PASS  198.19.x fake-ip is NOT domestic
+PASS  real CN ip is domestic
+PASS  real foreign ip is not domestic
+PASS  ResolveLocal never returns fake-ip
+PASS  second lookup is cached (<5ms)
+PASS  no RULE-SET (would need extra DNS per domain)
+PASS  no rule-providers (no file dependency)
+PASS  no clash-local proxy (split happens in local proxy)
+PASS  keeps PROCESS-NAME loop guard
+PASS  keeps LAN direct rules
+ALL PASS
+```
+
+新配置交给 mihomo 自己校验：`test is successful`。
+
 ## v0.14.18 — 2026-10-27
 
 > 客户端 1.0.21：**借网时境外能通了** —— TUN 也会把境外流量交给用户自己的 Clash。
