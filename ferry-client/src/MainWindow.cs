@@ -920,12 +920,16 @@ namespace Ferry
         {
             if (_busy) return;
             bool running = _rt != null && _rt.Running;
-            bool tunUp = running && _rt.TunRunning;
 
-            if (tunUp)
+            // 判据用**用户意图**（_cfg.UseTun），不是 TUN 是否真的在跑。
+            //
+            // 否则会出现死路：TUN 被跳过时（另一个 TUN 在抢路由 / 缺 wintun），
+            // 界面写着「关闭全局模式」，点下去却因为「TUN 没在跑」掉进开启分支，
+            // 于是每点一次就重启一次借网，永远关不掉。
+            if (_cfg.UseTun)
             {
                 _cfg.UseTun = false;
-                _forceTakeover = false;      // 用户关掉全局模式 = 不再抢占
+                _forceTakeover = false;      // 关掉全局模式 = 不再抢占系统代理
                 try { _cfg.Save(_cfgPath); } catch (Exception) { }
                 Log("关闭全局模式…");
                 if (running) { _pendingRestart = true; DoStop(); return; }
@@ -935,7 +939,7 @@ namespace Ferry
 
             // 节点模式下点「开启全局模式」= 用户明确要求接管系统代理。
             // 这时不能再让着别人（否则这个按钮就是空转的），先问一句再抢。
-            if (_nodeMode && _cfg.UseTun == false)
+            if (_nodeMode)
             {
                 var r0 = MessageBox.Show(this,
                     "现在有别的程序在管理系统代理（全局模式需要接管它）。\r\n\r\n" +
@@ -1240,7 +1244,11 @@ namespace Ferry
 
             // 纠正「代理指错地方」只在**我们自己是接管模式**时做。
             // 节点模式下那个位置属于用户的 Clash，我们一律不碰。
-            if (!_nodeMode && _weSetProxy && runtimeUp && proxyOn && bridgeUp &&
+            // TUN 在跑时不做纠正：TUN 抢的是默认路由，系统代理指向谁都不影响
+            // 流量走哪条路。这时还去改它，只会在用户开 Clash 后把状态搅乱
+            // （改 3 次 → 转 nodeMode → 界面说「未接管」，可 TUN 明明在跑）。
+            bool tunLive = rt != null && rt.TunRunning;
+            if (!_nodeMode && !tunLive && _weSetProxy && runtimeUp && proxyOn && bridgeUp &&
                 proxySrv != borrowServer && proxySrv.StartsWith("http://127.0.0.1:"))
             {
                 // 限次：如果用户中途开了 Clash/加速器，两边会每秒互相改回来（死循环）。
@@ -1335,8 +1343,10 @@ namespace Ferry
                 if (_cfg.UseTun && !(rt != null && rt.TunRunning))
                 {
                     var terr = rt != null ? rt.TunError : "";
+                    var why = rt != null ? rt.TunSkipReason : "";
+                    var reason = terr.Length > 0 ? terr : why;
                     _lblDesc.Text = "已借网，但全局接管（TUN）未启用 —— 只有认代理的程序生效。" +
-                        (terr.Length > 0 ? "\n原因：" + terr : "");
+                        (reason.Length > 0 ? "\n原因：" + reason : "");
                     _lblDesc.Foreground = Palette.BadB;
                 }
             }

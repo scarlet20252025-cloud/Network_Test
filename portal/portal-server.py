@@ -1538,6 +1538,11 @@ def download_page(detected_ip=''):
         <a class="btn btn-main" href="/download-cmd">&#9889; 一键安装</a>
         <a class="btn btn-ghost" href="/download">直接下载 .exe</a>
       </div>
+      <p style="font-size:13px;color:var(--muted);margin:10px 0 0">
+        装不上、报 <code>错误 4551</code>（应用控制策略拦截）？
+        用 <a href="/download-portable" style="color:var(--accent)">免安装版</a> &mdash;&mdash;
+        解压就能用，不经过系统临时目录。
+      </p>
       <div class="dl-trust">
         <span>不需要管理员权限</span>
         <span>不弹 UAC</span>
@@ -1616,6 +1621,31 @@ def download_page(detected_ip=''):
     <details class="dl-fold">
       <summary>更新日志<span class="hint">每个版本改了什么</span></summary>
       <div class="inner" style="max-height:560px;overflow:auto">LOG_HTML</div>
+    </details>
+
+    <details class="dl-fold">
+      <summary>安装时提示「错误 4551：应用程序控制策略已阻止此文件」<span class="hint">用免安装版</span></summary>
+      <div class="inner">
+        这不是杀软报毒，也不是文件坏了，是 Windows 的
+        <strong>智能应用控制 / 应用控制策略</strong>禁止「从临时目录执行程序」。
+        安装程序本来就要先解压到临时目录再运行，于是被这条策略拦下 &mdash;&mdash;
+        换台机器就能装，是策略差异，不是安装包的问题。
+
+        <div class="step"><div class="n">1</div><div class="t">
+          <b>改用免安装版</b>
+          <div class="hint">下载 <a href="/download-portable" style="color:var(--accent)">渡口助手-免安装.zip</a>，
+            解压到任意目录（比如 <code>D:\渡口</code>），双击里面的
+            <code>渡口助手.exe</code> 即可。完全不经过临时目录，所以不受这条策略影响。</div>
+        </div></div>
+        <div class="step"><div class="n">2</div><div class="t">
+          <b>免安装版怎么开机自启</b>
+          <div class="hint">设置里勾「开机自动启动」&mdash;&mdash; 用的是计划任务，不写注册表。</div>
+        </div></div>
+        <div class="step"><div class="n">3</div><div class="t">
+          <b>以后怎么卸载</b>
+          <div class="hint">设置里取消勾选「开机自动启动」&rarr; 退出程序 &rarr; 删掉那个文件夹。</div>
+        </div></div>
+      </div>
     </details>
 
     <details class="dl-fold">
@@ -5650,6 +5680,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.redirect('/')
             elif path == '/download-client':
                 self.handle_download_client()
+            elif path == '/download-portable':
+                self.handle_download_portable()
             elif path == '/download-cmd':
                 self.handle_download_cmd()
             elif path.startswith('/download/version/'):
@@ -5976,6 +6008,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
         self.db.log('download_client', self.client_ip(), 'v' + ver)
+
+    def handle_download_portable(self):
+        """发免安装的 ZIP（解压即用，不经过 %TEMP%）。
+
+        为什么需要：
+          有些机器开了「智能应用控制 / 应用控制策略」，Inno 安装包在解压到
+          临时目录执行那一步被系统拦下（错误 4551），装不了。
+          Inno 的 SetupLdr 天生就是这个结构，改不掉，所以给一个绿色包兜底。
+
+        找文件：dist/Ferry-Portable-*.zip，取版本号最大的那个。
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        cand = []
+        for d in (os.path.join(here, '..', 'dist'), os.path.join(here, 'dist')):
+            d = os.path.normpath(d)
+            if not os.path.isdir(d):
+                continue
+            for n in os.listdir(d):
+                if n.startswith('Ferry-Portable-') and n.endswith('.zip'):
+                    cand.append(os.path.join(d, n))
+        if not cand:
+            self.send_json({'ok': False, 'error': '免安装包尚未构建'}, 404)
+            return
+
+        def ver_of(path):
+            m = re.search(r'Ferry-Portable-([0-9.]+)\.zip$', path)
+            if not m:
+                return (0,)
+            return tuple(int(x) for x in m.group(1).split('.') if x.isdigit())
+
+        cand.sort(key=ver_of)
+        path = cand[-1]
+
+        with open(path, 'rb') as f:
+            data = f.read()
+
+        name = os.path.basename(path)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/zip')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        # 中文文件名要按 RFC 5987 编码，否则浏览器拿到乱码名
+        self.send_header('Content-Disposition',
+                         "attachment; filename=ferry-portable.zip; "
+                         "filename*=UTF-8''" + urllib.parse.quote('渡口助手-免安装.zip'))
+        self.end_headers()
+        CHUNK = 65536
+        try:
+            for i in range(0, len(data), CHUNK):
+                self.wfile.write(data[i:i + CHUNK])
+        except Exception:
+            pass
+        self.db.log('download_portable', self.client_ip(), name)
 
     def handle_download_cmd(self):
         """.cmd 一键安装：双击后自动下载 exe 并启动，全程不碰浏览器下载通道。

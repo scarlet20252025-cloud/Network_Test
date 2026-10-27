@@ -107,6 +107,14 @@ namespace Ferry
         public string TunSkipReason { get { return _tunSkipReason; } }
         string _tunSkipReason = "";
 
+        /// <summary>本次启动探测到的「别的 TUN」，只探一次（两次结果可能不一致）。</summary>
+        string _otherTun = null;
+        string OtherTunHere()
+        {
+            if (_otherTun == null) _otherTun = TunMode.OtherTunAdapter() ?? "";
+            return _otherTun.Length == 0 ? null : _otherTun;
+        }
+
         public string Start()
         {
             if (_running) return "";
@@ -114,6 +122,7 @@ namespace Ferry
             _tunSkipped = false;
             _tunSkipReason = "";
             _tunError = "";
+            _otherTun = null;
 
             // SOCKS 和 HTTP 要连续两个空闲端口。先找 SOCKS，再找 HTTP（跳过刚占的）。
             _socksPort = ProxyServer.FindFree(Math.Max(10800, _cfg.SocksPort), 40);
@@ -239,14 +248,27 @@ namespace Ferry
                 _tunSkipReason = "已被要求不启用";
                 _log("全局接管未启用：本次运行被要求不接管");
             }
-            else if (_cfg.UseTun && TunMode.OtherTunAdapter() != null)
+            else if (_cfg.UseTun && OtherTunHere() != null)
             {
                 // 真正会打架的情况：另一个 TUN 也在抢默认路由
-                var other = TunMode.OtherTunAdapter();
+                var other = OtherTunHere();
                 _tunSkipped = true;
                 _tunSkipReason = "另一个 TUN 正在接管（" + other + "）";
                 _log("全局接管未启用：检测到 " + other +
                      " 也在抢默认路由，两个 TUN 会互相覆盖。关掉它再点一次全局模式。");
+
+                // 降级：既然 TUN 起不来，就别再把「境外交给本机代理」也关掉。
+                // 否则用户以为开了全局，实际境内外全走渡口 —— 境外必然打不开，
+                // 而且没有任何提示。
+                if (AllowSplit)
+                {
+                    int cp = FerryCore.DetectLocalProxy(_httpPort);
+                    if (cp > 0)
+                    {
+                        _proxy.SetForeignProxy(cp, "127.0.0.1");
+                        _log("全局起不来，改用分流：国内走渡口，境外交给 127.0.0.1:" + cp);
+                    }
+                }
             }
             else if (_cfg.UseTun)
             {
