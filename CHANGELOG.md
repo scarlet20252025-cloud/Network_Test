@@ -1,3 +1,89 @@
+## v0.14.23 — 2026-10-27
+
+> 客户端 1.0.26：**游戏 UDP 一直是断的** —— 修「打 CS2 延迟突然跳到 130ms」。
+
+### 现象
+
+> 刚刚打 cs2，游戏延迟波动突然跳到 130ms
+
+而且界面显示「全局模式 已开启（UDP / 游戏都走渡口）」—— 看起来正好。
+
+### 根因：UDP 走了一条根本不通的路
+
+客户端生成的 TUN 配置（`%LOCALAPPDATA%\Ferry\tun-config.yaml`）：
+
+```yaml
+- name: ferry-udp
+  type: socks5
+  server: 10.13.24.1      # 远端服务器
+  port: 1080              # 但远端根本不在 1080 监听 UDP
+  udp: true
+```
+
+而 mihomo 的规则把所有 UDP 都交给它：
+
+```yaml
+- NETWORK,udp,ferry-udp-group
+```
+
+远端的 UDP 机制是：
+
+```
+先建一条 TCP 控制连接做 UDP ASSOCIATE
+  → 服务端临时 new 一个随机 UDP socket（0.0.0.0:0）
+  → 把那个随机端口放进 SOCKS5 应答的 BND 返回
+  → 客户端往那个端口发 UDP
+```
+
+**1080 上只有 TCP 监听。** 所以 mihomo 发出的每一个 UDP 包都收到
+ICMP port unreachable —— 游戏的每个包都在丢，只能靠重传，
+表现就是延迟从几十毫秒突然跳到 130ms 以上。
+
+### 修法
+
+`ferry-udp` 改指向**本地代理**（`127.0.0.1:<socksPort>`）：
+
+```yaml
+- name: ferry-udp
+  type: socks5
+  server: 127.0.0.1
+  port: 10801
+  udp: true
+```
+
+本地代理的 `UdpAssociateCore` 已经实现了完整的 UDP ASSOCIATE：
+先向上游要动态端口，再把本地 UDP 会话接上去（1.0.8 那轮修的就是这个）。
+
+```
+游戏 → TUN → mihomo → ferry-udp(127.0.0.1:10801)
+                        → 本地代理 UDP ASSOCIATE
+                        → 上游 10.13.24.1:1080 拿动态端口
+                        → 远端 Python 中继 → 游戏服务器
+```
+
+### 同一个坑犯过两次
+
+`mihomo/mihomo-keeper.ps1` 里的 `$UdpHost/$UdpPort` 在之前那轮已经改成了
+`127.0.0.1`（同样是这个原因）。但**客户端自己生成 TUN 配置的那条路径没跟着改** ——
+两处代码用不同的方式拼同一个上游地址，改一处漏一处。
+
+（这正好是「两处配合的逻辑，改一处要回头看另一处」那条元教训的第二次发作。）
+
+### 验证
+
+```
+PASS  ferry-udp points to 127.0.0.1 (not the remote host)
+PASS  ferry-udp uses the local proxy port
+PASS  udp enabled on the outbound
+PASS  socks handshake ok
+PASS  udp associate accepted
+PASS  got UDP response through relay        ← 真的收到了 71 字节 DNS 应答
+PASS  response is a DNS answer
+ALL PASS
+```
+
+第二条不是「配置看起来对」，而是**真的发了一个 UDP DNS 查询并收到应答**。
+
 ## v0.14.22 — 2026-10-27
 
 > 客户端 1.0.25：修「偶发性的小卡顿」—— 连不通的目标每次都要重等 8 秒。

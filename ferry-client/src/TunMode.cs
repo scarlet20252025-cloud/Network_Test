@@ -231,6 +231,9 @@ namespace Ferry
         /// </summary>
         int _clashPort;
 
+        /// <param name="udpHost">上游 UDP 中继地址（仅用于日志/诊断，不写进配置）。
+        /// UDP 现在统一走本地代理的 ASSOCIATE，见 ferry-udp 那段注释。</param>
+        /// <param name="udpPort">同上。</param>
         string BuildConfig(int socksPort, string udpHost, int udpPort)
         {
             var sb = new StringBuilder();
@@ -295,10 +298,19 @@ namespace Ferry
             sb.AppendLine("    udp: false");
             sb.AppendLine();
             sb.AppendLine("  # UDP：远端 Python 中继（唯一支持 UDP ASSOCIATE 的线路）");
+            // UDP 必须指向**本地代理**，不能指远端 1080。
+            //
+            // 远端的 UDP 是「每条 TCP ASSOCIATE 临时开一个随机端口」，1080
+            // 上根本没有 UDP 监听 —— 直发过去只会收到 ICMP port unreachable。
+            // 之前就写错了这一行，所有 UDP 包石沉大海，游戏只能靠重传，
+            // 表现是延迟从几十毫秒突然跳到 130ms+。
+            //
+            // 本地代理实现了完整的 UDP ASSOCIATE（向上游要动态端口再转发），
+            // 所以这里指向它：[游戏 → TUN → maxho → 本地代理 → 上游中继]。
             sb.AppendLine("  - name: ferry-udp");
             sb.AppendLine("    type: socks5");
-            sb.AppendLine("    server: " + udpHost);
-            sb.AppendLine("    port: " + udpPort.ToString());
+            sb.AppendLine("    server: 127.0.0.1");
+            sb.AppendLine("    port: " + socksPort.ToString());
             sb.AppendLine("    udp: true");
             sb.AppendLine();
             sb.AppendLine("proxy-groups:");
