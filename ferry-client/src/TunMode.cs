@@ -245,6 +245,12 @@ namespace Ferry
             sb.AppendLine("ipv6: false");
             sb.AppendLine("geodata-mode: false");
             sb.AppendLine("geo-auto-update: false");
+            // 进程查找必须打开。TUN 里靠 PROCESS-NAME 把翻墙客户端自己的
+            // 出站放行成 DIRECT —— 否则它连机场的流量被自己的 TUN 抓回来，
+            // 绕成「Clash → TUN → Clash」，表现是：Clash 端口能连、CONNECT
+            // 能成功，但所有境外站点都超时（因为 Clash 连不上机场）。
+            // 默认的 strict 在 gvisor 栈下实测不可靠，改成 always。
+            sb.AppendLine("find-process-mode: always");
             sb.AppendLine();
             // 不开 mixed-port：TUN 模式下不需要额外的 SOCKS 入口，
             // 开了反而多一个可能被占用的端口。
@@ -326,15 +332,17 @@ namespace Ferry
             {
                 sb.AppendLine("  # 本机的翻墙客户端自己要连机场节点 —— 这个出站也会被 TUN 抓到。");
                 sb.AppendLine("  # 不把它排成 DIRECT，就会变成 Clash → TUN → Clash 的死循环。");
-                sb.AppendLine("  - PROCESS-NAME,clash-verge.exe,DIRECT");
-                sb.AppendLine("  - PROCESS-NAME,clash-verge-service.exe,DIRECT");
-                sb.AppendLine("  - PROCESS-NAME,verge-mihomo.exe,DIRECT");
-                sb.AppendLine("  - PROCESS-NAME,clash-meta.exe,DIRECT");
-                sb.AppendLine("  - PROCESS-NAME,Clash for Windows.exe,DIRECT");
-                sb.AppendLine("  - PROCESS-NAME,v2rayN.exe,DIRECT");
-                sb.AppendLine("  - PROCESS-NAME,v2ray.exe,DIRECT");
-                sb.AppendLine("  - PROCESS-NAME,xray.exe,DIRECT");
-                sb.AppendLine("  - PROCESS-NAME,sing-box.exe,DIRECT");
+                // 两个写法都加：mihomo 不同版本对「进程名」是否含 .exe 的
+                // 处理不一致，实测只写一种会出现「规则在、但不匹配」的情况 ——
+                // 那会让翻墙客户端的出站被自己的 TUN 抓走，变成死循环。
+                foreach (var proc in new string[] {
+                    "clash-verge", "clash-verge-service", "verge-mihomo",
+                    "clash-meta", "Clash for Windows", "v2rayN", "v2ray",
+                    "xray", "sing-box", "clash", "mihomo", "nekoray", "nekobox" })
+                {
+                    sb.AppendLine("  - PROCESS-NAME," + proc + ",DIRECT");
+                    sb.AppendLine("  - PROCESS-NAME," + proc + ".exe,DIRECT");
+                }
             }
             sb.AppendLine("  # 内网与回环永远直连 —— 否则局域网打印机/共享/远端 SSH 立刻失联");
             sb.AppendLine("  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve");

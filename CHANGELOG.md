@@ -1,3 +1,66 @@
+## v0.14.27 — 2026-10-27
+
+> 客户端 1.0.30：加固 TUN 的进程例外 —— 修「Clash 端口能连但所有境外都超时」。
+
+### 现象
+
+```
+23:21:35 本机代理连不上，改走渡口：backend.accounts.hytale.com
+23:22:03 本机代理连不上，改走渡口：sd-gl.xinqiucc.com
+23:24:11 本机代理连不上，改走渡口：api.ipify.org
+23:26:04 本机代理连不上，改走渡口：ab.chatgpt.com
+23:29:53 本机代理连不上，改走渡口：registry.npmjs.org
+```
+
+外网全断。实测用户机器：
+
+```
+TcpClient 连 127.0.0.1:7897        → 成功
+curl -x http://127.0.0.1:7897 ...  → CONNECT 200，然后 5 秒超时
+渡口自己的 10801 → baidu           → 200（0.17s）
+```
+
+**Clash 的端口是活的、CONNECT 能成功，但数据出不去** —— 因为 Clash
+连不上它的机场节点。
+
+### 根因
+
+渡口的 TUN 抢了默认路由，Clash 连机场的出站也被抓进 TUN。
+本来靠 `PROCESS-NAME` 把翻墙客户端放行成 DIRECT，但：
+
+- 规则里写的是 `clash-verge.exe` 这种**带扩展名**的形式，
+  而 mihomo 不同版本对「进程名含不含 .exe」处理不一致；
+- `find-process-mode` 没显式设置，默认的 `strict` 在 gvisor 栈下实测不可靠。
+
+结果：`PROCESS-NAME` 规则在文件里存在，但**从不匹配**。于是：
+
+```
+Clash → 连机场 → 被自己的 TUN 抓走 → 判境外 → 交回 Clash → 再被抓 → …
+```
+
+死循环。表现就是「端口能连、CONNECT 200、然后一直等」。
+
+### 改法
+
+1. 顶层加 `find-process-mode: always`（强制启用进程查找）
+2. `PROCESS-NAME` 两种写法都写：
+
+```yaml
+- PROCESS-NAME,verge-mihomo,DIRECT
+- PROCESS-NAME,verge-mihomo.exe,DIRECT
+```
+
+名单从 9 条扩到 13 个进程 × 2 种写法（补了 clash / mihomo / nekoray / nekobox）。
+
+### 仍然存在的风险（如实写下来）
+
+`tun.dns-hijack: any:53` 会劫持**所有** 53 端口流量，包括 Clash 自己发的
+DNS 查询。如果 Clash 的机场域名解析依赖系统 DNS，它可能拿到 fake-ip，
+同样连不上 —— 这条路 `PROCESS-NAME` 管不到（DNS 劫持在规则匹配之前）。
+
+本版先修进程例外（这是实测能确认的部分）。如果加装后仍然断，
+下一步要动的是 DNS 劫持策略。
+
 ## v0.14.26 — 2026-10-27
 
 > 客户端 1.0.29：**UDP 改成一个上游关联服务所有本地关联**。
