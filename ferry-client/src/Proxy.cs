@@ -348,148 +348,194 @@ namespace Ferry
         /// </summary>
         void StartUdpAssociate(NetworkStream ns, IPEndPoint clientEp)
         {
-            if (Interlocked.Increment(ref _udpAssoc) > MaxUdpAssoc)
+            int now = Interlocked.Increment(ref _udpAssoc);
+            if (now > MaxUdpAssoc)
             {
                 Interlocked.Decrement(ref _udpAssoc);
-                _log("UDP 关联数已达上限 " + MaxUdpAssoc + "，拒绝新关联（" + clientEp + "）");
+                _log("UDP 关联数已达上限 " + MaxUdpAssoc + "，拒绝新关联 (" + clientEp + ")");
                 ReplySocks5(ns, 0x07);
                 return;
             }
-            try { UdpAssociateCore(ns, clientEp); }
-            finally { Interlocked.Decrement(ref _udpAssoc); }
+            try
+            {
+                UdpAssociateCore(ns, clientEp);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _udpAssoc);
+            }
+        }
+
+        /// <summary>一个客户端 UDP 流在本地的那一半。</summary>
+        class UdpRelay
+        {
+            public Socket Sock;            // 对客户端收发的本地 socket
+            public IPEndPoint Peer;        // 客户端实际的 UDP 源地址
+            public DateTime LastSend;      // 最近一次发包（用于回包分发）
+            public volatile bool Alive = true;
+        }
+
+        // ── 共享的上游关联 ──
+        //
+        // SOCKS5 的 UDP ASSOCIATE 设计上就是「一个关联承载所有目标」
+        // （每条数据报自带目标地址）。为每个客户端流各建一条上游连接，
+        // 会让远端同时挂几十条控制连接 + 几十个 UDP socket，
+        // 远端是单进程 async，accept 一忙新的 ASSOCIATE 就超时 ——
+        // 日志里那些「上游不支持或连不上」就是这么来的。
+        static readonly object _upLock = new object();
+        static Socket _upCtrl;             // 上游 TCP 控制连接（必须保持打开）
+        static Socket _upSock;             // 上游 UDP socket
+        static IPEndPoint _upEp;           // 上游分配的 UDP 端点
+        static Thread _upRecvThread;
+        static readonly List<UdpRelay> _relays = new List<UdpRelay>();
+
+        /// <summary>确保共享上游在。失败返回 null（调用方回 SOCKS5 错误）。</summary>
+        Socket EnsureUpstream(out IPEndPoint ep, int socksPort, string socksHost)
+        {
+            lock (_upLock)
+            {
+                ep = _upEp;
+                if (_upCtrl != null && _upSock != null && _upEp != null) return _upSock;
+
+                DropUpstreamLocked();
+
+                IPEndPoint up;
+                var ctrl = AssociateUpstream(socksPort, socksHost, out up, 8000);
+                if (ctrl == null) return null;
+
+                var us = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                // 必须绑 Any：绑 loopback 的话源地址是 127.0.0.1，
+                // 发往远端（10.13.24.1）的包出不去，回的包也收不到 ——
+                // 实测表现是「关联建立成功但一个 DNS 应答都没有」。
+                us.Bind(new IPEndPoint(IPAddress.Any, 0));
+                us.ReceiveTimeout = 1000;
+
+                _upCtrl = ctrl;
+                _upSock = us;
+                _upEp = up;
+                ep = up;
+
+                var sock = us;
+                _upRecvThread = new Thread(delegate () { UpRecvLoop(sock); });
+                _upRecvThread.IsBackground = true;
+                _upRecvThread.Name = "ferry-udp-up";
+                _upRecvThread.Start();
+
+                _log("UDP 上游已就绪（共享）：" + up + "（此后所有客户端流共用这一条）");
+                return us;
+            }
+        }
+
+        void DropUpstreamLocked()
+        {
+            try { if (_upSock != null) _upSock.Close(); } catch (Exception) { }
+            try { if (_upCtrl != null) _upCtrl.Close(); } catch (Exception) { }
+            _upSock = null;
+            _upCtrl = null;
+            _upEp = null;
+        }
+
+        /// <summary>从上游收包，分发给最近发过包的客户端流。</summary>
+        void UpRecvLoop(Socket sock)
+        {
+            var buf = new byte[65535];
+            while (_running)
+            {
+                try
+                {
+                    EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                    int n = sock.ReceiveFrom(buf, ref from);
+                    if (n <= 0) continue;
+                    Interlocked.Add(ref _udpPktsDown, 1);
+
+                    var nowTime = DateTime.UtcNow;
+                    UdpRelay[] copy;
+                    lock (_relays) { copy = _relays.ToArray(); }
+                    foreach (var r in copy)
+                    {
+                        if (!r.Alive || r.Peer == null) continue;
+                        // 只发给「最近 5 秒还在发包」的流：一是省得给早就
+                        // 不用的流发，二是避免过期 relay 的 socket 已被关掉
+                        if ((nowTime - r.LastSend).TotalSeconds > 5) continue;
+                        try { r.Sock.SendTo(buf, 0, n, SocketFlags.None, r.Peer); }
+                        catch (Exception) { }
+                    }
+                }
+                catch (SocketException) { }      // 超时，回循环顶看 _running
+                catch (ObjectDisposedException) { break; }
+                catch (Exception) { }
+            }
         }
 
         void UdpAssociateCore(NetworkStream ns, IPEndPoint clientEp)
         {
-            Socket upCtrl = null, clientSock = null, remoteSock = null;
+            Socket clientSock = null;
+            var relay = new UdpRelay();
             try
             {
-                // ① 先向上游要一个 UDP 端点。
-                //
-                // 为什么 UDP 不跟 TCP 一样按目标分流：SOCKS5 的 UDP ASSOCIATE
-                // 是**一个关联承载所有目标**（每条数据报自己带目标地址），
-                // 建立关联时根本不知道后面会发给谁。所以 UDP 只能选一条上游，
-                // 这里选渡口（用户要的是「借网打游戏」，那是国内游戏服务器）。
-                // 境外 UDP 走不通——但渡口本来就不做翻墙，这是明确的边界。
                 IPEndPoint upEp;
-                upCtrl = AssociateUpstream(_socksPort, _socksHost, out upEp, 8000);
-                if (upCtrl == null)
+                var upSock = EnsureUpstream(out upEp, _socksPort, _socksHost);
+                if (upSock == null)
                 {
                     _log("UDP 关联失败：上游不支持或连不上 " + _socksHost + ":" + _socksPort);
                     ReplySocks5(ns, 0x01);
                     return;
                 }
 
-                // ② 给客户端准备本地中继端口
                 clientSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 clientSock.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                clientSock.ReceiveTimeout = 1000;
                 int relayPort = ((IPEndPoint)clientSock.LocalEndPoint).Port;
 
-                remoteSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                remoteSock.Bind(new IPEndPoint(IPAddress.Any, 0));
+                relay.Sock = clientSock;
+                relay.LastSend = DateTime.UtcNow;
+                lock (_relays) { _relays.Add(relay); }
 
                 var bnd = new byte[] { 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1,
                                        (byte)(relayPort >> 8), (byte)(relayPort & 0xFF) };
                 ns.Write(bnd, 0, bnd.Length);
                 ns.Flush();
-
-                // 不再每条都写日志：mihomo 给每个 UDP 流建一个关联，
-                // 语音 + 游戏 + QUIC 一秒钟能建好几个，界面会被整屏刷掉，
-                // 真正要看的东西（失败、被拒）反而看不见。
-                // 改成 60 秒汇总一行，见 UdpStatsTick。
                 UdpAssocOpened();
 
-                // 空闲回收：mihomo 用完不会主动关 TCP 控制连接，
-                // 我们自己盯着 —— 20 秒没包就收摊，把名额还给后面的人。
-                // 语音/游戏的流是持续的，不会被误杀。
-                var lastActive = DateTime.UtcNow;
-
-                var cs = clientSock; var rs = remoteSock;
-                var ctrl = upCtrl;
-                bool stop = false;
-
-                // 客户端发 UDP 用的端口和它 TCP 控制连接的端口**不是同一个**
-                // （TCP 是它连我们时随机选的，UDP 又另选一个）。回包必须发给
-                // 实际收到包的那个地址，否则客户端永远收不到 —— 实测踩过：
-                // 用 TCP 的 clientEp 回包时，客户端干等到超时。
                 IPEndPoint udpPeer = null;
+                var buf = new byte[65535];
 
-                var upThread = new Thread(delegate ()
+                // 上行：客户端 → 共享上游
+                var lastActive = DateTime.UtcNow;
+                var cs = clientSock;
+                for (; ; )
                 {
-                    var buf = new byte[65535];
-                    while (!stop && _running)
+                    if ((DateTime.UtcNow - lastActive).TotalSeconds > 20) break;
+                    if (!_running) break;
+                    try
                     {
-                        try
-                        {
-                            EndPoint from = new IPEndPoint(IPAddress.Any, 0);
-                            int n = cs.ReceiveFrom(buf, ref from);
-                            var fe = from as IPEndPoint;
-                            // 只接受关联的客户端（同 IP 即可，端口由客户端自己决定）
-                            if (fe != null && fe.Address.Equals(clientEp.Address) && n > 0)
-                            {
-                                udpPeer = fe;          // 记下真实 UDP 源地址
-                                rs.SendTo(buf, 0, n, SocketFlags.None, upEp);
-                                lastActive = DateTime.UtcNow;
-                                Interlocked.Add(ref _udpPktsUp, 1);
-                            }
-                        }
-                        catch (Exception) { break; }
+                        EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                        int n = cs.ReceiveFrom(buf, ref from);
+                        var fe = from as IPEndPoint;
+                        // 只接受关联的客户端（同 IP 即可，UDP 端口由客户端自己选）
+                        if (fe == null || !fe.Address.Equals(clientEp.Address) || n <= 0) continue;
+                        udpPeer = fe;
+                        relay.Peer = fe;
+                        relay.LastSend = DateTime.UtcNow;
+                        lastActive = DateTime.UtcNow;
+                        try { upSock.SendTo(buf, 0, n, SocketFlags.None, upEp); }
+                        catch (Exception) { }
+                        Interlocked.Add(ref _udpPktsUp, 1);
                     }
-                });
-                upThread.IsBackground = true;
-                upThread.Start();
-
-                var downThread = new Thread(delegate ()
-                {
-                    var buf = new byte[65535];
-                    while (!stop && _running)
-                    {
-                        try
-                        {
-                            EndPoint from = new IPEndPoint(IPAddress.Any, 0);
-                            int n = rs.ReceiveFrom(buf, ref from);
-                            var peer = udpPeer ?? clientEp;
-                    lastActive = DateTime.UtcNow;
-                    Interlocked.Add(ref _udpPktsDown, 1);
-                            if (n > 0) cs.SendTo(buf, 0, n, SocketFlags.None, peer);
-                        }
-                        catch (Exception) { break; }
-                    }
-                });
-                downThread.IsBackground = true;
-                downThread.Start();
-
-                // 阻塞在客户端的控制连接上：它一关，关联就结束。
-                // 但 mihomo 不会主动关它，所以还要看空闲时间 ——
-                // 20 秒一个 UDP 包都没有，说明这条流早就不用了。
-                try
-                {
-                    var sink = new byte[16];
-                    ns.ReadTimeout = 1000;          // 1 秒超时，用来看空闲
-                    for (; ; )
-                    {
-                        if ((DateTime.UtcNow - lastActive).TotalSeconds > 20) break;
-                        try
-                        {
-                            if (ns.Read(sink, 0, sink.Length) <= 0) break;
-                            lastActive = DateTime.UtcNow;
-                        }
-                        catch (System.IO.IOException) { }   // 超时，回到循环顶看空闲
-                    }
+                    catch (SocketException) { }          // 超时，回到循环顶看空闲
+                    catch (ObjectDisposedException) { break; }
                 }
-                catch (Exception) { }
-
-                stop = true;
-                try { cs.Close(); } catch (Exception) { }
-                try { rs.Close(); } catch (Exception) { }
-                try { ctrl.Close(); } catch (Exception) { }
-                UdpAssocClosed();
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                _log("UDP 关联异常：" + ex.Message);
+            }
+            finally
+            {
+                relay.Alive = false;
+                lock (_relays) { _relays.Remove(relay); }
                 try { if (clientSock != null) clientSock.Close(); } catch (Exception) { }
-                try { if (remoteSock != null) remoteSock.Close(); } catch (Exception) { }
-                try { if (upCtrl != null) upCtrl.Close(); } catch (Exception) { }
+                UdpAssocClosed();
             }
         }
 

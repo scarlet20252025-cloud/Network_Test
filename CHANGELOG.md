@@ -1,3 +1,68 @@
+## v0.14.26 — 2026-10-27
+
+> 客户端 1.0.29：**UDP 改成一个上游关联服务所有本地关联**。
+
+### 用户看到的异常
+
+```
+23:01:54 UDP 关联 18 个（峰值 27），累计上下行包 58591 / 72243
+23:06:21 UDP 关联失败：上游不支持或连不上 10.13.24.1:1080
+23:06:25 UDP 关联失败：上游不支持或连不上 10.13.24.1:1080
+```
+
+关联数稳定了（1.0.28 的空闲回收生效，不再撞上限），但出现新的异常：
+**偶发「上游连不上」**。
+
+### 根因
+
+每次本地关联都要**新建一条 TCP 控制连接**去远端做 ASSOCIATE。
+峰值 27 个关联 = 27 条 TCP 连接 + 27 个远端 UDP socket，而且不断建/拆。
+远端 `ferry-socks5-server.py` 是 Python 单进程 async，accept 一忙，
+新的 ASSOCIATE 就超时 —— 就是那两条「上游连不上」。
+
+### 改法
+
+SOCKS5 的 UDP ASSOCIATE 设计上就是**一个关联承载所有目标**（每条数据报
+自带目标地址）。所以本地不需要为每个客户端流各建一条上游：
+
+```
+改前：N 个客户端流 → N 条 TCP 控制连接 + N 个远端 UDP socket
+改后：N 个客户端流 → 1 条 TCP 控制连接 + 1 个远端 UDP socket
+```
+
+回包分发：上游回来的包只带源地址，不知道给哪个客户端。
+用「最近 5 秒发过包的所有 relay 各发一份」—— 应用会按 SOCKS5 头里的地址
+自己过滤，不会串。拿少量冗余换实现简单，比维护完整映射表可靠。
+
+### 途中踩的坑（自己写出来的）
+
+第一版把共享的上游 UDP socket 绑在了 `IPAddress.Loopback` 上：
+
+```csharp
+us.Bind(new IPEndPoint(IPAddress.Loopback, 0));   // ← 错
+```
+
+源地址变成 127.0.0.1，发往远端 10.13.24.1 的包出不去、回包也收不到。
+表现很迷惑：**关联建立成功、日志一切正常，但一个 DNS 应答都没有**
+（测试里 0/6）。改成 `IPAddress.Any` 后 6/6。
+
+### 验证
+
+```
+PASS  most associations opened                  （6 个客户端关联）
+   associations that got a DNS answer: 6/6
+PASS  UDP actually flows through the shared upstream
+PASS  shared upstream control conn exists
+   shared upstream endpoint: 10.13.24.1:65344
+   'upstream ready' lines: 1                    ← 6 条流只建了 1 次
+PASS  upstream was established exactly once for all 6 streams
+   relays after close: 0
+PASS  all client relays cleaned up
+ALL PASS
+```
+
+生命周期回归：ALL PASS。
+
 ## v0.14.25 — 2026-10-27
 
 > 客户端 1.0.28：**UDP 关联名额不回收 → 撞上限 → 语音/游戏全卡**。
