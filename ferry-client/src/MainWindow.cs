@@ -509,6 +509,11 @@ namespace Ferry
             _hbTimer.Tick += delegate { SendHeartbeat(); };
             _hbTimer.Start();
 
+            // 清掉 1.0.9~1.0.12 遗留的 Clash 配置块。
+            // 那段配置会劫持国内流量到渡口端口，渡口没借网时国内站全打不开
+            // —— 用户实测过「外网能开、国内全死」。这里补救一次。
+            ClashCleanup.CleanLegacy(Log);
+
             _licTimer = new DispatcherTimer { Interval = TimeSpan.FromHours(6) };
             _licTimer.Tick += delegate { CheckLicense(false); CheckUpdate(); };
             _licTimer.Start();
@@ -798,7 +803,7 @@ namespace Ferry
             _nodeMode = OtherProxyActive();
             _proxyFixTimes = 0;
             if (_nodeMode)
-                Log("检测到系统代理已被其他程序占用 → 只提供 SOCKS 端口，不去抢（节点模式）");
+                Log("系统代理已由其它程序管理，本次不接管（只提供本地端口）");
 
             SetBusy(true);
             Log("启动隧道与代理…");
@@ -840,8 +845,8 @@ namespace Ferry
                     {
                         Log("隧道 + 代理已就绪（SOCKS " + _rt.SocksPort + " / HTTP " + _rt.HttpPort + "）");
                         if (_nodeMode)
-                            Log("节点模式：不改系统代理。在 Clash/加速器里加 SOCKS5 127.0.0.1:" +
-                                _rt.SocksPort + "（HTTP " + _rt.HttpPort + "）");
+                            Log("未接管系统代理；本地端口 SOCKS " + _rt.SocksPort +
+                                " / HTTP " + _rt.HttpPort);
                         else
                             Log("系统代理已切到 " + _rt.BorrowServer);
                         if (exitIp.Length > 0) { _exitVia = exitIp; Log("出口 IP：" + exitIp); }
@@ -1264,12 +1269,13 @@ namespace Ferry
                 _lblBig.Foreground = Palette.GoodB;
                 if (_nodeMode)
                 {
-                    // 节点模式：系统代理归用户的 Clash 管，我们只提供端口。
-                    // 这里必须把「该怎么接」说清楚，否则用户只会看到「借网成功但上不了网」。
-                    _lblDesc.Text = "节点模式 · 在 Clash / 加速器里添加 SOCKS5 127.0.0.1:" +
-                        (rt != null ? rt.SocksPort : _cfg.SocksPort) +
-                        "（HTTP " + (rt != null ? rt.HttpPort : _cfg.HttpPort) + "）" +
-                        ( _exitVia.Length > 0 ? "\n出口 " + _exitVia : "");
+                    // 只说「端口在哪儿」，不说「把它加进 Clash」——
+                    // 这台机器可能不是本人的，界面上不该出现任何「怎么用它翻墙」的字眼。
+                    // 需要细节的人去设置里点 🐱（那里有完整说明）。
+                    _lblDesc.Text = "本地端口 " + (rt != null ? rt.SocksPort : _cfg.SocksPort) +
+                        " / " + (rt != null ? rt.HttpPort : _cfg.HttpPort) +
+                        " · 系统代理未接管" +
+                        (_exitVia.Length > 0 ? "\n出口 " + _exitVia : "");
                 }
                 else
                 {
