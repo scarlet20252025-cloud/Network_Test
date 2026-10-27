@@ -1,3 +1,70 @@
+## v0.14.14 — 2026-10-27
+
+> 客户端 1.0.17：**修「全局模式」的两个 bug** —— 点了没反应 + 三处说法互相矛盾。
+
+### Bug 1：点「关闭全局模式」只回到直连，再点没反应
+
+代码里是这么写的：
+
+```csharp
+if (running) { DoStop(); DoStart(); return; }
+```
+
+而 `DoStop()` 第一行就是 `if (_busy) return;`，然后自己 `SetBusy(true)`，
+后台线程做完才 `SetBusy(false)`。
+
+所以同步连调时：
+
+```
+DoStop()  → _busy = true，起后台线程
+DoStart() → 立刻进来，_busy 还是 true → return，什么都不做
+```
+
+表现就是「停了但没重启」→ 回到直连。再点「开启全局模式」还是同一个问题。
+
+**修法**：加 `_pendingRestart` 标志，在 `DoStop` 完成后的 UI 回调里再调 `DoStart()`。
+
+### Bug 2：显示「已开启」又说「未启用」，三处说法打架
+
+节点模式下 `AllowTun = false`（1.0.16 加的，避免和 Clash 抢 TUN），
+所以 TUN 永远起不来。但界面上：
+
+| 位置 | 显示 |
+|---|---|
+| 全局模式行 | 「已开启 · 下次借网时生效」/「正在启用…」 |
+| 大状态描述 | 「已借网，但全局接管（TUN）未启用」 |
+| 按钮 | 「关闭全局模式」 |
+
+三处互相矛盾 —— 用户当然会问「到底开没开」。
+
+**修法**：节点模式下点「开启全局模式」= 用户明确要求接管，先弹一句
+「现在有别的程序在管理系统代理，接管后它会暂时不生效，确定吗？」，
+确认后设 `_forceTakeover = true`，`DoStart` 不再判定为节点模式，
+真正抢回系统代理并启用 TUN。
+
+关掉全局模式时 `_forceTakeover = false`，让位回去。
+
+### 验证
+
+测试机 8 项断言全过：
+
+```
+PASS  _pendingRestart field exists
+PASS  _forceTakeover field exists
+PASS  no synchronous DoStop();DoStart(); left (found 0)
+PASS  SetBusy exists (the reentrancy guard that caused bug 1)
+PASS  node mode: TUN not started (expected)
+ALL PASS
+```
+
+新增 `tools/verify-globalmode.cs`。
+
+### 教训（已写进踩坑 71）
+
+**`SetBusy` 这种「防重入锁」会把「顺序调用两个异步方法」变成静默失败。**
+`DoStop(); DoStart();` 看起来天经地义，实际第二个必然被吞掉，而且**不报错**。
+凡是「先停再起」的地方，都要用回调/标志衔接，不能同步连调。
+
 ## v0.14.13 — 2026-10-27
 
 > 客户端 1.0.16：**修「开了借网反而上不了网」** —— 1.0.13 的分流和 TUN 撞了。

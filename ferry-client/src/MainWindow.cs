@@ -554,6 +554,18 @@ namespace Ferry
         // 所以：**发现代理已被别人占着，就只提供服务，不碰那个位置**。
         // 用户在自己的 Clash 里把 127.0.0.1:<socks> 加成一个 SOCKS5 节点即可。
         bool _nodeMode = false;
+
+        /// <summary>
+        /// 用户明确要求「接管系统代理」（点过开启全局模式并确认）。
+        ///
+        /// 为什么需要它：节点模式是自动判定的（系统代理被别人占着就退让）。
+        /// 但用户点「开启全局模式」的意图就是「我要全局」——这时应该抢回来，
+        /// 而不是继续让着，否则那个开关就是空转的（点了没反应）。
+        /// </summary>
+        bool _forceTakeover = false;
+
+        /// <summary>停止完成后要不要紧接着重新开始（给 DoStop → DoStart 用）。</summary>
+        bool _pendingRestart = false;
         bool _weSetProxy = false;
         int _proxyFixTimes = 0;   // 「纠正系统代理」的次数上限，防和别的代理软件死循环
 
@@ -800,7 +812,7 @@ namespace Ferry
             }
 
             // 每次启动都重新判断：用户可能刚开了 Clash，也可能刚关掉。
-            _nodeMode = OtherProxyActive();
+            _nodeMode = !_forceTakeover && OtherProxyActive();
             _proxyFixTimes = 0;
             if (_nodeMode)
                 Log("系统代理已由其它程序管理，本次不接管（只提供本地端口）");
@@ -881,6 +893,15 @@ namespace Ferry
                     _exitVia = "";
                     SaveLastState(false);     // 用户主动停在直连，下次启动别再自作主张借网
                     RefreshUi();
+
+                    // 「停止后马上重来」必须在这里做，不能在调用处写 DoStop(); DoStart();
+                    // —— DoStop 是异步的，它自己 SetBusy(true)，同步连调的 DoStart
+                    //    进来就会被 `if (_busy) return;` 挡掉，表现是「点了没反应」。
+                    if (_pendingRestart)
+                    {
+                        _pendingRestart = false;
+                        DoStart();
+                    }
                 }));
             });
         }
@@ -894,11 +915,26 @@ namespace Ferry
             if (tunUp)
             {
                 _cfg.UseTun = false;
+                _forceTakeover = false;      // 用户关掉全局模式 = 不再抢占
                 try { _cfg.Save(_cfgPath); } catch (Exception) { }
                 Log("关闭全局模式…");
-                if (running) { DoStop(); DoStart(); return; }
+                if (running) { _pendingRestart = true; DoStop(); return; }
                 RefreshUi();
                 return;
+            }
+
+            // 节点模式下点「开启全局模式」= 用户明确要求接管系统代理。
+            // 这时不能再让着别人（否则这个按钮就是空转的），先问一句再抢。
+            if (_nodeMode && _cfg.UseTun == false)
+            {
+                var r0 = MessageBox.Show(this,
+                    "现在有别的程序在管理系统代理（全局模式需要接管它）。\r\n\r\n" +
+                    "接管之后那个程序会暂时不生效，直到你关闭全局模式或停止借网。\r\n\r\n" +
+                    "确定要接管吗？",
+                    "开启全局模式", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (r0 != MessageBoxResult.Yes) return;
+                _forceTakeover = true;
+                Log("用户要求接管系统代理（全局模式）");
             }
 
             if (!Elevator.IsAdmin())
@@ -919,7 +955,7 @@ namespace Ferry
             _cfg.UseTun = true;
             try { _cfg.Save(_cfgPath); } catch (Exception) { }
             Log("全局模式已开启");
-            if (running) { DoStop(); DoStart(); return; }
+            if (running) { _pendingRestart = true; DoStop(); return; }
             RefreshUi();
         }
 
