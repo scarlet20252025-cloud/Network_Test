@@ -1,3 +1,62 @@
+## v0.14.10 — 2026-10-27
+
+> 客户端 1.0.13 收尾：**分流在各种切换下都验过了**，顺带修掉三个隐患。
+
+### 一、修掉三个隐患
+
+**① 没装 Clash 的用户：域名没走本地解析**
+
+`ConnectSmart` 里「没有别的代理」那条分支直接传了原始域名给上游 —— 而远端
+（pcs）的 DNS 被污染，等于让上游拿假地址去连。现在所有分支都先 `PreferIp`。
+
+**② 节点模式下会成环**
+
+节点模式的含义是「用户把渡口当成一个节点加进他自己的 Clash 了」，
+流量是 Clash 主动送过来的。如果这时还按「境外」把流量送回 Clash，
+就是 `Clash → 渡口 → Clash` 的死循环。
+
+修法：`FerryRuntime.AllowSplit`，节点模式下设 false，一个都不分流。
+
+**③ 分流日志会刷屏**
+
+分流是**每条连接**都判的，浏览器打开一个页面几十条连接。代理挂掉时如果每条
+都写一行，日志几分钟就几 MB，真正的错误反被冲掉。改成 `LogOnce` 按目标去重。
+
+### 二、场景验证（测试机 10.113.66.6，真实借网）
+
+| 场景 | 期望 | 结果 |
+|---|---|---|
+| 接管模式 + 有本机代理 | 国内走渡口、境外走本机代理 | ✅ |
+| 接管模式 + 没有本机代理 | 全走渡口，不抛异常 | ✅ |
+| 节点模式（AllowSplit=false） | 一个都不分流，不成环 | ✅ |
+| 本机代理中途挂掉 | 境外回落渡口，不抛异常 | ✅ |
+| `DetectLocalProxy` | 能找到、能排除自己 | ✅ |
+
+```
+PASS  domestic -> ferry (local proxy untouched)
+PASS  foreign -> local proxy (hits=1)
+PASS  no exception when local proxy is gone (rep=5)
+PASS  node mode: foreign NOT sent back to local proxy (no loop)
+PASS  no proxy: domestic still works through ferry (rep=0)
+ALL PASS
+```
+
+生命周期回归 22 项同时全过（借网/直连反复切换、Clash 开关、UDP、残局清理）。
+
+### 三、一个明确的边界
+
+**UDP 不分流**。SOCKS5 的 UDP ASSOCIATE 是「一个关联承载所有目标」
+（每条数据报自己带目标地址），建立关联时根本不知道后面会发给谁，
+所以只能选一条上游 —— 选渡口（用户要的是「借网打游戏」，那是国内游戏服务器）。
+
+境外 UDP 走不通。但渡口本来就不做翻墙，这是明确边界，不是缺陷。
+
+### 四、回归工具
+
+- `tools/verify-scenarios.cs`：上面 5 个场景
+- `tools/verify-split.cs`：分流基础行为（国内/境外/域名本地解析）
+- `tools/verify-lifecycle.cs`：借网生命周期 22 项
+
 ## v0.14.9 — 2026-10-27
 
 > 客户端 1.0.13：**借网时不再和 Clash 打架** —— 国内走渡口，境外交给你自己的代理。

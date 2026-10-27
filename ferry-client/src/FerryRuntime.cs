@@ -71,6 +71,14 @@ namespace Ferry
         /// 端口从 config 的 httpPort 起找空闲的 —— 用户可以在 config 里指定，
         /// 但被占用时会自动往上挪（Clash 常占 10808/10809）。
         /// </summary>
+        /// <summary>
+        /// 是否允许「国内走渡口 / 境外交给本机代理」的分流。
+        ///
+        /// 节点模式下必须设成 false：那时用户是把渡口当成一个节点加进他自己的
+        /// Clash 的，流量由 Clash 主动送来；再按「境外」送回 Clash 就成环。
+        /// </summary>
+        public bool AllowSplit = true;
+
         public string Start()
         {
             if (_running) return "";
@@ -155,7 +163,7 @@ namespace Ferry
             //
             // 所以让渡口自己分流：国内目标走渡口，其余交给用户那个代理。他什么都
             // 不用配，Clash 照常开着就行。
-            int clashPort = FerryCore.DetectLocalProxy(_httpPort);
+            int clashPort = AllowSplit ? FerryCore.DetectLocalProxy(_httpPort) : 0;
             if (clashPort > 0)
             {
                 _proxy.SetForeignProxy(clashPort, "127.0.0.1");

@@ -46,6 +46,9 @@ namespace Ferry
         int _clashPort;
         string _clashHost = "127.0.0.1";
 
+        /// <summary>已经记过日志的告警 key（见 LogOnce）。</summary>
+        readonly HashSet<string> _loggedOnce = new HashSet<string>();
+
         TcpListener _listener;
         volatile bool _running;
         long _connTotal, _connActive, _bytesUp, _bytesDown;
@@ -83,7 +86,15 @@ namespace Ferry
             _log = log ?? delegate { };
         }
 
-        /// <summary>设置「境外流量交给谁」。port=0 表示不分流（全部走渡口）。</summary>
+        /// <summary>
+        /// 设置「境外流量交给谁」。port=0 表示不分流（全部走渡口）。
+        ///
+        /// 什么时候**不**分流（port 传 0）：
+        ///   · 节点模式：用户把渡口当成一个节点加进了他自己的 Clash，流量是 Clash
+        ///     主动送过来的。这时候再按「境外」把流量送回 Clash，就成环了
+        ///     （Clash → 渡口 → Clash）。
+        ///   · 本机没检测到别的代理：没有可以交接的对象。
+        /// </summary>
         public void SetForeignProxy(int port, string host)
         {
             _clashPort = port;
@@ -315,7 +326,13 @@ namespace Ferry
             Socket upCtrl = null, clientSock = null, remoteSock = null;
             try
             {
-                // ① 先向上游要一个 UDP 端点
+                // ① 先向上游要一个 UDP 端点。
+                //
+                // 为什么 UDP 不跟 TCP 一样按目标分流：SOCKS5 的 UDP ASSOCIATE
+                // 是**一个关联承载所有目标**（每条数据报自己带目标地址），
+                // 建立关联时根本不知道后面会发给谁。所以 UDP 只能选一条上游，
+                // 这里选渡口（用户要的是「借网打游戏」，那是国内游戏服务器）。
+                // 境外 UDP 走不通——但渡口本来就不做翻墙，这是明确的边界。
                 IPEndPoint upEp;
                 upCtrl = AssociateUpstream(_socksPort, _socksHost, out upEp, 8000);
                 if (upCtrl == null)
@@ -515,18 +532,16 @@ namespace Ferry
         Socket ConnectSmart(string host, int port, int timeoutMs)
         {
             bool cn = IsDomestic(host);
-            _log("分流判定 " + host + " -> " + (cn ? "国内(走渡口)" : "境外(走本机代理)") +
-                 "  clashPort=" + _clashPort);
 
             if (_clashPort <= 0)
-                return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+                return ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
 
             if (cn)
             {
                 var s1 = ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
                 if (s1 != null) return s1;
-                _log("国内目标连不上，改走本机代理：" + host);
-                return ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
+                LogOnce("国内目标连不上，改走本机代理", host);
+                return ConnectSocks(_clashPort, PreferIp(host), port, timeoutMs, _clashHost);
             }
 
             // 境外：交给用户本机的代理。域名先本地解析成 IP 再传下去 ——
@@ -534,8 +549,27 @@ namespace Ferry
             // 这条链路上不可信；本地拿到什么就传什么，至少是我们自己看到的地址。
             var s2 = ConnectSocks(_clashPort, PreferIp(host), port, timeoutMs, _clashHost);
             if (s2 != null) return s2;
-            _log("本机代理连不上，改走渡口：" + host);
+            LogOnce("本机代理连不上，改走渡口", host);
             return ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
+        }
+
+        /// <summary>
+        /// 同一类告警只记一次（按 key 去重）。
+        ///
+        /// 为什么：分流是**每条连接**都要判的。浏览器打开一个页面会建几十条连接，
+        /// 代理挂掉时如果每条都写一行日志，日志文件几分钟就几 MB，真正的错误反而
+        /// 被冲掉了。去重之后「某个目标一直走不通」这件事仍然看得见。
+        /// </summary>
+        void LogOnce(string what, string key)
+        {
+            string id = what + "|" + key;
+            lock (_loggedOnce)
+            {
+                if (_loggedOnce.Contains(id)) return;
+                if (_loggedOnce.Count > 500) _loggedOnce.Clear();   // 别无限长
+                _loggedOnce.Add(id);
+            }
+            _log(what + "：" + key);
         }
 
         /// <summary>
