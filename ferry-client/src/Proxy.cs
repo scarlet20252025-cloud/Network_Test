@@ -536,10 +536,19 @@ namespace Ferry
             if (_clashPort <= 0)
                 return ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
 
+            // 国内目标走渡口时不要等满 8 秒：国内 RTT 普遍 < 100ms，
+            // 建连 2.5 秒还没成基本就是那个目标从出口不可达。等满会卡住页面。
+            int quickMs = Math.Min(timeoutMs, CnConnectMs);
+
             if (cn)
             {
-                var s1 = ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
+                // 刚失败过的目标直接走另一条 —— 否则每次重连都要重等一遍。
+                if (RecentlyFailed("ferry", host, port))
+                    return ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
+
+                var s1 = ConnectSocks(_socksPort, PreferIp(host), port, quickMs, _socksHost);
                 if (s1 != null) return s1;
+                MarkFailed("ferry", host, port);
                 LogOnce("国内目标连不上，改走本机代理", host);
                 return ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
             }
@@ -547,10 +556,43 @@ namespace Ferry
             // 境外：交给用户本机的代理，**传原始域名**。
             // 不能用 PreferIp：国内 DNS 解析墙外域名拿到的是污染地址，
             // 传过去 Clash 就会去连那个假 IP（明明它自己有干净的解析）。
+            if (RecentlyFailed("clash", host, port))
+                return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+
             var s2 = ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
             if (s2 != null) return s2;
+            MarkFailed("clash", host, port);
             LogOnce("本机代理连不上，改走渡口", host);
             return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+        }
+
+        /// <summary>国内目标连渡口最多等这么久（见 ConnectSmart 注释）。</summary>
+        const int CnConnectMs = 2500;
+
+        /// <summary>失败记忆保留多久。太短起不到作用，太长会让「临时抖动」变成长期绕路。</summary>
+        const int FailMemoSec = 300;
+
+        static readonly Dictionary<string, DateTime> _recentFail =
+            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        static bool RecentlyFailed(string via, string host, int port)
+        {
+            string key = via + "|" + host + ":" + port;
+            lock (_recentFail)
+            {
+                DateTime until;
+                return _recentFail.TryGetValue(key, out until) && until > DateTime.UtcNow;
+            }
+        }
+
+        static void MarkFailed(string via, string host, int port)
+        {
+            string key = via + "|" + host + ":" + port;
+            lock (_recentFail)
+            {
+                if (_recentFail.Count > 4000) _recentFail.Clear();   // 别无限长
+                _recentFail[key] = DateTime.UtcNow.AddSeconds(FailMemoSec);
+            }
         }
 
         /// <summary>
@@ -830,25 +872,50 @@ namespace Ferry
 
         static List<IPAddress> ResolveCn(string host)
         {
+            // 三个 DNS 并发问，谁先给出答案用谁。
+            //
+            // 原来是串行：每个 1200ms 超时，解析不了就依次等满三个 ——
+            // 最坏 3.6 秒。分流是**每个新域名**都要判一次的，这个等待直接
+            // 变成页面卡顿（用户反馈的「偶发性的小卡顿」）。
+            // 并发之后最坏只等 1.2 秒。
+            var req = BuildDnsQuery(host);
+            var results = new List<IPAddress>();
+            var done = new ManualResetEvent(false);
+            int pending = CnDns.Length;
+            object gate = new object();
+
             foreach (var dns in CnDns)
             {
-                try
+                var server = dns;
+                ThreadPool.QueueUserWorkItem(delegate
                 {
-                    var req = BuildDnsQuery(host);
-                    var ep = new IPEndPoint(IPAddress.Parse(dns), 53);
-                    using (var u = new System.Net.Sockets.UdpClient())
+                    try
                     {
-                        u.Client.ReceiveTimeout = 1200;
-                        u.Send(req, req.Length, ep);
-                        var from = new IPEndPoint(IPAddress.Any, 0);
-                        var resp = u.Receive(ref from);
-                        var got = ParseDnsAnswers(resp);
-                        if (got.Count > 0) return got;
+                        var ep = new IPEndPoint(IPAddress.Parse(server), 53);
+                        using (var u = new System.Net.Sockets.UdpClient())
+                        {
+                            u.Client.ReceiveTimeout = 1200;
+                            u.Send(req, req.Length, ep);
+                            var from = new IPEndPoint(IPAddress.Any, 0);
+                            var resp = u.Receive(ref from);
+                            var got = ParseDnsAnswers(resp);
+                            if (got.Count > 0)
+                            {
+                                lock (gate) { if (results.Count == 0) results.AddRange(got); }
+                                done.Set();
+                            }
+                        }
                     }
-                }
-                catch (Exception) { }
+                    catch (Exception) { }
+                    finally
+                    {
+                        if (Interlocked.Decrement(ref pending) == 0) done.Set();
+                    }
+                });
             }
-            return null;
+
+            done.WaitOne(1400);
+            lock (gate) { return results.Count > 0 ? results : null; }
         }
 
         static byte[] BuildDnsQuery(string host)
