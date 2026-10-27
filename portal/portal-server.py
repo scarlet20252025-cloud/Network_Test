@@ -1536,18 +1536,21 @@ def download_page(detected_ip=''):
          装一次，之后点一下就能接通，不用改任何网络配置。</p>
       <div class="dl-actions">
         <a class="btn btn-main" href="/download-cmd">&#9889; 一键安装</a>
-        <a class="btn btn-ghost" href="/download">直接下载 .exe</a>
+        <a class="btn btn-ghost" href="/download">下载安装包 .exe</a>
+        <a class="btn btn-ghost" href="/download-portable">&#128230; 绿色版（解压即用）</a>
       </div>
-      <p style="font-size:13px;color:var(--muted);margin:10px 0 0">
-        装不上、报 <code>错误 4551</code>（应用控制策略拦截）？
-        用 <a href="/download-portable" style="color:var(--accent)">免安装版</a> &mdash;&mdash;
-        解压就能用，不经过系统临时目录。
-      </p>
       <div class="dl-trust">
+        <span>三个入口功能完全一样</span>
         <span>不需要管理员权限</span>
         <span>不弹 UAC</span>
         <span>升级不丢激活</span>
       </div>
+      <p style="font-size:13px;color:var(--fg2);margin:12px 0 0;line-height:1.7">
+        <b>绿色版</b>是完整的软件包：解压到任意目录，双击 <code>渡口助手.exe</code> 就能用，
+        借网 / 全局模式 / 自动更新 / 开机自启全都在。它唯一的不同是<strong>不安装</strong> ——
+        不写注册表、不进「程序和功能」、卸载就是删文件夹。<br>
+        装不上的机器（报 <code>错误 4551</code>，应用控制策略拦截安装程序）用这个就行。
+      </p>
     </div>
 
     <div class="dl-card">
