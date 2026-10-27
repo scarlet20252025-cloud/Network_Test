@@ -58,7 +58,45 @@ namespace Ferry
         /// 不设上限的话一个坏掉的客户端（反复重连不停）能把线程刷爆。
         /// 32 条足够覆盖「游戏 + 语音 + 几个 P2P」的并发。</summary>
         int _udpAssoc;
-        const int MaxUdpAssoc = 32;
+        const int MaxUdpAssoc = 96;
+
+        // ── UDP 关联的统计与降噪 ──
+        //
+        // mihomo 给每个 UDP 流建一个关联（语音、游戏、浏览器的 QUIC 各算各的），
+        // 每秒能建好几个。如果每条都写日志，界面会被整屏刷掉，真正要看的东西
+        // （失败、被拒）反而看不见 —— 用户反馈的「怎么一直刷这个」就是这个。
+        // 改成 60 秒汇总一行。
+        static int _udpAssocNow;
+        static int _udpAssocPeak;
+        static long _udpPktsUp, _udpPktsDown;
+        static DateTime _udpStatsNext = DateTime.UtcNow.AddSeconds(60);
+        static readonly object _udpStatsLock = new object();
+
+        void UdpAssocOpened()
+        {
+            int now = Interlocked.Increment(ref _udpAssocNow);
+            lock (_udpStatsLock) { if (now > _udpAssocPeak) _udpAssocPeak = now; }
+            UdpStatsTick();
+        }
+
+        void UdpAssocClosed()
+        {
+            Interlocked.Decrement(ref _udpAssocNow);
+            UdpStatsTick();
+        }
+
+        void UdpStatsTick()
+        {
+            lock (_udpStatsLock)
+            {
+                if (DateTime.UtcNow < _udpStatsNext) return;
+                _udpStatsNext = DateTime.UtcNow.AddSeconds(60);
+                _log("UDP 关联 " + _udpAssocNow + " 个（峰值 " + _udpAssocPeak + "），"
+                     + "累计上下行包 " + Interlocked.Read(ref _udpPktsUp) + " / "
+                     + Interlocked.Read(ref _udpPktsDown));
+                _udpAssocPeak = _udpAssocNow;
+            }
+        }
 
         /// <summary>
         /// 同时处理的连接上限。
@@ -354,7 +392,17 @@ namespace Ferry
                                        (byte)(relayPort >> 8), (byte)(relayPort & 0xFF) };
                 ns.Write(bnd, 0, bnd.Length);
                 ns.Flush();
-                _log("UDP 关联 " + clientEp + " → 127.0.0.1:" + relayPort + " ⇒ 上游 " + upEp);
+
+                // 不再每条都写日志：mihomo 给每个 UDP 流建一个关联，
+                // 语音 + 游戏 + QUIC 一秒钟能建好几个，界面会被整屏刷掉，
+                // 真正要看的东西（失败、被拒）反而看不见。
+                // 改成 60 秒汇总一行，见 UdpStatsTick。
+                UdpAssocOpened();
+
+                // 空闲回收：mihomo 用完不会主动关 TCP 控制连接，
+                // 我们自己盯着 —— 20 秒没包就收摊，把名额还给后面的人。
+                // 语音/游戏的流是持续的，不会被误杀。
+                var lastActive = DateTime.UtcNow;
 
                 var cs = clientSock; var rs = remoteSock;
                 var ctrl = upCtrl;
@@ -381,6 +429,8 @@ namespace Ferry
                             {
                                 udpPeer = fe;          // 记下真实 UDP 源地址
                                 rs.SendTo(buf, 0, n, SocketFlags.None, upEp);
+                                lastActive = DateTime.UtcNow;
+                                Interlocked.Add(ref _udpPktsUp, 1);
                             }
                         }
                         catch (Exception) { break; }
@@ -399,6 +449,8 @@ namespace Ferry
                             EndPoint from = new IPEndPoint(IPAddress.Any, 0);
                             int n = rs.ReceiveFrom(buf, ref from);
                             var peer = udpPeer ?? clientEp;
+                    lastActive = DateTime.UtcNow;
+                    Interlocked.Add(ref _udpPktsDown, 1);
                             if (n > 0) cs.SendTo(buf, 0, n, SocketFlags.None, peer);
                         }
                         catch (Exception) { break; }
@@ -407,11 +459,23 @@ namespace Ferry
                 downThread.IsBackground = true;
                 downThread.Start();
 
-                // 阻塞在客户端的控制连接上：它一关，关联就结束
+                // 阻塞在客户端的控制连接上：它一关，关联就结束。
+                // 但 mihomo 不会主动关它，所以还要看空闲时间 ——
+                // 20 秒一个 UDP 包都没有，说明这条流早就不用了。
                 try
                 {
                     var sink = new byte[16];
-                    while (ns.Read(sink, 0, sink.Length) > 0) { }
+                    ns.ReadTimeout = 1000;          // 1 秒超时，用来看空闲
+                    for (; ; )
+                    {
+                        if ((DateTime.UtcNow - lastActive).TotalSeconds > 20) break;
+                        try
+                        {
+                            if (ns.Read(sink, 0, sink.Length) <= 0) break;
+                            lastActive = DateTime.UtcNow;
+                        }
+                        catch (System.IO.IOException) { }   // 超时，回到循环顶看空闲
+                    }
                 }
                 catch (Exception) { }
 
@@ -419,7 +483,7 @@ namespace Ferry
                 try { cs.Close(); } catch (Exception) { }
                 try { rs.Close(); } catch (Exception) { }
                 try { ctrl.Close(); } catch (Exception) { }
-                _log("UDP 关联结束：" + clientEp);
+                UdpAssocClosed();
             }
             catch (Exception)
             {
