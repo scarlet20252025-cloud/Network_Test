@@ -515,45 +515,100 @@ namespace Ferry
         Socket ConnectSmart(string host, int port, int timeoutMs)
         {
             bool cn = IsDomestic(host);
+            _log("分流判定 " + host + " -> " + (cn ? "国内(走渡口)" : "境外(走本机代理)") +
+                 "  clashPort=" + _clashPort);
 
             if (_clashPort <= 0)
                 return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
 
             if (cn)
             {
-                var s1 = ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+                var s1 = ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
                 if (s1 != null) return s1;
                 _log("国内目标连不上，改走本机代理：" + host);
                 return ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
             }
 
-            var s2 = ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
+            // 境外：交给用户本机的代理。域名先本地解析成 IP 再传下去 ——
+            // 用户那个代理多半也把域名丢给上游解析，而墙外域名的解析结果在
+            // 这条链路上不可信；本地拿到什么就传什么，至少是我们自己看到的地址。
+            var s2 = ConnectSocks(_clashPort, PreferIp(host), port, timeoutMs, _clashHost);
             if (s2 != null) return s2;
             _log("本机代理连不上，改走渡口：" + host);
-            return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+            return ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
+        }
+
+        /// <summary>
+        /// 能本地解析成 IP 就把域名换成 IP 再交给上游。
+        ///
+        /// 为什么：远端（pcs）的 DNS 被污染，把域名丢给上游解析等于让它拿假地址
+        /// （google.com → 31.13.92.37）。本地解析虽然也可能被污染，但至少是
+        /// 「客户端所在网络看到的结果」，而且借网期间客户端的 DNS 是通的。
+        /// 解析不出来就退回原域名 —— 有些站只认 SNI 里的域名，传 IP 反而错。
+        /// </summary>
+        static string PreferIp(string host)
+        {
+            IPAddress ip;
+            if (IPAddress.TryParse(host, out ip)) return host;
+            var addrs = ResolveLocal(host);
+            if (addrs == null || addrs.Count == 0) return host;
+            return addrs[0].ToString();
         }
 
         /// <summary>
         /// 这个目标是「国内」的吗？
         ///
-        /// 判据刻意做得粗糙且保守：**只有明确解析得到国内 IP 才算国内**。
-        /// 因为判错的代价不对称 —— 把国内站判成境外，走 Clash 也还是能上（慢一点）；
-        /// 把墙外站判成国内，走渡口就永远打不开。
+        /// 判据：**只有解析出的地址明确落在国内分配段里才算国内**（段表来自 APNIC）。
+        ///
+        /// 为什么保守：判错的代价不对称。
+        ///   · 国内站判成境外 → 走用户的代理，还是能上，只是多绕一跳；
+        ///   · 墙外站判成国内 → 走渡口出口，远端 DNS 被污染 + 目标 IP 不可达，
+        ///     永远打不开，而且没有任何报错可查。
+        ///
+        /// 为什么必须在**客户端**解析域名：远端（pcs）的 DNS 被污染，
+        /// google.com 会解析成 31.13.92.37（Facebook 的段）。拿污染结果判断
+        /// 会得出「这是国内」的错误结论，然后走渡口 → 永远打不开。
+        /// 本地解析之后把 IP 交给上游，还顺带绕开了污染本身。
         /// </summary>
         bool IsDomestic(string host)
         {
             IPAddress ip;
             if (IPAddress.TryParse(host, out ip))
-                return IsDomesticIp(ip);
+                return CnIpRanges.Contains(ip);
 
-            // 域名：问国内 DNS。解析得到 → 这域名在国内是通的 → 走渡口。
-            // 解析不到（被墙的域名在国内 DNS 上通常也是空的或污染）→ 交给 Clash。
-            var addrs = ResolveCn(host);
-            if (addrs == null || addrs.Count == 0) return false;
+            var addrs = ResolveLocal(host);
+            if (addrs == null || addrs.Count == 0)
+                return false;    // 解析不出来 → 当境外（交给用户的代理）
+
             foreach (var a in addrs)
-                if (IsDomesticIp(a)) return true;
+                if (CnIpRanges.Contains(a)) return true;
             return false;
         }
+
+        /// <summary>
+        /// 在客户端本地解析域名：先问系统 DNS（快，国内域名基本都能拿到国内 IP），
+        /// 拿不到再问国内公共 DNS。
+        ///
+        /// 不做 DoH：用户来借网的前提就是「上不了网」，DoH 在这种环境下也不通；
+        /// 而借网期间系统 DNS 走校园网，解析国内域名没问题。
+        /// </summary>
+        static List<IPAddress> ResolveLocal(string host)
+        {
+            var list = new List<IPAddress>();
+            try
+            {
+                foreach (var a in Dns.GetHostAddresses(host))
+                    if (a.AddressFamily == AddressFamily.InterNetwork) list.Add(a);
+            }
+            catch (Exception) { }
+            if (list.Count > 0) return list;
+
+            var cn = ResolveCn(host);
+            if (cn != null && cn.Count > 0) return cn;
+            return list;
+        }
+
+
 
         static readonly string[] CnDns = new string[] { "223.5.5.5", "119.29.29.29", "114.114.114.114" };
 
@@ -626,57 +681,6 @@ namespace Ferry
             }
             catch (Exception) { }
             return list;
-        }
-
-        /// <summary>
-        /// 粗判「这个 IP 是不是国内」。不追求精确（那要 GeoIP 库，几十 MB），
-        /// 只把「几乎肯定不是国内」的排掉：私网、保留段、以及已知的境外大块。
-        /// 剩下的当作国内 —— 因为判成国内的代价（走渡口）对国内站是**正确**的，
-        /// 而真正的墙外站基本都是 Cloudflare/Google/AWS 这些一眼能认的段。
-        /// </summary>
-        static bool IsDomesticIp(IPAddress ip)
-        {
-            if (ip.AddressFamily != AddressFamily.InterNetwork) return false;
-            var b = ip.GetAddressBytes();
-
-            // 私网 / 回环 / 链路本地 / 保留：都当国内（直连语义）
-            if (b[0] == 10 || b[0] == 127) return true;
-            if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true;
-            if (b[0] == 192 && b[1] == 168) return true;
-            if (b[0] == 169 && b[1] == 254) return true;
-            if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return true;
-            if (b[0] >= 224) return true;
-
-            // 已知境外大块（这些段里的服务在国内基本要翻墙，或者翻墙更快）
-            if (b[0] == 8 && b[1] == 8) return false;                       // 8.8.8.8
-            if (b[0] == 1 && b[1] == 1) return false;                        // 1.1.1.1
-            if (b[0] == 104 && b[1] >= 16 && b[1] <= 31) return false;       // Cloudflare
-            if (b[0] == 172 && b[1] == 67) return false;                     // Cloudflare
-            if (b[0] == 162 && b[1] == 159) return false;                    // Cloudflare
-            if (b[0] == 142 && b[1] == 250) return false;                    // Cloudflare
-            if (b[0] == 188 && b[1] == 114) return false;                    // Cloudflare DNS
-            if (b[0] == 31 && b[1] >= 13 && b[1] <= 14) return false;        // 31.13.x  Facebook
-            if (b[0] == 157 && b[1] == 240) return false;                    // Facebook
-            if (b[0] == 74 && b[1] >= 86 && b[1] <= 125) return false;       // Facebook
-            if (b[0] == 216 && b[1] == 58) return false;                     // Google
-            if (b[0] == 142 && b[1] >= 250 && b[1] <= 251) return false;     // Google
-            if (b[0] == 34 && b[1] >= 64 && b[1] <= 128) return false;       // Google Cloud
-            if (b[0] == 35 && b[1] >= 184 && b[1] <= 255) return false;      // Google Cloud
-            if (b[0] == 13 && b[1] >= 32 && b[1] <= 35) return false;        // AWS
-            if (b[0] == 52 && b[1] >= 0 && b[1] <= 95) return false;         // AWS
-            if (b[0] == 54 && b[1] >= 64 && b[1] <= 255) return false;       // AWS
-            if (b[0] == 18 && b[1] >= 128 && b[1] <= 255) return false;      // AWS
-            if (b[0] == 151 && b[1] == 101) return false;                    // Discord
-            if (b[0] == 162 && b[1] == 125) return false;                    // Discord
-            if (b[0] == 199 && b[1] == 232) return false;                    // GitHub
-            if (b[0] == 140 && b[1] == 82) return false;                     // GitHub
-            if (b[0] == 185 && b[1] == 199) return false;                    // GitHub
-            if (b[0] == 91 && b[1] == 108) return false;                     // Telegram
-            if (b[0] == 149 && b[1] == 154) return false;                    // Telegram
-            if (b[0] == 66 && b[1] == 220) return false;                     // Wikipedia
-            if (b[0] == 208 && b[1] == 80) return false;                     // Wikipedia
-
-            return true;
         }
 
         void HandleHttp(NetworkStream ns, byte firstByte)
