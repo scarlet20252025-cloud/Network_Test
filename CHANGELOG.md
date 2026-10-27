@@ -1,3 +1,77 @@
+## v0.14.24 — 2026-10-27
+
+> 客户端 1.0.27：**线程从「每连接 3 个」降到 1 个** —— 修「整个网速都很慢」。
+
+### 现象
+
+> 整个网速都很慢
+> 之前一直都是没问题的。就刚刚突然卡了
+
+查了一下用户机器上的进程：
+
+```
+渡口助手.exe   pid 29048
+线程数   298
+工作集   145 MB
+累计 CPU 180 秒
+```
+
+298 个线程。算一下来源：
+
+```
+每个被代理的 TCP 连接 = HandleConn 线程 + 上下行各 1 个 copy 线程 = 3 个
+浏览器 keep-alive 把连接挂很久
+TUN 接管后**所有程序的所有连接**都进这里
+→ 100 个连接 = 300 线程
+```
+
+线程一多，上下文切换 + 每个线程 1 MB 栈，整机都跟着慢。
+
+### 为什么之前不慢
+
+因为线程是**逐步累积**的：开一堆网页、看视频、语音、游戏，
+keep-alive 连接一个个挂上来，每个贡献 3 个线程。到了 300 线程才明显。
+
+### 修法：转发改成异步 IO
+
+`copy` 原来是同步阻塞的 `src.Read()`，只能用专用线程顶着。
+改成 `ReadAsync/WriteAsync` 之后，等数据时线程会还给系统（IOCP），
+两个方向用一个 `Task.WhenAny` 收尾：
+
+```
+每个连接：3 线程 → 1 线程
+100 个连接：300 → 100
+```
+
+代码里原来有一条注释警告「别用 Task 跑 copy」——那说的是**把同步阻塞代码
+丢进线程池**（每秒只扩容 1~2 个线程，会积压）。这里是真异步，
+等待期间不占线程，语义完全不同。注释已改写说明区别。
+
+保留的行为不变：任一方向结束就收尾（HTTP 请求体传完不等 EOF）、64 KB 缓冲、
+字节统计、3 秒收尾兜底、6 小时防半开。
+
+### 验证
+
+线程数（本机，60 条空闲连接）：
+
+```
+threads before: 7
+threads with 60 idle conns: 67     ← delta = 60，即每连接 1 个
+threads after closing: 7           ← 全部释放，没有泄漏
+```
+
+功能（真连渡口访问 www.baidu.com）：
+
+```
+PASS  socks handshake
+PASS  socks connect success
+   bytes received: 18159
+PASS  got response body through the async pump
+   concurrent ok: 20/20
+PASS  at least 15 of 20 concurrent connections succeeded
+ALL PASS
+```
+
 ## v0.14.23 — 2026-10-27
 
 > 客户端 1.0.26：**游戏 UDP 一直是断的** —— 修「打 CS2 延迟突然跳到 130ms」。

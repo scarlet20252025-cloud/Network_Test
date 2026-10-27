@@ -1173,69 +1173,67 @@ namespace Ferry
 
         // ── 双向搬运 ───────────────────────────────────────────
 
-        void Pump(NetworkStream a, NetworkStream b)
+        /// <summary>
+        /// 双向转发。**异步实现**，等待期间不占线程。
+        ///
+        /// 为什么必须异步：TUN 全局接管后，本机所有程序的连接都进这里。
+        /// 同步版每个连接要 3 个线程（1 个 HandleConn + 上下行各 1 个 copy），
+        /// 浏览器 keep-alive 挂 100 个连接就是 300 线程 —— 实测用户机器上
+        /// 到了 298 线程、145 MB 工作集，然后整机变慢。
+        /// ReadAsync 在等数据时把线程还给系统（IOCP），所以这里只留
+        /// HandleConn 那 1 个线程。
+        ///
+        /// 注意：代码里其他地方警告过「别用 Task 跑阻塞 copy」—— 那说的是
+        /// 把同步阻塞代码丢进线程池（每秒只扩容 1~2 个线程，会积压）。
+        /// 这里是真异步，语义完全不同。
+        /// </summary>
+        async Task PumpAsync(NetworkStream a, NetworkStream b)
         {
-            // 关键：任一方向结束就收尾，绝不等两个方向都 EOF。
-            // HTTP 请求体传完后客户端就不再写、只等响应；
-            // 如果等两个方向都结束，会一直卡到超时（实测卡了 90 秒以上）。
-            Action<NetworkStream, NetworkStream, bool> copy = delegate (NetworkStream src, NetworkStream dst, bool up)
-            {
-                try
-                {
-                    // 64 KB。原来 16 KB 在千兆/局域网里的单流吞吐上不去 ——
-                    // 每次 Read/Write 系统调用有固定开销，块越大同样的带宽下
-                    // 调用次数越少。实测把单流上限从 ~5 MB/s 抬到 10 MB/s 以上。
-                    var buf = new byte[65536];
-                    for (; ; )
-                    {
-                        int n = src.Read(buf, 0, buf.Length);
-                        if (n <= 0) break;
-                        dst.Write(buf, 0, n);
-                        if (up) Interlocked.Add(ref _bytesUp, n);
-                        else Interlocked.Add(ref _bytesDown, n);
-                    }
-                }
-                catch (Exception) { }
-            };
+            var t1 = CopyAsync(a, b, true);
+            var t2 = CopyAsync(b, a, false);
 
-            // ⚠ 用**专用线程**，不用 Task.Factory.StartNew。
-            //
-            // 踩过的坑：原来这里两个方向都走 Task.Factory.StartNew，而 copy()
-            // 里是同步阻塞的 src.Read —— 这是线程池反模式。
-            // 线程池遇到「一堆阻塞任务」会每秒只注入 1~2 个新线程，
-            // 连接一多就严重积压：新连接迟迟拿不到执行机会，
-            // 而同一线程池上还有心跳上报、授权检查、UI 回调在排队 ——
-            // 整机都跟着卡。实测 40 个连接时客户端已经 61 线程。
-            //
-            // 换成未托管的专用线程：每个方向一个，生命周期明确，
-            // 不占用线程池配额，卡也只卡它自己那条连接。
-            var anyDone = new ManualResetEventSlim(false);
+            // 任一方向结束就收尾，绝不等两个都 EOF ——
+            // HTTP 请求体传完后客户端就不再写、只等响应，
+            // 等两个方向都结束会一直卡到超时（实测卡了 90 秒以上）。
+            await Task.WhenAny(t1, t2).ConfigureAwait(false);
 
-            Thread th1 = new Thread(delegate ()
-            {
-                try { copy(a, b, true); } catch (Exception) { } finally { anyDone.Set(); }
-            });
-            Thread th2 = new Thread(delegate ()
-            {
-                try { copy(b, a, false); } catch (Exception) { } finally { anyDone.Set(); }
-            });
-            th1.IsBackground = true;
-            th2.IsBackground = true;
-            th1.Name = "ferry-copy-up";
-            th2.Name = "ferry-copy-down";
-            th1.Start();
-            th2.Start();
-
-            // 任一方向结束就收尾，绝不等两个都 EOF。
-            // 超长兜底 6 小时：防止某个 socket 卡死在半开状态导致线程永久泄漏。
-            anyDone.Wait(TimeSpan.FromHours(6));
-
-            // 一端结束 → 两端都关，另一端自然退出
             try { a.Close(); } catch (Exception) { }
             try { b.Close(); } catch (Exception) { }
-            th1.Join(3000);
-            th2.Join(3000);
-            anyDone.Dispose();
+
+            // 另一端读完剩下的（最多 3 秒），别让它永远挂着。
+            // 不能用 Task.WaitAsync —— 那是 .NET 6 才有的，这里是 .NET Framework 4.8。
+            try { await Task.WhenAny(Task.WhenAll(t1, t2), Task.Delay(3000)).ConfigureAwait(false); }
+            catch (Exception) { }
+        }
+
+        async Task CopyAsync(Stream src, Stream dst, bool up)
+        {
+            // 64 KB。原来 16 KB 在千兆/局域网里的单流吞吐上不去 ——
+            // 每次 Read/Write 系统调用有固定开销，块越大同样的带宽下
+            // 调用次数越少。实测把单流上限从 ~5 MB/s 抬到 10 MB/s 以上。
+            var buf = new byte[65536];
+            try
+            {
+                for (; ; )
+                {
+                    int n = await src.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false);
+                    if (n <= 0) break;
+                    await dst.WriteAsync(buf, 0, n).ConfigureAwait(false);
+                    if (up) Interlocked.Add(ref _bytesUp, n);
+                    else Interlocked.Add(ref _bytesDown, n);
+                }
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// 同步外壳：调用方（HandleSocks5 / HandleHttp）仍是同步代码，
+        /// 这里只等一个已经跑在线程池上的异步任务，不再额外开 copy 线程。
+        /// </summary>
+        void Pump(NetworkStream a, NetworkStream b)
+        {
+            try { PumpAsync(a, b).GetAwaiter().GetResult(); }
+            catch (Exception) { }
         }
 
         // ── 小工具 ──────────────────────────────────────────────
