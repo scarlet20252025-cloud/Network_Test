@@ -42,6 +42,7 @@ namespace Ferry
 
         // ── 界面元素 ──
         TextBlock _lblAcct, _lblBig, _lblDesc, _lblQuota;
+        TextBlock _lblVer;
         TextBlock _rowBridge, _rowProxy, _rowTun;
         Border _card;
         TextBlock _lblActTitle, _lblActHint;
@@ -60,6 +61,8 @@ namespace Ferry
         string _exitVia = "";
         string _updPrompted = "";
         string _latestVer = "";
+        int _guardTick;
+        string _guardNote = "";
 
         public bool StartBorrowOnLoad = false;
         public bool AutoUpdateOnLoad = false;
@@ -162,6 +165,18 @@ namespace Ferry
                 DoUpdate(_latestVer);
             };
             rightStack.Children.Add(_btnUpd);
+
+            // 版本号常驻显示（用户要求：放在更新按钮下面，任何时候都能看到）。
+            // 以前只有设置页里能看到版本，排查「他装的是哪一版」得让他去翻设置。
+            _lblVer = new TextBlock
+            {
+                Text = "v" + typeof(MainWindow).Assembly.GetName().Version.ToString(3),
+                FontSize = Palette.FsSmall,
+                Foreground = Palette.MutedB,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 4, 0, 0)
+            };
+            rightStack.Children.Add(_lblVer);
 
             // ── 状态卡 ──
             _card = MakeCard();
@@ -487,7 +502,7 @@ namespace Ferry
             else { Log("尚未激活 —— 在「输入密钥激活」框里填入管理员给的密钥"); _txtCode.Focus(); }
 
             _fast = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-            _fast.Tick += delegate { RefreshUi(); };
+            _fast.Tick += delegate { RefreshUi(); GuardSystemProxy(); };
             _fast.Start();
 
             _slow = new DispatcherTimer { Interval = TimeSpan.FromSeconds(Math.Max(10, _cfg.NetCheckSec)) };
@@ -1036,6 +1051,52 @@ namespace Ferry
             if (_tray != null) { _tray.Visible = false; _tray.Dispose(); }
             Thread.Sleep(600);
             Application.Current.Shutdown();
+        }
+
+        // ── 系统代理守护 ──
+        //
+        // 为什么需要：Clash Verge 启动时会把系统代理设成它自己的 127.0.0.1:7897。
+        // 用户的机器是靠渡口借网上网的，Clash 抢走系统代理后，浏览器就只走 Clash；
+        // 而 Clash 的节点连不上（机场在境外、它的 DNS 又被 TUN 劫持），于是
+        // 表现成「国内网站也打不开、整个网好像断了」。2026-10-28 00:46 实测发生。
+        //
+        // 守护只在「正在借网」时生效：没借网时系统代理归谁管都无所谓。
+        // 每 3 秒看一次（_fast 是 1 秒一跳），避免每秒读注册表。
+        //
+        // 这里**不强行打开**代理：如果代理被关掉了，可能是用户在手动切直连，
+        // 渡口只管「被别人改走」这一种情况。
+        void GuardSystemProxy()
+        {
+            _guardTick++;
+            if (_guardTick % 3 != 0) return;
+            try
+            {
+                if (_rt == null || !_rt.Running) return;
+                if (!FerryCore.ProxyEnabled()) return;
+                var want = _rt.BorrowServer;
+                var cur = FerryCore.ProxyServer();
+                if (SameEndpoint(cur, want)) return;
+                FerryCore.SetProxy(true, want);
+                if (_guardNote != cur)
+                {
+                    _guardNote = cur;
+                    Log("系统代理被其他程序改成 [" + cur + "]，已改回 [" + want + "]（借网期间由渡口持有）");
+                }
+            }
+            catch (Exception) { }
+        }
+
+        // 两种写法都见过：http://127.0.0.1:10802 与 127.0.0.1:10802。
+        static bool SameEndpoint(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            a = a.Trim().ToLowerInvariant();
+            b = b.Trim().ToLowerInvariant();
+            if (a.StartsWith("http://")) a = a.Substring(7);
+            if (b.StartsWith("http://")) b = b.Substring(7);
+            if (a.EndsWith("/")) a = a.Substring(0, a.Length - 1);
+            if (b.EndsWith("/")) b = b.Substring(0, b.Length - 1);
+            return a == b;
         }
 
         // ── 更新 ──
