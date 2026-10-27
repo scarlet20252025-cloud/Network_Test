@@ -226,8 +226,8 @@ namespace Ferry
         }
 
         /// <summary>
-        /// 本机 Clash 的端口。>0 时 TUN 把境外流量交给它，国内走渡口。
-        /// 0 表示没检测到（那就全部走渡口，维持旧行为）。
+        /// 本机 Clash 的端口。1.0.31 起**不再影响规则的生成**（防回环例外
+        /// 无条件写），保留它只为了在日志里说明「这次为什么把境外交给本机代理」。
         /// </summary>
         int _clashPort;
 
@@ -245,12 +245,19 @@ namespace Ferry
             sb.AppendLine("ipv6: false");
             sb.AppendLine("geodata-mode: false");
             sb.AppendLine("geo-auto-update: false");
-            // 进程查找必须打开。TUN 里靠 PROCESS-NAME 把翻墙客户端自己的
-            // 出站放行成 DIRECT —— 否则它连机场的流量被自己的 TUN 抓回来，
-            // 绕成「Clash → TUN → Clash」，表现是：Clash 端口能连、CONNECT
-            // 能成功，但所有境外站点都超时（因为 Clash 连不上机场）。
-            // 默认的 strict 在 gvisor 栈下实测不可靠，改成 always。
-            sb.AppendLine("find-process-mode: always");
+            // 进程查找必须显式打开，PROCESS-NAME 规则才有可能命中。
+            //
+            // 1.0.31 实测（mihomo v1.19.32 + gvisor，测试机 10.113.66.6）：
+            //   strict 与 always 的表现**完全一致**，都能命中：
+            //     [TCP] 198.18.0.1:4243(clash-verge.exe) --> 1.1.1.1:80
+            //           match ProcessName(clash-verge.exe) using DIRECT
+            //   所以用默认的 strict。always 会在每个连接上多查一次进程
+            //   （Windows 上是 GetExtendedTcpTable 一类的系统调用），而用户
+            //   明确抱怨过「卡慢」—— 没有证据支持的开销不要加。
+            //
+            // 1.0.30 写的 always 来自一次误诊：那次的规则其实压根没生成
+            // （见下面 rules 段），不是 strict 不匹配。
+            sb.AppendLine("find-process-mode: strict");
             sb.AppendLine();
             // 不开 mixed-port：TUN 模式下不需要额外的 SOCKS 入口，
             // 开了反而多一个可能被占用的端口。
@@ -328,21 +335,31 @@ namespace Ferry
             sb.AppendLine("    proxies: [ferry-udp]");
             sb.AppendLine();
             sb.AppendLine("rules:");
-            if (_clashPort > 0)
+            // 防回环例外：**无条件写入**，不看有没有检测到本机代理。
+            //
+            // 1.0.30 及之前是 `if (_clashPort > 0)` 才写这一段。用户机 23:44
+            // 的日志是反例：
+            //     23:44:37 没有检测到本机代理，全部流量走渡口
+            // 那一刻 Clash 的 7897 恰好不可达，于是一条 PROCESS-NAME 都没生成；
+            // 用户随后打开 Clash，它连机场的出站被 TUN 抓回来判境外、再交给
+            // Clash、再被抓 —— 死循环。表现就是「Clash 端口能连、CONNECT 200，
+            // 但所有境外站点都超时」。
+            //
+            // 这条规则只在名单里的进程真的存在时才命中，写上是纯保险、没有
+            // 副作用；而依赖「启动那一瞬间恰好检测到 Clash」是一个竞态 ——
+            // 只要用户先起渡口再起 Clash，保险就永远缺失。
+            //
+            // 名单固定、不枚举用户装了什么（踩坑 66 的教训：方案一旦需要
+            // 「知道用户装了什么」，就说明绕路了）。两种写法都写：mihomo
+            // 不同版本对进程名是否带 .exe 的处理不一致，实测两种都能匹配，
+            // 多写一份的成本为零。
+            foreach (var proc in new string[] {
+                "clash-verge", "clash-verge-service", "verge-mihomo",
+                "clash-meta", "Clash for Windows", "v2rayN", "v2ray",
+                "xray", "sing-box", "clash", "mihomo", "nekoray", "nekobox" })
             {
-                sb.AppendLine("  # 本机的翻墙客户端自己要连机场节点 —— 这个出站也会被 TUN 抓到。");
-                sb.AppendLine("  # 不把它排成 DIRECT，就会变成 Clash → TUN → Clash 的死循环。");
-                // 两个写法都加：mihomo 不同版本对「进程名」是否含 .exe 的
-                // 处理不一致，实测只写一种会出现「规则在、但不匹配」的情况 ——
-                // 那会让翻墙客户端的出站被自己的 TUN 抓走，变成死循环。
-                foreach (var proc in new string[] {
-                    "clash-verge", "clash-verge-service", "verge-mihomo",
-                    "clash-meta", "Clash for Windows", "v2rayN", "v2ray",
-                    "xray", "sing-box", "clash", "mihomo", "nekoray", "nekobox" })
-                {
-                    sb.AppendLine("  - PROCESS-NAME," + proc + ",DIRECT");
-                    sb.AppendLine("  - PROCESS-NAME," + proc + ".exe,DIRECT");
-                }
+                sb.AppendLine("  - PROCESS-NAME," + proc + ",DIRECT");
+                sb.AppendLine("  - PROCESS-NAME," + proc + ".exe,DIRECT");
             }
             sb.AppendLine("  # 内网与回环永远直连 —— 否则局域网打印机/共享/远端 SSH 立刻失联");
             sb.AppendLine("  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve");

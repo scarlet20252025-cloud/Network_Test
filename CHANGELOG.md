@@ -1,3 +1,97 @@
+## v0.14.28 — 2026-10-28
+
+> 客户端 1.0.31：TUN 的防回环例外**不再依赖「启动那一瞬间检测到 Clash」**。
+
+### 现象
+
+用户机 23:21~23:30 境外全断，日志只有这一类：
+
+```
+23:21:35 本机代理连不上，改走渡口：backend.accounts.hytale.com
+23:24:11 本机代理连不上，改走渡口：api.ipify.org
+23:29:53 本机代理连不上，改走渡口：registry.npmjs.org
+```
+
+手工验证的结果很矛盾：
+
+```
+TcpClient 连 127.0.0.1:7897  → 成功
+curl -x http://127.0.0.1:7897 https://www.google.com → CONNECT 200，然后 5 秒超时
+渡口自己的 10801 → baidu      → 200（0.17s）
+```
+
+### 根因：规则是「有条件生成」的，而条件是时序敏感的
+
+PROCESS-NAME 防回环例外以前包在 `if (_clashPort > 0)` 里 —— 只有**启动 TUN 的
+那一刻**检测到本机 Clash，才会写进配置。用户机的日志正好记录了那一刻：
+
+```
+23:44:37 没有检测到本机代理，全部流量走渡口
+```
+
+那时 Clash 的 7897 恰好不可达（1.0.29 在 23:44:33 还写过「原代理 127.0.0.1:7897
+当前不可达」）。于是 tun-config.yaml 里**一条 PROCESS-NAME 都没有**，规则只有
+内网 DIRECT + UDP + MATCH,ferry。用户随后打开 Clash：
+
+```
+Clash 连机场 → 被 TUN 抓走 → 判境外 → 交给 Clash → 再被抓 → 死循环
+```
+
+表现就是「端口能连、CONNECT 200、然后一直等」—— 不是 Clash 坏了，是它的出站
+被自己的 TUN 抢走了。
+
+**这是一条竞态**：用户先起渡口再起 Clash（或中途重启过 Clash），保险就永远缺失。
+
+### 为什么 1.0.30 没修好，以及它加错了东西
+
+1.0.30 的判断是「strict 在 gvisor 栈下不匹配」，于是加了 `find-process-mode: always`。
+在测试机上实测（mihomo v1.19.32 + gvisor + 手动 /32 路由，避免抢 SSH 的路由）：
+
+```
+strict:  [TCP] 198.18.0.1:4243(clash-verge.exe) --> 1.1.1.1:80 match ProcessName(clash-verge.exe) using DIRECT
+always:  [TCP] 198.18.0.1:3586(clash-verge.exe) --> 1.1.1.1:80 match ProcessName(clash-verge.exe) using DIRECT
+```
+
+**两种模式表现完全一致**，`clash-verge.exe` 这种带扩展名的写法也能匹配。
+所以：
+
+1. `always` 是多余开销 —— 它让每个连接都多查一次进程归属，而用户明确抱怨过「卡慢」。
+   回退成 `strict`。
+2. 1.0.30 真正的漏洞是**规则仍然没有无条件生成**（那段代码还在 `if (_clashPort > 0)` 里），
+   所以它对着用户机的现场一无所知。
+
+### 改法
+
+| 改动 | 说明 |
+|---|---|
+| **PROCESS-NAME 例外无条件写入** | 13 个进程 × 2 种写法 = 26 条。只在名单进程真的存在时才命中，写上纯属保险；不依赖任何检测结果 |
+| `find-process-mode` 回 `strict` | 实测与 always 等效，去掉每连接查进程的固定开销 |
+| 名单保持固定 | 不枚举用户装了什么（踩坑 66：方案一旦需要「知道用户装了什么」就说明绕路了） |
+
+### 验证
+
+- `tools/verify-tunconfig.cs` 重写为新结构的 19 项断言，**核心一项**：
+  `clashPort = 0` 时仍然必须写出 26 条 PROCESS-NAME（这正是用户机的现场）；
+  另有一项断言两个场景生成的配置**逐字相同**。
+- 两份配置都过 `mihomo -t` 语法校验。
+- 测试机上用真实 mihomo（v1.19.32 + gvisor）跑**等价配置**：`find-process-mode: strict`
+  + 两条 `PROCESS-NAME`，`auto-route: false` 再手动加一条 `/32` 路由（不抢默认路由，
+  SSH 不会断）。模拟进程 `clash-verge.exe` 发起连接 →
+  `match ProcessName(clash-verge.exe) using DIRECT`，不再成环。
+- 用客户端生成的**完整配置**（把 `auto-route` 改成 false）再跑一次时暴露了实验方法的
+  局限：`/32` 路由是全机的，mihomo 自己那条 DIRECT 出站也被抓回 TUN，日志报
+  `reject loopback connection to: 1.1.1.1:80`。真实运行时 `auto-route: true` 会让
+  mihomo 自动排除自己的出口，不会有这个问题 —— 但这说明**手工路由只能验规则命中，
+  不能验端到端转发**，两个结论要分开写。
+- 生命周期回归（`tools/verify-lifecycle.cs`，22 项）见提交说明。
+
+### 这次该记住的
+
+**「配置里没有这条规则」和「这条规则没匹配上」是两件事。** 1.0.30 直接跳到了
+后者（怀疑 mihomo 的进程匹配），却没去看生成的配置文件里到底有没有那些行 ——
+而 `%LOCALAPPDATA%\Ferry	un-config.yaml` 里明摆着一条都没有。
+下次先 dump 产物，再怀疑运行时。
+
 ## v0.14.27 — 2026-10-27
 
 > 客户端 1.0.30：加固 TUN 的进程例外 —— 修「Clash 端口能连但所有境外都超时」。
