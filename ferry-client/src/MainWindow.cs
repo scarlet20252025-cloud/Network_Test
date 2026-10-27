@@ -813,6 +813,8 @@ namespace Ferry
                 // 节点模式不分流：用户已经把渡口当节点加进自己的 Clash 了，
                 // 再把境外流量送回 Clash 会成环（Clash → 渡口 → Clash）。
                 rt.AllowSplit = !_nodeMode;
+                // 节点模式也不启用 TUN：两个都想「接管全部流量」会打架。
+                rt.AllowTun = !_nodeMode;
                 var err = rt.Start();
                 string exitIp = "";
                 if (err.Length == 0)

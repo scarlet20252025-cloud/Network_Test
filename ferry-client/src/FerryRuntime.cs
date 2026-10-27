@@ -79,6 +79,16 @@ namespace Ferry
         /// </summary>
         public bool AllowSplit = true;
 
+        /// <summary>
+        /// 是否允许启用 TUN（全局接管）。
+        ///
+        /// 节点模式下必须设成 false：节点模式的语义是「我只开一个端口，你把流量送过来」，
+        /// 而 TUN 是「我抢默认路由，所有流量归我」。两个同时启用会：
+        ///   ① 和用户本来开着的 Clash/加速器 TUN 抢路由，两边打架；
+        ///   ② 让「不接管系统代理」这句日志变成谎话，用户完全搞不清谁在管流量。
+        /// </summary>
+        public bool AllowTun = true;
+
         public string Start()
         {
             if (_running) return "";
@@ -163,7 +173,10 @@ namespace Ferry
             //
             // 所以让渡口自己分流：国内目标走渡口，其余交给用户那个代理。他什么都
             // 不用配，Clash 照常开着就行。
-            int clashPort = AllowSplit ? FerryCore.DetectLocalProxy(_httpPort) : 0;
+            // TUN 模式下不分流：mihomo 自己已经有分流规则（内网直连 + MATCH ferry），
+            // 它送过来的流量就是要走渡口。这里再按「境外」分一次，会把本该走渡口的
+            // 流量送回本机代理，绕一圈还可能成环。
+            int clashPort = (AllowSplit && !_cfg.UseTun) ? FerryCore.DetectLocalProxy(_httpPort) : 0;
             if (clashPort > 0)
             {
                 _proxy.SetForeignProxy(clashPort, "127.0.0.1");
@@ -198,7 +211,11 @@ namespace Ferry
             // 为什么失败不算整体失败：
             //   TUN 需要管理员 + wintun.dll。缺一个就开不了，但用户借网
             //   本身（浏览器/下载）不依赖它。所以只记 TunError，不 return。
-            if (_cfg.UseTun)
+            if (_cfg.UseTun && !AllowTun)
+            {
+                _log("全局接管未启用：系统代理已由其它程序管理，避免和它抢流量");
+            }
+            else if (_cfg.UseTun)
             {
                 _tunError = "";
                 _tun = new TunMode(_cfg, _appDir, _log);

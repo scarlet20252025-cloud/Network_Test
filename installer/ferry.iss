@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "1.0.15"
+#define AppVersion "1.0.16"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -119,6 +119,7 @@ Source: "..\dist\渡口助手.exe";              DestDir: "{app}"; Flags: ignore
 ;   mihomo 用 Windows 默认 DLL 搜索顺序找 wintun.dll（先找 exe 所在目录），
 ;   放到别处会找不到，报的错还很含糊（"Cannot create a file when that file
 ;   already exists" 或直接没反应）。实测踩过。
+Source: "..\ferry-client\app.ico";            DestDir: "{app}"; Flags: ignoreversion
 Source: "..\mihomo\wintun.dll";              DestDir: "{app}"; Flags: ignoreversion
 Source: "..\vendor\mihomo.exe";              DestDir: "{app}"; Flags: ignoreversion
 

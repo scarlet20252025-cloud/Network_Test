@@ -583,9 +583,20 @@ namespace Ferry
         static string PreferIp(string host)
         {
             IPAddress ip;
-            if (IPAddress.TryParse(host, out ip)) return host;
+            if (IPAddress.TryParse(host, out ip))
+            {
+                // 已经是 fake-ip 了：绝对不能传给上游 —— 那是 mihomo 内部编号，
+                // 远端拿到它只会连到一个不存在的地址。
+                return IsFakeIp(ip) ? host : host;
+            }
+
             var addrs = ResolveLocal(host);
             if (addrs == null || addrs.Count == 0) return host;
+
+            // 解析出来是 fake-ip 就保留域名，让上游（或 TUN 那层）自己解析
+            foreach (var a in addrs)
+                if (IsFakeIp(a)) return host;
+
             return addrs[0].ToString();
         }
 
@@ -608,15 +619,33 @@ namespace Ferry
         {
             IPAddress ip;
             if (IPAddress.TryParse(host, out ip))
-                return CnIpRanges.Contains(ip);
+                return IsFakeIp(ip) || CnIpRanges.Contains(ip);
 
             var addrs = ResolveLocal(host);
             if (addrs == null || addrs.Count == 0)
                 return false;    // 解析不出来 → 当境外（交给用户的代理）
 
             foreach (var a in addrs)
-                if (CnIpRanges.Contains(a)) return true;
+                if (IsFakeIp(a) || CnIpRanges.Contains(a)) return true;
             return false;
+        }
+
+        /// <summary>
+        /// 这是不是 mihomo / Clash 的 fake-ip 地址（198.18.0.0/15）？
+        ///
+        /// 为什么必须单独认它：TUN 模式开着 fake-ip 时，**系统 DNS 被 mihomo 接管**，
+        /// 任何域名都解析成 198.18.x.x。拿这个假地址去查「是不是国内 IP」永远是否，
+        /// 于是国内站被判成境外 —— 再把 198.18.x.x 传给远端，远端根本连不上，
+        /// 结果就是「开了借网反而上不了网」。
+        ///
+        /// 见到 fake-ip 就说明「DNS 已经由 TUN 那层接管了，它送来的流量就是要走渡口」，
+        /// 所以这里一律按国内处理，并且不要把这个假 IP 传给上游（见 PreferIp）。
+        /// </summary>
+        static bool IsFakeIp(IPAddress ip)
+        {
+            if (ip == null || ip.AddressFamily != AddressFamily.InterNetwork) return false;
+            var b = ip.GetAddressBytes();
+            return b[0] == 198 && (b[1] == 18 || b[1] == 19);
         }
 
         /// <summary>
