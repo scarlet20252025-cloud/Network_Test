@@ -225,6 +225,12 @@ namespace Ferry
             catch (Exception) { }
         }
 
+        /// <summary>
+        /// 本机 Clash 的端口。>0 时 TUN 把境外流量交给它，国内走渡口。
+        /// 0 表示没检测到（那就全部走渡口，维持旧行为）。
+        /// </summary>
+        int _clashPort;
+
         string BuildConfig(int socksPort, string udpHost, int udpPort)
         {
             var sb = new StringBuilder();
@@ -294,7 +300,28 @@ namespace Ferry
             sb.AppendLine("    server: " + udpHost);
             sb.AppendLine("    port: " + udpPort.ToString());
             sb.AppendLine("    udp: true");
+            if (_clashPort > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("  # 用户自己正在跑的那个代理（Clash / v2rayN …）。");
+                sb.AppendLine("  # 渡口出口到不了境外，境外流量得让它来出 —— 这是它能正常");
+                sb.AppendLine("  # 翻墙、而我们只管借网的关键。");
+                sb.AppendLine("  - name: clash-local");
+                sb.AppendLine("    type: socks5");
+                sb.AppendLine("    server: 127.0.0.1");
+                sb.AppendLine("    port: " + _clashPort.ToString());
+                sb.AppendLine("    udp: true");
+            }
             sb.AppendLine();
+            if (_clashPort > 0)
+            {
+                sb.AppendLine("rule-providers:");
+                sb.AppendLine("  cn:");
+                sb.AppendLine("    type: file");
+                sb.AppendLine("    behavior: classical");
+                sb.AppendLine("    path: ./cn-cidr.txt");
+                sb.AppendLine();
+            }
             sb.AppendLine("proxy-groups:");
             sb.AppendLine("  - name: ferry");
             sb.AppendLine("    type: select");
@@ -302,8 +329,28 @@ namespace Ferry
             sb.AppendLine("  - name: ferry-udp-group");
             sb.AppendLine("    type: select");
             sb.AppendLine("    proxies: [ferry-udp]");
+            if (_clashPort > 0)
+            {
+                sb.AppendLine("  - name: overseas");
+                sb.AppendLine("    type: select");
+                sb.AppendLine("    proxies: [clash-local, DIRECT]");
+            }
             sb.AppendLine();
             sb.AppendLine("rules:");
+            if (_clashPort > 0)
+            {
+                sb.AppendLine("  # 本机的翻墙客户端自己要连机场节点 —— 这个出站也会被 TUN 抓到。");
+                sb.AppendLine("  # 不把它排成 DIRECT，就会变成 Clash → TUN → Clash 的死循环。");
+                sb.AppendLine("  - PROCESS-NAME,clash-verge.exe,DIRECT");
+                sb.AppendLine("  - PROCESS-NAME,clash-verge-service.exe,DIRECT");
+                sb.AppendLine("  - PROCESS-NAME,verge-mihomo.exe,DIRECT");
+                sb.AppendLine("  - PROCESS-NAME,clash-meta.exe,DIRECT");
+                sb.AppendLine("  - PROCESS-NAME,Clash for Windows.exe,DIRECT");
+                sb.AppendLine("  - PROCESS-NAME,v2rayN.exe,DIRECT");
+                sb.AppendLine("  - PROCESS-NAME,v2ray.exe,DIRECT");
+                sb.AppendLine("  - PROCESS-NAME,xray.exe,DIRECT");
+                sb.AppendLine("  - PROCESS-NAME,sing-box.exe,DIRECT");
+            }
             sb.AppendLine("  # 内网与回环永远直连 —— 否则局域网打印机/共享/远端 SSH 立刻失联");
             sb.AppendLine("  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve");
             sb.AppendLine("  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve");
@@ -311,7 +358,25 @@ namespace Ferry
             sb.AppendLine("  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve");
             sb.AppendLine("  # UDP 单独分流：只有 ferry-udp 能承载");
             sb.AppendLine("  - NETWORK,udp,ferry-udp-group");
-            sb.AppendLine("  - MATCH,ferry");
+            if (_clashPort > 0)
+            {
+                // 已知的「/16 里混了境外地址」例外：位图是 /16 粒度，而 APNIC
+                // 是 /24 级分配。1.1.0.0/16 整个被标成国内，但 1.1.1.0/24 是
+                // Cloudflare 的 —— 不排除掉就会把 Cloudflare DNS 送去渡口，
+                // 而渡口出口到不了它。
+                sb.AppendLine("  - IP-CIDR,1.1.1.0/24,overseas,no-resolve");
+                sb.AppendLine("  - IP-CIDR,8.8.8.0/24,overseas,no-resolve");
+                sb.AppendLine("  - IP-CIDR,8.8.4.0/24,overseas,no-resolve");
+                sb.AppendLine("  - IP-CIDR,9.9.9.0/24,overseas,no-resolve");
+                sb.AppendLine("  # 国内 IP 走渡口（段表见 cn-cidr.txt，由客户端启动时生成）");
+                sb.AppendLine("  - RULE-SET,cn,ferry");
+                sb.AppendLine("  # 其余（境外）交给用户自己的代理，它才出得去");
+                sb.AppendLine("  - MATCH,overseas");
+            }
+            else
+            {
+                sb.AppendLine("  - MATCH,ferry");
+            }
             return sb.ToString();
         }
 
@@ -321,9 +386,16 @@ namespace Ferry
         /// <param name="socksPort">客户端当前 SOCKS 端口</param>
         /// <param name="udpHost">远端 UDP 中继地址</param>
         /// <param name="udpPort">远端 UDP 中继端口</param>
-        public string Start(int socksPort, string udpHost, int udpPort)
+        /// <param name="clashPort">
+        /// 本机正在跑的翻墙客户端端口（Clash 的 7897 之类）。>0 时 TUN 会把
+        /// 境外流量交给它 —— 渡口出口到不了境外，这一步是「借网 + 翻墙共存」
+        /// 的关键。0 表示没检测到，全部走渡口。
+        /// </param>
+        public string Start(int socksPort, string udpHost, int udpPort, int clashPort)
         {
             if (_running) return "";
+
+            _clashPort = clashPort;
 
             if (!IsAdmin())
                 return "TUN 需要管理员权限。请右键「以管理员身份运行」，或用安装包重新安装（已默认要求管理员）。";
@@ -338,6 +410,25 @@ namespace Ferry
             _upstreamSocksPort = socksPort;
             _configPath = Path.Combine(_appDir, "tun-config.yaml");
             _fatalError = null;
+
+            // 检测到本机代理时才需要国内段表（全走渡口的旧路径用不上）。
+            if (_clashPort > 0)
+            {
+                try
+                {
+                    var cnPath = Path.Combine(_appDir, "cn-cidr.txt");
+                    File.WriteAllText(cnPath, CnIpRanges.AsCidrRules(),
+                        new System.Text.UTF8Encoding(false));
+                    _log("已生成国内 IP 段表：" + cnPath);
+                }
+                catch (Exception ex)
+                {
+                    // 生成失败就别用分流规则了，退回「全部走渡口」——
+                    // 否则 mihomo 找不到 rule-provider 会拒绝启动，用户直接断网。
+                    _log("生成国内段表失败（" + ex.Message + "），本次全部流量走渡口");
+                    _clashPort = 0;
+                }
+            }
 
             // 启动前先清掉残留的 FerryTun 网卡。
             //

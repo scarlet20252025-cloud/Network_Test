@@ -16,8 +16,24 @@ import os
 import shutil
 import zipfile
 
+import glob
+import sys
+
 root = r'E:\肥鱼不乐园\borrow-net'
-version = '1.0.20'
+
+# 版本号优先取命令行参数；不给就从 dist 里最新的 Ferry-Setup-*.exe 反推。
+# 不写死常量：发版时忘了改就会打出上一个版本的包，而这件事没有任何报错。
+if len(sys.argv) > 1:
+    version = sys.argv[1]
+else:
+    setups = glob.glob(os.path.join(root, 'dist', 'Ferry-Setup-*.exe'))
+
+    def _ver(path):
+        m = os.path.basename(path).replace('Ferry-Setup-', '').replace('.exe', '')
+        return tuple(int(x) for x in m.split('.') if x.isdigit())
+
+    version = '.'.join(str(x) for x in _ver(max(setups, key=_ver)))
+print('version = ' + version)
 stage = r'C:\Users\63526\AppData\Local\Temp\ferry-portable'
 if os.path.isdir(stage):
     shutil.rmtree(stage)

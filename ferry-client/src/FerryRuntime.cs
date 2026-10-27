@@ -204,10 +204,12 @@ namespace Ferry
             //
             // 所以让渡口自己分流：国内目标走渡口，其余交给用户那个代理。他什么都
             // 不用配，Clash 照常开着就行。
-            // TUN 模式下不分流：mihomo 自己已经有分流规则（内网直连 + MATCH ferry），
-            // 它送过来的流量就是要走渡口。这里再按「境外」分一次，会把本该走渡口的
-            // 流量送回本机代理，绕一圈还可能成环。
-            int clashPort = (AllowSplit && !_cfg.UseTun) ? FerryCore.DetectLocalProxy(_httpPort) : 0;
+            // TUN 模式下也要检测：TUN 会把境外流量交给它（规则里 clash-local），
+            // 而「渡口出口到不了境外」是硬事实 —— 不交给它，借网就等于把外网全掐了。
+            // 曾经这里写的是 `AllowSplit && !_cfg.UseTun`，理由「TUN 自己的规则
+            // 已经分好流了」，但那时 TUN 规则是 MATCH,ferry（全走渡口），
+            // 于是境外流量必然 502。真正该改的是规则，不是把分流关掉。
+            int clashPort = AllowSplit ? FerryCore.DetectLocalProxy(_httpPort) : 0;
             if (clashPort > 0)
             {
                 _proxy.SetForeignProxy(clashPort, "127.0.0.1");
@@ -274,7 +276,7 @@ namespace Ferry
             {
                 _tunError = "";
                 _tun = new TunMode(_cfg, _appDir, _log);
-                var terr = _tun.Start(_httpPort, _cfg.UdpRelayHost, _cfg.UdpRelayPort);
+                var terr = _tun.Start(_httpPort, _cfg.UdpRelayHost, _cfg.UdpRelayPort, clashPort);
                 if (terr.Length > 0)
                 {
                     _tunError = terr;

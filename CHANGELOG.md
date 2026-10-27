@@ -1,3 +1,120 @@
+## v0.14.18 — 2026-10-27
+
+> 客户端 1.0.21：**借网时境外能通了** —— TUN 也会把境外流量交给用户自己的 Clash。
+
+### 现象
+
+用户报障（附 Clash 节点延迟截图，全部 80~350ms 正常）：
+
+> 我的 clash 节点延迟检测正常，但是借网状态下还是无法访问外网。
+
+实测复现（同一台机器，两个方向对照）：
+
+```
+via ferry  baidu  -> 200
+via ferry  google -> FAIL (502) 网关错误      ← 渡口出口到不了境外
+via clash  baidu  -> 200
+via clash  google -> 200                       ← Clash 完全正常
+```
+
+### 根因
+
+两处叠加，都指向同一个设计错误：**把「TUN 存在」当成了「不需要分流」**。
+
+1. `FerryRuntime.cs:210`
+
+   ```csharp
+   int clashPort = (AllowSplit && !_cfg.UseTun) ? DetectLocalProxy(...) : 0;
+   ```
+
+   1.0.16 引入的 `!_cfg.UseTun`：勾了「全局模式」就不检测本机代理，
+   所有流量都往渡口送 —— 而渡口出口是大陆联通，境外到不了。
+
+   当时的理由写的是「TUN 自己的规则已经分好流了，再分一次可能成环」。
+   但那时 TUN 规则是 `MATCH,ferry`（**全部**走渡口），根本没有「分好流」。
+
+2. `mihomo` 配置里同样只有 `MATCH,ferry`。
+
+所以无论走系统代理还是走 TUN，境外流量都会被送进渡口出口，得到 502。
+
+### 修法：两层分工，各管一段
+
+| 层 | 国内 | 境外 |
+|---|---|---|
+| TUN（mihomo 规则） | `RULE-SET,cn` → ferry | `MATCH` → `clash-local`（127.0.0.1:7897） |
+| 本地代理（ProxyServer） | `IsDomestic` → 渡口 | `ConnectSmart` → 本机 Clash |
+
+关键的两个细节：
+
+**① 不能用 `GEOIP,CN`** —— 它要下载 `geoip.metadb`：
+
+```
+can't download MMDB: Get "https://github.com/MetaCubeX/meta-rules-dat/...": EOF
+```
+
+借网场景（校园网禁网）下必然失败，规则加载不了 → TUN 起不来 → 用户直接断网。
+改成 `rule-providers` + `type: file`，本地文件，零网络依赖：
+
+- 客户端启动时用 `CnIpRanges.AsCidrRules()` 生成 `cn-cidr.txt`
+- 5933 个 /16 合并成 **1151 条** `IP-CIDR`（相邻 /16 合成 /15、/14…）
+- 生成失败就退回「全部走渡口」，绝不让 mihomo 因为缺文件拒绝启动
+
+**② 必须排除 Clash 自己的出站** —— 否则成环：
+
+```
+用户请求 → TUN 抓走 → 规则判境外 → 交给 Clash
+                                     ↓
+                              Clash 自己连机场 → 又被 TUN 抓走 → 再交给 Clash …
+```
+
+用 `PROCESS-NAME` 把翻墙客户端本身放行成 DIRECT：
+
+```yaml
+- PROCESS-NAME,clash-verge.exe,DIRECT
+- PROCESS-NAME,verge-mihomo.exe,DIRECT
+- PROCESS-NAME,Clash for Windows.exe,DIRECT
+- PROCESS-NAME,v2ray.exe,DIRECT
+- PROCESS-NAME,sing-box.exe,DIRECT   # 等 9 条
+```
+
+**③ /16 位图的已知偏差**：APNIC 把 `1.1.0.0/16` 里的大部分分给了 CN，
+于是 `1.1.1.1`（Cloudflare DNS）会被判成国内。在 mihomo 规则里加几条
+更细的例外放在 `RULE-SET,cn` **之前**：
+
+```yaml
+- IP-CIDR,1.1.1.0/24,overseas,no-resolve
+- IP-CIDR,8.8.8.0/24,overseas,no-resolve
+- IP-CIDR,8.8.4.0/24,overseas,no-resolve
+- IP-CIDR,9.9.9.0/24,overseas,no-resolve
+```
+
+### 验证
+
+配置生成（测试机 10.113.66.6，13 项 ALL PASS）：
+
+```
+PASS  proxies has clash-local
+PASS  clash-local points to 127.0.0.1
+PASS  proxy-group overseas exists
+PASS  rule-providers section exists
+PASS  rule-provider reads local file (no network)
+PASS  does not use GEOIP (needs downloading a database)
+PASS  PROCESS-NAME exceptions to avoid loops
+PASS  exception rule comes before RULE-SET,cn
+PASS  MATCH comes after RULE-SET
+PASS  clashPort=0 falls back to ferry-only
+PASS  clashPort=0 keeps MATCH,ferry
+```
+
+`mihomo -t` 校验生成的配置：
+
+```
+configuration file ...\tun-config.yaml test is successful
+```
+
+**没有 Clash 的用户**：检测不到本机代理 → `clashPort = 0` → 生成旧规则
+（`MATCH,ferry`，全部走渡口），行为与 1.0.20 完全一致。
+
 ## v0.14.17 — 2026-10-27
 
 > 门户新增**绿色版（解压即用）**下载入口：完整功能、不需要安装。
