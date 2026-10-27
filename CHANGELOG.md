@@ -1,3 +1,59 @@
+## v0.14.8 — 2026-10-27
+
+> 客户端 1.0.12：**修正 Clash for Windows 的接入方式**（1.0.11 那个写错了地方）。
+
+### 1.0.11 错在哪
+
+1.0.11 给 CFW 写的是 `parserserry.js` + 在 `profiles.yaml` 里挂 `parsers: [ferry]`。
+这是照着 Verge 的思路猜的 —— **CFW 没有这种「每个订阅一个 parser 文件」的机制**。
+它把预处理脚本存在 `cfw-settings.yaml` 的 `parsers:` 段里（Settings → Profiles → Parsers
+那个文本框），条目形如：
+
+```yaml
+parsers:
+  - reg: ^.*$
+    code: |
+      module.exports.parse = async (raw, { yaml }, info) => { ... return yaml.stringify(cfg); }
+```
+
+所以用户点了按钮什么也没发生。
+
+### 1.0.12 的做法（双保险）
+
+| 写什么 | 作用 |
+|---|---|
+| `%USERPROFILE%\.config\clash\config.yaml` | **立刻生效**：在 proxies / proxy-groups / rules 里插入渡口节点、`国内出口` 组、`GEOIP,CN` 规则；原文件备份成 `.bak-ferry` |
+| `%USERPROFILE%\.config\clash\cfw-settings.yaml` | **持久**：追加一段 `parsers:`，CFW 每次加载订阅都会重新加上节点 |
+
+为什么两个都要：`config.yaml` 是 CFW 从订阅生成的，订阅一更新就覆盖；Parser 是它
+官方的扩展点，能扛住更新。只写 Parser 的话，用户点完必须等下一次订阅刷新才见效；
+只写 config.yaml 的话，改完能用但过几天又没了。
+
+安全边界：
+
+- `config.yaml` 里找不到 `proxies:` 段时**不动它**（结构不同就交回手动说明，不硬写）
+- `cfw-settings.yaml` 里**已有** `parsers:` 段时不动（用户可能自己写了预处理脚本，
+  覆盖掉等于毁了他的配置），只提示去手动合并
+- 两个文件都先备份（`.bak-ferry`）
+- 重复点：`config.yaml` 里已有「渡口」节点就直接返回「已经有」，不重复插
+
+### 验证（这次是跑起来验的）
+
+1. **C# 侧 15 项断言**（测试机造真实结构的 config.yaml + profiles.yaml）：
+   节点/组/规则都插对、原有 proxies 与 rules 保留、规则插在最前、备份生成、
+   cfw-settings.yaml 写出 `module.exports.parse`、第二次调用不重复插。
+
+2. **JS 侧用 node 真跑了一遍**（这是 1.0.11 没做的）：
+   把生成的 Parser 抽出来，喂一份带 proxies/规则的最小配置，
+   确认 `渡口` 节点（port 10800 / udp true）、`国内出口` fallback 组、
+   `GEOIP,CN` 规则都进得去，原有内容不丢，重复调用只加一次。
+
+### 仍然不确定的一件事
+
+`cfw-settings.yaml` 这个**存储位置**是从社区资料推断的（CFW 已停更、作者删库）。
+`config.yaml` 那条路是确定的（CFW 的运行配置就是它）。所以就算 Parser 没被读到，
+用户重启 CFW 也能用 —— 只是订阅更新后需要再点一次按钮。
+
 ## v0.14.7 — 2026-10-27
 
 > 客户端 1.0.11：**Clash for Windows 用户也能一键接入了**。
