@@ -212,6 +212,7 @@ namespace Ferry
                 var m = MethodNoArg(_netInfo, "GetConnectionProfiles");
                 var profiles = (IEnumerable)m.Invoke(null, null);
                 object fallback = null;
+                object internet = null;
                 foreach (var p in profiles)
                 {
                     if (p == null) continue;
@@ -226,12 +227,17 @@ namespace Ferry
                     try { level = Convert.ToString(gm.Invoke(p, null)); }
                     catch (Exception) { continue; }
 
-                    if (level == "InternetAccess") return p;
+                    // 优先用渡口的 TUN（FerryTun）：它是「已经借到网」的那条路，
+                    // 用它当共享源，手机走的就是渡口的分流规则。
+                    // 次要选物理网卡；两者都 InternetAccess 时 FerryTun 优先，
+                    // 因为用户的物理出口在断网时段本来就不通。
+                    if (level == "InternetAccess" && pn == "FerryTun") return p;
+                    if (level == "InternetAccess" && internet == null) internet = p;
                     // 没找到 InternetAccess 时留一个「非 None」的兜底，
                     // 总比完全没有共享源好（例如刚连上还没探测完连通性）。
                     if (fallback == null && level != "None") fallback = p;
                 }
-                return fallback;
+                return internet != null ? internet : fallback;
             }
             catch (Exception) { return null; }
         }
@@ -258,6 +264,36 @@ namespace Ferry
 
                 var mgr = Manager();
                 if (mgr == null) return "找不到可共享的网络连接（本机当前没有能上网的接口）";
+
+                // 频段必须显式设成 2.4GHz。
+                //
+                // 实测（2026-10-28，Realtek 8852BE）：Band 默认 Auto 时，
+                // 系统选 5GHz 去开 SoftAP，而这台机器正用 5GHz 连校园网
+                // （信道 40）—— 同一张网卡不能在 5GHz 上同时做 station 和 AP，
+                // 于是 StartTetheringAsync 直接返回 WiFiDeviceOff。
+                // 改成 TwoPointFourGigahertz 之后同一段代码返回 Success。
+                try
+                {
+                    var cfg0 = MethodNoArg(mgr.GetType(), "GetCurrentAccessPointConfiguration").Invoke(mgr, null);
+                    if (cfg0 != null)
+                    {
+                        var bandT = Type.GetType(
+                            "Windows.Networking.NetworkOperators.TetheringWiFiBand, " +
+                            "Windows.Networking.NetworkOperators, ContentType=WindowsRuntime");
+                        var bp = cfg0.GetType().GetProperty("Band");
+                        if (bandT != null && bp != null && bp.CanWrite)
+                        {
+                            bp.SetValue(cfg0, Enum.Parse(bandT, "TwoPointFourGigahertz"), null);
+                            var cm = MethodNoArg(mgr.GetType(), "ConfigureAccessPointAsync");
+                            if (cm != null)
+                            {
+                                var op = cm.Invoke(mgr, new object[] { cfg0 });
+                                AwaitOpResult(op);
+                            }
+                        }
+                    }
+                }
+                catch (Exception) { /* 设不了频段就按系统默认来，不影响后面的启动 */ }
 
                 // 改 SSID/密码要先停再改再起 —— 热点开着的时候配置改不动。
                 if (!string.IsNullOrEmpty(ssid) || !string.IsNullOrEmpty(pass))

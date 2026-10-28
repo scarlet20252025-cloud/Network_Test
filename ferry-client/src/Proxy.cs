@@ -141,6 +141,36 @@ namespace Ferry
         /// </summary>
         const int MaxConns = 400;
 
+        /// <summary>
+        /// 监听 socket 的 backlog。
+        ///
+        /// 为什么从默认调大到 512：TUN 全局接管时，所有程序的连接都挤到这一个
+        /// 端口上。手机连上热点之后，手机上的每个应用也一起挤进来 ——
+        /// 瞬时并发很容易冲到上百。
+        /// backlog 太小的话，内核会把来不及 accept 的连接直接丢掉，
+        /// 表现是「热点一开，本机的连接就开始超时」，
+        /// 而日志里什么都看不出来（连接根本没进到应用层）。
+        /// </summary>
+        const int ListenBacklog = 512;
+
+        /// <summary>
+        /// 并发闸门：同一时刻**处理中**的连接不超过 MaxConns。
+        ///
+        /// 为什么用「等待」而不是「拒绝」：
+        ///   · 拒绝（直接 Close）会让客户端看到连接失败 → 立刻重试 →
+        ///     重试风暴反而把并发推得更高，形成恶性循环。
+        ///   · 等待（排队）时客户端只是觉得「慢了一点」，不会触发重试风暴。
+        /// 2026-10-28 开热点场景实测：手机上的应用也一起挤进这个端口，
+        /// 瞬时并发冲高，拒绝策略直接表现为「热点一开本机就断网」。
+        ///
+        /// 为什么上限仍然要留：每个连接占 3 个线程（1 conn + 2 copy）。
+        /// 不留上限的话，一个疯狂重连的程序就能开几千线程 ——
+        /// 那时不是某个软件卡，是整机卡死（上下文切换吃光 CPU、
+        /// 句柄耗尽导致所有程序都开不了新连接）。历史实测 40 连接已 984 句柄。
+        /// 所以上限是熔断器，去不得；但策略从「拒绝」改成「排队」。
+        /// </summary>
+        readonly SemaphoreSlim _connSem = new SemaphoreSlim(MaxConns);
+
         public long ConnRejected { get { return Interlocked.Read(ref _connRejected); } }
 
         public ProxyServer(int listenPort, int socksPort, Action<string> log)
@@ -208,7 +238,7 @@ namespace Ferry
             try
             {
                 _listener = new TcpListener(IPAddress.Loopback, _listenPort);
-                _listener.Start();
+                _listener.Start(ListenBacklog);
                 _running = true;
                 var t = new Thread(delegate () { AcceptLoopOn(_listener, false); });
                 t.IsBackground = true;
@@ -221,7 +251,7 @@ namespace Ferry
                     try
                     {
                         _bypassListener = new TcpListener(IPAddress.Loopback, _bypassPort);
-                        _bypassListener.Start();
+                        _bypassListener.Start(ListenBacklog);
                         var tb = new Thread(delegate () { AcceptLoopOn(_bypassListener, true); });
                         tb.IsBackground = true;
                         tb.Name = "ferry-accept-bypass";
@@ -268,24 +298,11 @@ namespace Ferry
                 var c = client;
                 Interlocked.Increment(ref _connTotal);
 
-                // 并发上限。超过就**直接拒绝**，不要无限制开线程。
-                //
-                // 为什么需要：TUN 全局接管时，本机所有程序的所有连接都进这里。
-                // 一个浏览器开 20 个标签就是几百连接，每个连接要
-                // 1 个 HandleConn 线程 + 2 个 copy 线程 —— 无上限的话
-                // 很容易上千线程，上下文切换把整机拖慢，
-                // 而且进程句柄数会顶到系统上限（实测 40 连接已 984 句柄）。
-                //
-                // 拒绝对协议是安全的：HTTP 客户端会看到连接被关并重试，
-                // SOCKS5 会失败，都比让整机卡死好。
-                long active = Interlocked.Increment(ref _connActive);
-                if (active > MaxConns)
-                {
-                    Interlocked.Decrement(ref _connActive);
-                    Interlocked.Increment(ref _connRejected);
-                    try { c.Close(); } catch (Exception) { }
-                    continue;
-                }
+                // 等一个处理名额（满了就排队，不丢弃 —— 见 _connSem 注释）。
+                // 这里**阻塞** accept 线程是可接受的：backlog 已经调大到 512，
+                // 排队的连接先被内核收着，不会丢；而整机线程数始终有上限。
+                _connSem.Wait();
+                Interlocked.Increment(ref _connActive);
 
                 var t = new Thread(delegate () { HandleConn(c, bypass); });
                 t.IsBackground = true;
@@ -317,6 +334,7 @@ namespace Ferry
             finally
             {
                 Interlocked.Decrement(ref _connActive);
+                _connSem.Release();          // 归还名额，让排队的连接进来
                 try { if (ns != null) ns.Close(); } catch (Exception) { }
                 try { client.Close(); } catch (Exception) { }
             }

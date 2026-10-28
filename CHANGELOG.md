@@ -1,3 +1,81 @@
+## v0.14.38 — 2026-10-28
+
+> 客户端 1.0.41：并发策略从「拒绝」改成「排队」；热点频段与共享源修正。
+
+### 一、MaxConns 不能取消，但「拒绝」是错的
+
+用户问：最大连接上限有什么意义，没用是不是可以取消？
+
+**上限去不得**：每个连接占 3 个线程（1 conn + 2 copy）。不留上限的话，
+一个疯狂重连的程序就能开几千线程 —— 那时不是某个软件卡，是**整机卡死**
+（上下文切换吃光 CPU，句柄耗尽导致所有程序都开不了新连接）。
+历史实测：40 个连接已经占了 984 个句柄。上限是熔断器。
+
+**但「超过就 Close」的策略是错的**：
+
+```csharp
+// 旧行为
+if (active > MaxConns) { c.Close(); continue; }
+```
+
+客户端看到连接失败 → 立刻重试 → 重试风暴反而把并发推得更高。
+开热点时（手机上的应用也一起挤进这个端口）瞬时并发冲高，
+这个策略直接表现为**「热点一开，本机就断网」**。
+
+**改成排队**（`SemaphoreSlim`）：
+
+| | 旧 | 新 |
+|---|---|---|
+| 超过上限 | 丢弃连接 | 等一个名额 |
+| 客户端感知 | 连接失败 → 重试风暴 | 慢一点 |
+| 整机线程数 | 有界 | 同样有界 |
+
+**监听 backlog 同时从默认调大到 512**：backlog 太小时，内核会把来不及
+accept 的连接直接丢掉 —— 而这一层丢连接**日志里完全看不出来**
+（连接根本没进到应用层）。这也是「开热点后本机开始超时」的一个来源。
+
+实测（60 并发）：`handshake ok=60 failed=0`，一条都不丢。
+
+### 二、热点：频段必须显式设 2.4GHz
+
+`Band` 默认 `Auto` 时，系统选 5GHz 开 SoftAP；而这台机器正用 5GHz 连校园网
+（信道 40）—— **同一张网卡不能在 5GHz 上同时做 station 和 AP**，
+于是 `StartTetheringAsync` 返回 `WiFiDeviceOff`。
+
+实测对比：
+
+```
+Band = Auto                  → Start 返回 WiFiDeviceOff
+Band = TwoPointFourGigahertz → Start 返回 Success
+```
+
+### 三、热点：共享源优先选 FerryTun
+
+原来按「第一个 InternetAccess 的配置档」选，可能选到物理网卡。
+改成有 `FerryTun` 时优先用 TUN —— 手机走的就是渡口的分流规则，
+断网时段物理出口本来就不通，选它没意义。
+
+### 验证
+
+新增 `tools/verify-connqueue.cs`，8 项断言全过：
+
+```
+PASS  backlog >= 512 (was default, drops burst connections)
+PASS  _connSem field exists (SemaphoreSlim, queueing not rejecting)
+PASS  MaxConns still 400 (thread explosion guard)
+    60 concurrent connects -> handshake ok=60 failed=0
+PASS  no connection dropped under burst (queueing works)
+```
+
+`tools/verify-tunconfig.cs` 28 项仍全过。
+
+### 还没解决的
+
+**开热点后本机断网**仍未解决。已排除：默认路由没变、系统代理没变、
+DNS 没变、ICS 服务在跑、ICS 接口配置已写入（Private=0/1 都正确）。
+观察到的唯一差异是 **WLAN 的 `Forwarding` 被 ICS 打开**
+（热点开时 Enabled，关掉后 Disabled）—— 下一步验证是不是它。
+
 ## v0.14.37 — 2026-10-28
 
 > 客户端 1.0.40：主界面**整页不滚动**（不是隐藏滚动条，是去掉滚动这件事）。
