@@ -1,3 +1,82 @@
+## v0.14.35 — 2026-10-28
+
+> 客户端 1.0.38：修「游戏/语音连接缓慢、加载中途超时」——UDP 回包不再被误杀。
+
+### 现象
+
+Hytale 加入服务器，卡在加载阶段，日志：
+
+```
+13:36:19  Quiche Stream connected to play.hytown.org:5520     ← 连上了
+13:38:27  Added cached reference to asset ...                  ← 一直在处理资产
+13:38:32  WARN  ReceiveLoop: No packets received for 5.0s (total: 10085)
+13:38:37  WARN  ReceiveLoop: No packets received for 5.0s
+   ...（每 5 秒一条，连刷 7 条）
+13:39:04  Connection is closed after 10085 packets
+13:39:04  Disconnected during loading (network) QuicheException: Connection timed out
+```
+
+注意 `total: 10085` **一直不变** —— 说明不是「一个包都没收到」，而是
+「收了 10085 个之后突然一个都没有了」。
+
+### 根因：UDP 回包分发用「最近 5 秒发过包」判活
+
+`ferry-client/src/Proxy.cs` 的 `UpRecvLoop`：
+
+```csharp
+if ((nowTime - r.LastSend).TotalSeconds > 5) continue;   // 只发给最近 5 秒发过包的流
+```
+
+对 DNS 那种一问一答没问题，但**游戏和语音是下行远大于上行的**：
+
+- 玩家站着不动 / 在看加载画面 → 上行只有零星 ACK，十几秒可能一个包都没有
+- 资产下载的空档同理
+
+这些流的回包被当成「早就没用的流」直接丢掉。客户端那边表现就是
+**连接还在（TCP/QUIC 状态机没断）、但一直卡着不动**，最后超时。
+
+### 改法
+
+| 项 | 原来 | 现在 | 为什么 |
+|---|---|---|---|
+| 判活依据 | 只看 `LastSend` | 取 `min(距上次发包, 距上次收包)` | 下行流量也要算「活着」的证据 |
+| 单流空闲窗口 | 5 秒 | **45 秒** | 覆盖游戏/语音的正常静默 |
+| 整条关联空闲回收 | 20 秒 | **90 秒** | 同理；关联回收会连带丢掉所有流的 socket |
+
+为什么不能无限长：每条关联占 2 个 socket + 2 个线程，远端中继还有
+`RELAY_HARD_LIMIT = 3000` 的硬上限。45/90 是「覆盖正常静默、又不长期占名额」的折中。
+
+### 实测数据（本机，走正在运行的渡口）
+
+UDP 本身是通的，问题只在回包分发：
+
+```
+经本地代理 10801 -> 223.5.5.5:53        OK 50 bytes
+经本地代理 10801 -> play.hytown.org:5520  OK 82 bytes
+直连远端中继 10.13.24.1:1080（对照）      TIMEOUT（远端只接受白名单网段）
+UDP 延迟（IP 直连目标）：43~49ms，与物理直连的 43~45ms 基本一致
+UDP 吞吐：30 发 30 收（100%），无丢包
+```
+
+所以「UDP 不通」是假象，「回包被分发逻辑丢掉」才是真因。
+
+### 验证
+
+新增 `tools/verify-udpidle.cs`，10 项断言全过，其中最关键的一项：
+
+```
+PASS  reply still delivered after 8s of uplink silence (the actual bug)
+```
+
+—— 建关联、发一个包、**静默 8 秒**（旧逻辑 5 秒就判死了）、再发一个包，
+回包仍然送达。`tools/verify-udpreclaim.cs` 的等待时间同步从 26 秒改成 98 秒。
+
+### 附带说明：为什么之前一直没发现
+
+旧窗口 5 秒对「浏览器打开网页」这种一问一答完全够用，所以分流、DNS、
+网页都正常。只有游戏和语音这种长连接 + 下行密集的场景才会暴露。
+这类 bug 只在真实使用里出现，纯功能测试（发包-收包一次）永远测不出来。
+
 ## v0.14.34 — 2026-10-28
 
 > 客户端 1.0.37：修「一借网，DSH/Clash 就掉线」+ 热点开关打不开。

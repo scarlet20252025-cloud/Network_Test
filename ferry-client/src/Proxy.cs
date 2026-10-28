@@ -75,6 +75,22 @@ namespace Ferry
         /// 不设上限的话一个坏掉的客户端（反复重连不停）能把线程刷爆。
         /// 32 条足够覆盖「游戏 + 语音 + 几个 P2P」的并发。</summary>
         int _udpAssoc;
+
+        /// <summary>
+        /// 一条 UDP 流「多久没有任何收发」才认为死了。
+        ///
+        /// 原来是 5 秒（回包侧）/ 20 秒（关联侧）。对 DNS 够用，对游戏和语音
+        /// 太短：玩家站着不动、资产下载的空档、语音的静音段，都可能超过 5 秒
+        /// 没有上行包，回包就被丢掉，客户端以为对端不响应。
+        ///
+        /// 为什么不能无限长：每条关联占 2 个 socket + 2 个线程，且远端中继
+        /// 有 3000 条的硬上限（见 ferry-socks5-server.py 的 RELAY_HARD_LIMIT）。
+        /// 45 秒是「覆盖游戏/语音的正常静默，又不至于长期占着名额」的折中。
+        /// </summary>
+        const int UdpIdleSec = 45;
+
+        /// <summary>整条 UDP 关联的空闲回收时间（没有收到任何客户端包）。</summary>
+        const int UdpAssocIdleSec = 90;
         const int MaxUdpAssoc = 96;
 
         // ── UDP 关联的统计与降噪 ──
@@ -419,6 +435,9 @@ namespace Ferry
             public Socket Sock;            // 对客户端收发的本地 socket
             public IPEndPoint Peer;        // 客户端实际的 UDP 源地址
             public DateTime LastSend;      // 最近一次发包（用于回包分发）
+            /// <summary>最近一次收到回包。判断「这条流还活着」要同时看收发两侧 ——
+            /// 游戏这类下行远大于上行的流量，光看 LastSend 会被误杀（见 UpRecvLoop）。</summary>
+            public DateTime LastRecv;
             public volatile bool Alive = true;
         }
 
@@ -501,10 +520,26 @@ namespace Ferry
                     foreach (var r in copy)
                     {
                         if (!r.Alive || r.Peer == null) continue;
-                        // 只发给「最近 5 秒还在发包」的流：一是省得给早就
-                        // 不用的流发，二是避免过期 relay 的 socket 已被关掉
-                        if ((nowTime - r.LastSend).TotalSeconds > 5) continue;
-                        try { r.Sock.SendTo(buf, 0, n, SocketFlags.None, r.Peer); }
+                        // 判「这条流还活着」要看**收发两侧**，不能只看发。
+                        //
+                        // 原来是 `(now - LastSend) > 5s 就跳过`。对 DNS 这种
+                        // 一问一答没影响，但游戏/语音是**下行远大于上行**的：
+                        // 玩家站着不动、或者资产下载时上行只有零星 ACK，
+                        // 5 秒不发包的流就被判死，回包全丢 —— 表现就是
+                        // 「连接还在、但一直卡着不动」。
+                        //
+                        // 2026-10-28 Hytale 现场：日志里 `ReceiveLoop: No packets
+                        // received for 5.0s (total: 10085)` 刷屏，然后
+                        // `QuicheException: Connection timed out`。
+                        var idle = Math.Min(
+                            (nowTime - r.LastSend).TotalSeconds,
+                            (nowTime - r.LastRecv).TotalSeconds);
+                        if (idle > UdpIdleSec) continue;
+                        try
+                        {
+                            r.Sock.SendTo(buf, 0, n, SocketFlags.None, r.Peer);
+                            r.LastRecv = nowTime;
+                        }
                         catch (Exception) { }
                     }
                 }
@@ -552,7 +587,7 @@ namespace Ferry
                 var cs = clientSock;
                 for (; ; )
                 {
-                    if ((DateTime.UtcNow - lastActive).TotalSeconds > 20) break;
+                    if ((DateTime.UtcNow - lastActive).TotalSeconds > UdpAssocIdleSec) break;
                     if (!_running) break;
                     try
                     {
@@ -564,6 +599,7 @@ namespace Ferry
                         udpPeer = fe;
                         relay.Peer = fe;
                         relay.LastSend = DateTime.UtcNow;
+                        if (relay.LastRecv == default(DateTime)) relay.LastRecv = DateTime.UtcNow;
                         lastActive = DateTime.UtcNow;
                         try { upSock.SendTo(buf, 0, n, SocketFlags.None, upEp); }
                         catch (Exception) { }

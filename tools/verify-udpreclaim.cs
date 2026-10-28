@@ -83,9 +83,13 @@ static class UdpReclaimCheck
         Console.WriteLine("   live associations: " + live);
         Ok(live >= 5, "they are counted as live");
 
-        // ── 2) 什么都不做，等空闲回收（20 秒 + 余量）──
-        Console.WriteLine("   waiting 26s for idle reclaim...");
-        Thread.Sleep(26000);
+        // ── 2) 什么都不做，等空闲回收（1.0.38 起是 90 秒，+ 余量）──
+        //
+        // 为什么从 20 秒放宽到 90 秒：游戏/语音是下行远大于上行的流量，
+        // 上行静默十几秒很常见。20 秒回收会把「玩家站着不动」误判成死流，
+        // 回包全丢 —— Hytale 的 `Connection timed out` 就是这么来的。
+        Console.WriteLine("   waiting 98s for idle reclaim...");
+        Thread.Sleep(98000);
         live = (int)nowField.GetValue(null);
         Console.WriteLine("   live after idle: " + live);
         Ok(live == 0, "idle associations were reclaimed even though TCP stayed open");
