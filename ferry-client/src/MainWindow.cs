@@ -108,21 +108,19 @@ namespace Ferry
             Foreground = Palette.TextB;
             ResizeMode = ResizeMode.CanMinimize;
 
-            // 纵向滚动：Auto 时，只要内容比窗口高出 1 像素就会画出滚动条，
-            // 而这条滚动条在固定尺寸窗口里显得多余（用户 2026-10-28 反馈）。
-            // 改成 Hidden —— 内容装得下时完全不占位；装不下时仍然能滚（鼠标滚轮
-            // 和 PageDown 照常工作），只是不显示那条竖条。
-            // 真正装不下的情况（小屏 / 高 DPI）在下面给 _mainStack 加了 MinHeight，
-            // 内容会被压缩而不是被截断。
-            var scroll = new ScrollViewer
-            {
-                VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
-            };
-            Content = scroll;
-
-            _mainStack = new StackPanel { Margin = new Thickness(20, 18, 20, 16) };
-            scroll.Content = _mainStack;
+            // 主界面**整页不滚动**：内容本来就装得下 780 高，加滚动容器只会
+            // 在右侧留一条永远不用的竖条（用户 2026-10-28 明确要求去掉）。
+            //
+            // 之前是 ScrollViewer + Auto（Auto = 高出 1 像素就画条），后来改 Hidden
+            // 只是「看不见但还能滚」—— 用户要的是「不要滚动这件事本身」。
+            //
+            // 现在内容直接放进窗口。为防内容超出（不同 DPI / 字体），
+            // 下面日志框用可伸缩高度（见 _log 的 Height 与 logCard 的 MinHeight），
+            // 由 Grid 分配剩余空间，而不是靠滚动条兜底。
+            //
+            // 日志框内部仍然有自己的滚动条（那是终端区域，用户说不用动）。
+            _mainStack = new StackPanel { Margin = new Thickness(20, 16, 20, 12) };
+            Content = _mainStack;
 
             // ── 顶部：标题 + 账号 ──
             var header = new Grid { Margin = new Thickness(0, 0, 0, 14) };
