@@ -231,6 +231,9 @@ namespace Ferry
         /// </summary>
         int _clashPort;
 
+        /// <summary>本地代理的直通端口（不分流，一律走隧道）。0 = 没有。</summary>
+        int _bypassPort;
+
         /// <param name="udpHost">上游 UDP 中继地址（仅用于日志/诊断，不写进配置）。
         /// UDP 现在统一走本地代理的 ASSOCIATE，见 ferry-udp 那段注释。</param>
         /// <param name="udpPort">同上。</param>
@@ -343,6 +346,22 @@ namespace Ferry
             sb.AppendLine("    port: " + socksPort.ToString());
             sb.AppendLine("    udp: true");
             sb.AppendLine();
+            // 直通上游：翻墙客户端自己连机场的出站走这里。
+            //
+            // 不能像 1.0.31 那样给 DIRECT：断网时段用户的物理出口是断的，
+            // DIRECT 出去必然失败。能连上机场的只有「借道 pcs」这条隧道。
+            // 2026-10-28 实测：经渡口连机场节点 36.141.40.13:764 → OK。
+            if (_bypassPort > 0)
+            {
+                sb.AppendLine("  # 直通：不分流，直接上隧道（给翻墙客户端自己用）");
+                sb.AppendLine("  - name: ferry-clash");
+                sb.AppendLine("    type: socks5");
+                sb.AppendLine("    server: 127.0.0.1");
+                sb.AppendLine("    port: " + _bypassPort.ToString());
+                sb.AppendLine("    udp: false");
+                sb.AppendLine();
+            }
+
             sb.AppendLine("proxy-groups:");
             sb.AppendLine("  - name: ferry");
             sb.AppendLine("    type: select");
@@ -352,32 +371,15 @@ namespace Ferry
             sb.AppendLine("    proxies: [ferry-udp]");
             sb.AppendLine();
             sb.AppendLine("rules:");
-            // 防回环例外：**无条件写入**，不看有没有检测到本机代理。
+            // 规则顺序是设计的一部分，别随手调：
+            //   ① 内网/回环直连（局域网、打印机、远端 SSH 不能进隧道）
+            //   ② 所有 UDP 走 ferry-udp（唯一能承载 UDP 的线路）
+            //   ③ 翻墙客户端自己的出站 → ferry-clash（直通，不分流）
+            //   ④ 其余交给本地代理去分流
             //
-            // 1.0.30 及之前是 `if (_clashPort > 0)` 才写这一段。用户机 23:44
-            // 的日志是反例：
-            //     23:44:37 没有检测到本机代理，全部流量走渡口
-            // 那一刻 Clash 的 7897 恰好不可达，于是一条 PROCESS-NAME 都没生成；
-            // 用户随后打开 Clash，它连机场的出站被 TUN 抓回来判境外、再交给
-            // Clash、再被抓 —— 死循环。表现就是「Clash 端口能连、CONNECT 200，
-            // 但所有境外站点都超时」。
-            //
-            // 这条规则只在名单里的进程真的存在时才命中，写上是纯保险、没有
-            // 副作用；而依赖「启动那一瞬间恰好检测到 Clash」是一个竞态 ——
-            // 只要用户先起渡口再起 Clash，保险就永远缺失。
-            //
-            // 名单固定、不枚举用户装了什么（踩坑 66 的教训：方案一旦需要
-            // 「知道用户装了什么」，就说明绕路了）。两种写法都写：mihomo
-            // 不同版本对进程名是否带 .exe 的处理不一致，实测两种都能匹配，
-            // 多写一份的成本为零。
-            foreach (var proc in new string[] {
-                "clash-verge", "clash-verge-service", "verge-mihomo",
-                "clash-meta", "Clash for Windows", "v2rayN", "v2ray",
-                "xray", "sing-box", "clash", "mihomo", "nekoray", "nekobox" })
-            {
-                sb.AppendLine("  - PROCESS-NAME," + proc + ",DIRECT");
-                sb.AppendLine("  - PROCESS-NAME," + proc + ".exe,DIRECT");
-            }
+            // 为什么 UDP 排在进程规则前面：mihomo 的 PROCESS-NAME 不区分
+            // TCP/UDP，如果放在前面，Clash 的 UDP（ss 的 UDP 转发）会被导到
+            // 只支持 TCP 的 ferry-clash 上，直接失败。先让 UDP 落进 ferry-udp 就对。
             sb.AppendLine("  # 内网与回环永远直连 —— 否则局域网打印机/共享/远端 SSH 立刻失联");
             sb.AppendLine("  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve");
             sb.AppendLine("  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve");
@@ -385,16 +387,34 @@ namespace Ferry
             sb.AppendLine("  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve");
             sb.AppendLine("  # UDP 单独分流：只有 ferry-udp 能承载");
             sb.AppendLine("  - NETWORK,udp,ferry-udp-group");
-            // 规则保持极简：把「分流」全部交给本地代理。
+
+            // 翻墙客户端自己的出站。
             //
-            // 为什么这一层不按 IP 分：TUN 开着 fake-ip，域名进 TUN 时是
-            // 198.18.x.x，要匹配 IP-CIDR 就得先解析 —— 等于**每个新域名多一次
-            // DNS 查询**，而且用的是国内 DNS，墙外域名拿到的是污染地址，
-            // 判定本身就错。本地代理那边拿得到域名、有缓存，比这里准。
+            // 1.0.31 这里写的是 DIRECT，理由「防回环」。方向对了一半：确实不能让它
+            // 被 TUN 抓回去判境外。但 DIRECT 在**断网时段必死** —— 用户的物理出口
+            // 是断的，能出网的只有借道 pcs 的隧道。
+            // 2026-10-28 实测：经渡口连机场节点 36.141.40.13:764 → OK。
+            // 所以 1.0.34 起改走 ferry-clash（本地代理的直通端口，不分流）。
+            // 没有直通端口时（老版本/端口起不来）退回 DIRECT，行为与 1.0.31 一致。
             //
-            // 这一层只做两件事：翻墙客户端自己的出站放行直连（否则
-            // Clash 连机场会被自己的 TUN 抓走 → 转一圈回 Clash，成环），
-            // 其余全部交给本地代理。
+            // 名单无条件写入，不看有没有检测到本机代理 —— 以前是
+            // `if (_clashPort > 0)` 才写，成了竞态：用户机 23:44 的日志是
+            // 「没有检测到本机代理」，于是这条防回环保险一条都没生成。
+            // 名字两种写法都写：mihomo 各版本对是否带 .exe 的处理不一致，实测都能匹配。
+            var clashDest = _bypassPort > 0 ? "ferry-clash" : "DIRECT";
+            foreach (var proc in new string[] {
+                "clash-verge", "clash-verge-service", "verge-mihomo",
+                "clash-meta", "Clash for Windows", "v2rayN", "v2ray",
+                "xray", "sing-box", "clash", "mihomo", "nekoray", "nekobox" })
+            {
+                sb.AppendLine("  - PROCESS-NAME," + proc + "," + clashDest);
+                sb.AppendLine("  - PROCESS-NAME," + proc + ".exe," + clashDest);
+            }
+
+            // 其余全部交给本地代理：这一层只决定「谁进隧道」，不判国内外。
+            // 为什么不在这里判：TUN 开着 fake-ip，域名进来时是 198.18.x.x，
+            // 要判就得先解析 —— 用的是国内 DNS，墙外域名拿到污染地址，判定本身就错。
+            // 本地代理那边拿得到域名、有缓存，比这里准。（踩坑 71/72/73）
             sb.AppendLine("  - MATCH,ferry");
             return sb.ToString();
         }
@@ -410,11 +430,13 @@ namespace Ferry
         /// 境外流量交给它 —— 渡口出口到不了境外，这一步是「借网 + 翻墙共存」
         /// 的关键。0 表示没检测到，全部走渡口。
         /// </param>
-        public string Start(int socksPort, string udpHost, int udpPort, int clashPort)
+        public string Start(int socksPort, string udpHost, int udpPort, int clashPort,
+                            int bypassPort = 0)
         {
             if (_running) return "";
 
             _clashPort = clashPort;
+            _bypassPort = bypassPort;
 
             if (!IsAdmin())
                 return "TUN 需要管理员权限。请右键「以管理员身份运行」，或用安装包重新安装（已默认要求管理员）。";

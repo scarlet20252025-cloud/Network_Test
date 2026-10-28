@@ -50,6 +50,23 @@ namespace Ferry
         readonly HashSet<string> _loggedOnce = new HashSet<string>();
 
         TcpListener _listener;
+
+        /// <summary>
+        /// 「直通」端口：从这儿进来的连接**不做国内外分流**，一律直接上隧道的
+        /// SOCKS 上游。TUN 会把本机翻墙客户端的出站导到这里（规则里叫 ferry-clash）。
+        ///
+        /// 为什么需要单独一个端口：本地代理看到的来源永远是 127.0.0.1，
+        /// 分不出「这条连接是浏览器发的」还是「Clash 发给机场的」。而这两类
+        /// 必须区别对待 ——
+        ///   · 浏览器的境外流量：交给本机 Clash（不然渡口出口到不了境外）
+        ///   · Clash 自己连机场：**必须走渡口**。断网时段物理出口是不通的，
+        ///     DIRECT 出去必然失败；只有借道 pcs 的出口才连得上机场。
+        /// 两者混淆就是死循环（Clash → 渡口 → 判境外 → 回 Clash）。
+        /// 端口分开之后，两条路各走各的，不再靠猜。
+        /// </summary>
+        int _bypassPort;
+        TcpListener _bypassListener;
+
         volatile bool _running;
         long _connTotal, _connActive, _bytesUp, _bytesDown;
         long _connRejected;
@@ -139,7 +156,11 @@ namespace Ferry
             if (!string.IsNullOrEmpty(host)) _clashHost = host;
         }
 
+        /// <summary>开一个直通端口（0 = 不开）。必须在 Start 之前调用。</summary>
+        public void SetBypassPort(int port) { _bypassPort = port; }
+
         public int Port { get { return _listenPort; } }
+        public int BypassPort { get { return _bypassPort; } }
         public bool Running { get { return _running; } }
         public long ConnTotal { get { return Interlocked.Read(ref _connTotal); } }
         public long ConnActive { get { return Interlocked.Read(ref _connActive); } }
@@ -173,12 +194,34 @@ namespace Ferry
                 _listener = new TcpListener(IPAddress.Loopback, _listenPort);
                 _listener.Start();
                 _running = true;
-                var t = new Thread(AcceptLoop);
+                var t = new Thread(delegate () { AcceptLoopOn(_listener, false); });
                 t.IsBackground = true;
                 t.Name = "ferry-accept";
                 t.Start();
-                _log("代理已监听 127.0.0.1:" + _listenPort + "（上游 SOCKS " +
-                     _socksHost + ":" + _socksPort + "）");
+
+                // 直通端口起不来不算致命：退化成「没有直通」，TUN 规则会回退成 DIRECT。
+                if (_bypassPort > 0)
+                {
+                    try
+                    {
+                        _bypassListener = new TcpListener(IPAddress.Loopback, _bypassPort);
+                        _bypassListener.Start();
+                        var tb = new Thread(delegate () { AcceptLoopOn(_bypassListener, true); });
+                        tb.IsBackground = true;
+                        tb.Name = "ferry-accept-bypass";
+                        tb.Start();
+                    }
+                    catch (Exception ex)
+                    {
+                        _bypassPort = 0;
+                        _bypassListener = null;
+                        _log("直通端口 " + _bypassPort + " 起不来（翻墙客户端会退回直连）：" + ex.Message);
+                    }
+                }
+
+                _log("代理已监听 127.0.0.1:" + _listenPort +
+                     (_bypassPort > 0 ? " + 直通 " + _bypassPort : "") +
+                     "（上游 SOCKS " + _socksHost + ":" + _socksPort + "）");
                 return true;
             }
             catch (Exception e)
@@ -192,16 +235,18 @@ namespace Ferry
         {
             _running = false;
             try { if (_listener != null) _listener.Stop(); } catch (Exception) { }
+            try { if (_bypassListener != null) _bypassListener.Stop(); } catch (Exception) { }
             _listener = null;
+            _bypassListener = null;
             _log("代理已停止");
         }
 
-        void AcceptLoop()
+        void AcceptLoopOn(TcpListener listener, bool bypass)
         {
             while (_running)
             {
                 TcpClient client = null;
-                try { client = _listener.AcceptTcpClient(); }
+                try { client = listener.AcceptTcpClient(); }
                 catch (Exception) { if (!_running) return; continue; }
 
                 var c = client;
@@ -226,14 +271,14 @@ namespace Ferry
                     continue;
                 }
 
-                var t = new Thread(delegate () { HandleConn(c); });
+                var t = new Thread(delegate () { HandleConn(c, bypass); });
                 t.IsBackground = true;
-                t.Name = "ferry-conn";
+                t.Name = bypass ? "ferry-conn-bypass" : "ferry-conn";
                 t.Start();
             }
         }
 
-        void HandleConn(TcpClient client)
+        void HandleConn(TcpClient client, bool bypass)
         {
             NetworkStream ns = null;
             try
@@ -248,9 +293,9 @@ namespace Ferry
                 if (!ReadExact(ns, first, 1)) return;
 
                 if (first[0] == 0x05)
-                    HandleSocks5(ns, first[0], client.Client.RemoteEndPoint as IPEndPoint);
+                    HandleSocks5(ns, first[0], client.Client.RemoteEndPoint as IPEndPoint, bypass);
                 else
-                    HandleHttp(ns, first[0]);
+                    HandleHttp(ns, first[0], bypass);
             }
             catch (Exception) { }
             finally
@@ -263,7 +308,7 @@ namespace Ferry
 
         // ── SOCKS5（客户端 → 我）──────────────────────────────
 
-        void HandleSocks5(NetworkStream ns, byte ver, IPEndPoint clientEp)
+        void HandleSocks5(NetworkStream ns, byte ver, IPEndPoint clientEp, bool bypass)
         {
             // 我们已经读了 VER，接着读 NMETHODS + METHODS
             var buf = new byte[1];
@@ -321,7 +366,9 @@ namespace Ferry
             Socket upstream = null;
             try
             {
-                upstream = ConnectSmart(host, port, 8000);
+                upstream = bypass
+                    ? ConnectSocks(_socksPort, host, port, 8000, _socksHost)
+                    : ConnectSmart(host, port, 8000);
                 if (upstream == null) { ReplySocks5(ns, 0x05); return; }
                 ReplySocks5(ns, 0x00);
                 Pump(ns, new NetworkStream(upstream, true));
@@ -1076,7 +1123,7 @@ namespace Ferry
             return list;
         }
 
-        void HandleHttp(NetworkStream ns, byte firstByte)
+        void HandleHttp(NetworkStream ns, byte firstByte, bool bypass)
         {
             var header = ReadHeader(ns, firstByte, 65536);
             if (header == null || header.Length == 0) return;
@@ -1122,7 +1169,9 @@ namespace Ferry
             Socket upstream = null;
             try
             {
-                upstream = ConnectSmart(host, port, 8000);
+                upstream = bypass
+                    ? ConnectSocks(_socksPort, host, port, 8000, _socksHost)
+                    : ConnectSmart(host, port, 8000);
                 if (upstream == null)
                 {
                     var err = Encoding.ASCII.GetBytes(

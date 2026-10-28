@@ -24,7 +24,7 @@ namespace Ferry
         Tunnel _tunnel;
         ProxyServer _proxy;
         TunMode _tun;
-        int _httpPort, _socksPort;
+        int _httpPort, _socksPort, _bypassPort;
         volatile bool _running;
 
         public FerryRuntime(Cfg cfg, string appDir, Action<string> log)
@@ -128,6 +128,8 @@ namespace Ferry
             _socksPort = ProxyServer.FindFree(Math.Max(10800, _cfg.SocksPort), 40);
             _httpPort = ProxyServer.FindFree(_socksPort + 1, 40);
             if (_httpPort == _socksPort) { _httpPort = ProxyServer.FindFree(_socksPort + 2, 40); }
+            // 直通端口：TUN 把翻墙客户端的出站导到这里（见 ProxyServer._bypassPort）。
+            _bypassPort = ProxyServer.FindFree(_httpPort + 1, 40);
 
             if (_socksPort == _cfg.SocksPort && _httpPort == _cfg.HttpPort)
                 _log("端口：SOCKS " + _socksPort + " / HTTP " + _httpPort);
@@ -193,6 +195,7 @@ namespace Ferry
             // （以前这里会另外 FindFree 一个端口，但根本没监听它，日志里那个号是假的）。
             if (_cfg.DirectSocks) _socksPort = _httpPort;
             _proxy = new ProxyServer(_httpPort, upstreamPort, upstreamHost, _log);
+            _proxy.SetBypassPort(_bypassPort);
 
             // ④ 分流：用户本来就在用 Clash/加速器的话，境外交给它，渡口只管国内。
             //
@@ -276,7 +279,7 @@ namespace Ferry
             {
                 _tunError = "";
                 _tun = new TunMode(_cfg, _appDir, _log);
-                var terr = _tun.Start(_httpPort, _cfg.UdpRelayHost, _cfg.UdpRelayPort, clashPort);
+                var terr = _tun.Start(_httpPort, _cfg.UdpRelayHost, _cfg.UdpRelayPort, clashPort, _proxy.BypassPort);
                 if (terr.Length > 0)
                 {
                     _tunError = terr;
