@@ -108,9 +108,15 @@ namespace Ferry
             Foreground = Palette.TextB;
             ResizeMode = ResizeMode.CanMinimize;
 
+            // 纵向滚动：Auto 时，只要内容比窗口高出 1 像素就会画出滚动条，
+            // 而这条滚动条在固定尺寸窗口里显得多余（用户 2026-10-28 反馈）。
+            // 改成 Hidden —— 内容装得下时完全不占位；装不下时仍然能滚（鼠标滚轮
+            // 和 PageDown 照常工作），只是不显示那条竖条。
+            // 真正装不下的情况（小屏 / 高 DPI）在下面给 _mainStack 加了 MinHeight，
+            // 内容会被压缩而不是被截断。
             var scroll = new ScrollViewer
             {
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
             };
             Content = scroll;
@@ -386,7 +392,7 @@ namespace Ferry
                 AcceptsReturn = true,
                 TextWrapping = TextWrapping.Wrap,
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                Height = 220,
+                Height = 190,
                 FontFamily = new FontFamily(Palette.FontMono),
                 FontSize = Palette.FsMono,
                 Foreground = Palette.MutedB,

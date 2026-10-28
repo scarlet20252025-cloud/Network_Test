@@ -252,6 +252,10 @@ namespace Ferry
 
             try
             {
+                // ICS 必须先起来，否则下面 StartTetheringAsync 会「假成功」。
+                var ics = EnsureIcs();
+                if (ics != "") return ics;
+
                 var mgr = Manager();
                 if (mgr == null) return "找不到可共享的网络连接（本机当前没有能上网的接口）";
 
@@ -360,6 +364,84 @@ namespace Ferry
             if (result == null) return "";
             var sp = result.GetType().GetProperty("Status");
             return sp == null ? "" : Convert.ToString(sp.GetValue(result, null));
+        }
+
+        /// <summary>
+        /// 确保 ICS（SharedAccess）服务在跑。返回空字符串表示就绪。
+        ///
+        /// 为什么必须显式拉起来：WinRT 的 StartTetheringAsync 只负责「让网卡进入
+        /// SoftAP 模式」，**不会去启动 ICS 服务**。ICS 没跑时它的行为是：
+        ///   · API 返回 Success
+        ///   · 网卡一度拿到 192.168.137.1
+        ///   · 但系统在约 15 秒后把热点关掉，网卡退回 169.254
+        /// 用户看到的就是「热点开了又自己关」「手机连上没网」。
+        ///
+        /// 2026-10-28 用户机实测：SharedAccess = Stopped，热点开了两次都失败；
+        /// 测试机上 ICS 是 Running，同样代码能起来。差别就在这里。
+        ///
+        /// 为什么用 sc 而不是 ServiceController：
+        /// 需要以管理员身份启动服务，ServiceController.Start() 在权限不足时
+        /// 抛的异常信息很难看懂（"无法打开计算机上的服务"），而 sc.exe 的
+        /// 返回码能直接判断。渡口本身以管理员运行（app.manifest
+        /// requireAdministrator），所以这里不会弹 UAC。
+        /// </summary>
+        static string EnsureIcs()
+        {
+            try
+            {
+                if (IcsRunning()) return "";
+
+                RunSc("start SharedAccess");
+
+                // 服务启动是异步的，等它真的进入 Running（最多 15 秒）
+                var until = DateTime.UtcNow.AddSeconds(15);
+                while (DateTime.UtcNow < until)
+                {
+                    if (IcsRunning()) return "";
+                    Thread.Sleep(500);
+                }
+                return "Internet 连接共享（ICS）服务起不来，热点无法工作。" +
+                       "请以管理员身份运行渡口，或在「服务」里手动启动 SharedAccess。";
+            }
+            catch (Exception e)
+            {
+                return "启动 ICS 服务失败：" + Innermost(e).Message;
+            }
+        }
+
+        static bool IcsRunning()
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("sc.exe", "query SharedAccess")
+                {
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    var outp = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit(5000);
+                    return outp.IndexOf("RUNNING", StringComparison.OrdinalIgnoreCase) >= 0;
+                }
+            }
+            catch (Exception) { return false; }
+        }
+
+        static void RunSc(string args)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("sc.exe", args)
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using (var p = System.Diagnostics.Process.Start(psi))
+            {
+                p.StandardOutput.ReadToEnd();
+                p.WaitForExit(15000);
+            }
         }
 
         /// <summary>
