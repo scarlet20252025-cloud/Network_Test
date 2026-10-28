@@ -245,6 +245,29 @@ namespace Ferry
         /// <summary>开一个直通端口（0 = 不开）。必须在 Start 之前调用。</summary>
         public void SetBypassPort(int port) { _bypassPort = port; }
 
+        /// <summary>UDP 关联该往哪条上游走。null = 跟 TCP 用同一个（旧行为）。</summary>
+        string _udpUpHost;
+        int _udpUpPort;
+
+        /// <summary>
+        /// 单独指定 UDP 的上游。
+        ///
+        /// 为什么必须能分开：OpenSSH 的 `-D` **在协议层面就不实现 UDP ASSOCIATE**
+        /// （RFC 1928 的 CMD=0x03）。隧道模式下上游是 `127.0.0.1:ssh的SOCKS端口`，
+        /// 拿它去发 UDP ASSOCIATE 必然失败 —— 而且失败得很安静：客户端只是
+        /// 收不到回包，日志里什么都没有。用户看到的是「游戏 / 语音一直连不上」。
+        ///
+        /// 远端的 `ferry-socks5-server.py` 本来就同时提供 TCP CONNECT 和
+        /// UDP ASSOCIATE，所以隧道模式下 UDP 应该**绕过 SSH**，
+        /// 直连远端的 1080。代价是这段 UDP 是明文的 —— 但 UDP 走 SSH 本来就不可能，
+        /// 且游戏/UDP 流量对加密的诉求远低于「能不能通」。
+        /// </summary>
+        public void SetUdpUpstream(string host, int port)
+        {
+            _udpUpHost = host;
+            _udpUpPort = port;
+        }
+
         public int Port { get { return _listenPort; } }
         public int BypassPort { get { return _bypassPort; } }
         public bool Running { get { return _running; } }
@@ -587,10 +610,14 @@ namespace Ferry
             {
                 // 每条流独占一个上游（见 UdpRelay 的注释）。
                 IPEndPoint upEp;
-                var upCtrl = AssociateUpstream(_socksPort, _socksHost, out upEp, 8000);
+                // UDP 的上游可以和 TCP 不同（隧道模式下 TCP 走 ssh -D，
+                // 而 ssh -D 不支持 UDP ASSOCIATE，见 SetUdpUpstream 的注释）。
+                var uHost = string.IsNullOrEmpty(_udpUpHost) ? _socksHost : _udpUpHost;
+                var uPort = _udpUpPort > 0 ? _udpUpPort : _socksPort;
+                var upCtrl = AssociateUpstream(uPort, uHost, out upEp, 8000);
                 if (upCtrl == null)
                 {
-                    _log("UDP 关联失败：上游不支持或连不上 " + _socksHost + ":" + _socksPort);
+                    _log("UDP 关联失败：上游不支持或连不上 " + uHost + ":" + uPort);
                     ReplySocks5(ns, 0x01);
                     return;
                 }

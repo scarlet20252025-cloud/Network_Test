@@ -197,6 +197,26 @@ namespace Ferry
             _proxy = new ProxyServer(_httpPort, upstreamPort, upstreamHost, _log);
             _proxy.SetBypassPort(_bypassPort);
 
+            // UDP 的上游单独指定：**永远指向远端中继**，不走 ssh -D。
+            //
+            // 为什么（2026-10-29 查出来的一个静默 bug）：
+            //   OpenSSH 的 `-D` 在协议层面不实现 UDP ASSOCIATE（CMD=0x03）。
+            //   隧道模式下 upstreamPort 是「本机 ssh 的 SOCKS 端口」，
+            //   拿它做 UDP ASSOCIATE 必然失败，而且失败得完全无声 ——
+            //   用户看到的是「游戏 / 语音一直连不上」，日志里一个字都没有。
+            //   远端的 ferry-socks5-server.py 本来就同时支持 TCP CONNECT
+            //   和 UDP ASSOCIATE，所以 UDP 直接连远端 1080 就行。
+            //
+            // 直连模式下两者本来就是同一个地址，这里再设一次是无害的 ——
+            // 所以不需要 if。
+            {
+                var udpHost = _cfg.RemoteHost;
+                var udpPort = _cfg.RelayPort > 0 ? _cfg.RelayPort : 1080;
+                _proxy.SetUdpUpstream(udpHost, udpPort);
+                if (!_cfg.DirectSocks)
+                    _log("UDP 上游：" + udpHost + ":" + udpPort + "（ssh -D 不支持 UDP，故绕过隧道）");
+            }
+
             // ④ 分流：用户本来就在用 Clash/加速器的话，境外交给它，渡口只管国内。
             //
             // 为什么这么做：用户往往已经有一套翻墙代理。渡口接管系统代理之后，

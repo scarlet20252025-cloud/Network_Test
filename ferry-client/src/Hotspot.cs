@@ -199,11 +199,131 @@ namespace Ferry
         }
 
         /// <summary>
+        /// 把适配器 id 归一化后再比较。
+        ///
+        /// 为什么需要（2026-10-29 实测踩到的坑）：
+        ///   WinRT 的 `NetworkAdapter.NetworkAdapterId` 是**小写、不带花括号**的 Guid 文本：
+        ///     `240a0b06-fe61-4787-9314-52f74b98e203`
+        ///   而 .NET 的 `NetworkInterface.Id` 是**大写、带花括号**：
+        ///     `{240A0B06-FE61-4787-9314-52F74B98E203}`
+        ///   直接 `string.Equals(..., OrdinalIgnoreCase)` 永远不相等 ——
+        ///   于是任何按 id 找网卡描述的逻辑都会「找不到」，把**所有**网卡
+        ///   当成虚拟网卡排除掉，最后报「本机没有已连接的物理网卡」。
+        ///   这个 bug 在测试里表现为「实际选中 = null」。
+        /// </summary>
+        static Guid NormalizeId(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return Guid.Empty;
+            var s = id.Trim().Trim('{', '}');
+            Guid g;
+            return Guid.TryParse(s, out g) ? g : Guid.Empty;
+        }
+
+        /// <summary>按 WinRT 的 adapterId 找到 .NET 的网卡。</summary>
+        static NetworkInterface FindNi(string winRtAdapterId)
+        {
+            var want = NormalizeId(winRtAdapterId);
+            if (want == Guid.Empty) return null;
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (NormalizeId(ni.Id) == want) return ni;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 取适配器描述（「Realtek 8852BE Wireless LAN …」这种）。
+        /// 判断物理/虚拟只能靠它 —— 只看 IanaInterfaceType 不够。
+        /// </summary>
+        static string AdapterDescOf(object profile)
+        {
+            try
+            {
+                var t = profile.GetType();
+                var ad = t.GetProperty("NetworkAdapter");
+                var adVal = ad == null ? null : ad.GetValue(profile, null);
+                if (adVal == null) return "";
+                var idp = adVal.GetType().GetProperty("NetworkAdapterId");
+                string id = idp == null ? "" : Convert.ToString(idp.GetValue(adVal, null));
+                var ni = FindNi(id);
+                return ni == null ? "" : (ni.Description ?? "");
+            }
+            catch (Exception) { return ""; }
+        }
+
+        /// <summary>
+        /// 描述里这些词出现就**不是**可以拿去 NAT 的物理网卡。
+        ///
+        /// 为什么必须按描述排除（2026-10-29 用户机实测）：
+        ///   只看 IanaInterfaceType 会把三类假货当成物理网卡 ——
+        ///     · `Radmin VPN` —— Famatech 的虚拟以太网，iana=6，**Up**
+        ///       （用户装着实机在用，一点名就必被选中）
+        ///     · `etgame` —— 游戏加速器的隧道网卡，iana=53
+        ///     · `WAN Miniport` / `Teredo` / `6to4` / `IP-HTTPS` —— 系统虚拟口
+        ///   它们都能报 InternetAccess，但 ICS 拿它们当共享源只会把状态机搞乱。
+        ///   物理网卡反而常常是 LocalAccess（校园网禁网），于是「先找物理」那条
+        ///   规则反而排不上队 —— 必须先把假货挑出去。
+        /// </summary>
+        static readonly string[] _virtualWords = new string[] {
+            "wi-fi direct", "virtual", "vpn", "tunnel", "teredo", "6to4",
+            "ip-https", "wan miniport", "loopback", "hyper-v", "tap-",
+            "wintun", "wireguard", "openvpn", "accelerat", "meta "
+        };
+
+        static bool IsVirtualAdapter(string desc)
+        {
+            if (string.IsNullOrEmpty(desc)) return true;   // 查不到就当虚拟，宁可不选
+            var d = desc.ToLowerInvariant();
+            foreach (var w in _virtualWords)
+                if (d.IndexOf(w, StringComparison.Ordinal) >= 0) return true;
+            return false;
+        }
+
+        /// <summary>取配置档的 IanaInterfaceType（71=WiFi，6=以太网，53=隧道）。</summary>
+        static int IanaOf(object profile)
+        {
+            try
+            {
+                var t = profile.GetType();
+                var ad = t.GetProperty("NetworkAdapter");
+                var adVal = ad == null ? null : ad.GetValue(profile, null);
+                if (adVal == null) return 0;
+                var ia = adVal.GetType().GetProperty("IanaInterfaceType");
+                return ia == null ? 0 : Convert.ToInt32(ia.GetValue(adVal, null));
+            }
+            catch (Exception) { return 0; }
+        }
+
+        /// <summary>
+        /// 是不是热点自己的 AP 网卡（Microsoft Wi-Fi Direct Virtual Adapter）。
+        ///
+        /// 热点起来之后它会以「本地连接* N」或热点 SSID 的名字出现在
+        /// GetConnectionProfiles 里，级别通常是 LocalAccess —— 要是被选成共享源，
+        /// 就是「自己共享给自己」，状态机立刻卡死。
+        /// 只靠名字前缀（原来的 "Hotspot" 判断）挡不住，必须看适配器描述。
+        /// </summary>
+        static bool IsApProfile(object profile)
+        {
+            try
+            {
+                var t = profile.GetType();
+                var ad = t.GetProperty("NetworkAdapter");
+                var adVal = ad == null ? null : ad.GetValue(profile, null);
+                if (adVal == null) return false;
+                var idp = adVal.GetType().GetProperty("NetworkAdapterId");
+                string id = idp == null ? "" : Convert.ToString(idp.GetValue(adVal, null));
+                var ni = FindNi(id);
+                if (ni == null) return false;
+                return (ni.Description ?? "").IndexOf("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch (Exception) { return false; }
+        }
+
+        /// <summary>
         /// 挑一个能当共享源的连接配置档。
         ///
-        /// 判据是「网络级别 = InternetAccess」，不是网卡名 —— 见文件头注释。
-        /// 同时**跳过热点自己的配置档**：热点起来之后它也会出现在列表里
-        /// （级别通常是 LocalAccess），要是被选中就会「自己共享给自己」。
+        /// 判据是「**已连接的物理网卡**」（WLAN / 以太网），不是「网络级别」。
+        /// 这个判断在 1.0.45 改过，原因见方法内注释。
         /// </summary>
         static object PickShareProfile()
         {
@@ -211,8 +331,9 @@ namespace Ferry
             {
                 var m = MethodNoArg(_netInfo, "GetConnectionProfiles");
                 var profiles = (IEnumerable)m.Invoke(null, null);
+                object physical = null;   // 已连接的物理网卡（不管有没有外网）
+                object internet = null;   // 任何 InternetAccess
                 object fallback = null;
-                object internet = null;
                 foreach (var p in profiles)
                 {
                     if (p == null) continue;
@@ -220,6 +341,7 @@ namespace Ferry
                     var pnProp = t.GetProperty("ProfileName");
                     string pn = pnProp == null ? "" : Convert.ToString(pnProp.GetValue(p, null));
                     if (pn.StartsWith("Hotspot", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (IsApProfile(p)) continue;   // 热点自己的 AP 网卡，绝不共享给自己
 
                     var gm = MethodNoArg(t, "GetNetworkConnectivityLevel");
                     if (gm == null) continue;
@@ -227,42 +349,54 @@ namespace Ferry
                     try { level = Convert.ToString(gm.Invoke(p, null)); }
                     catch (Exception) { continue; }
 
-                    // 共享源**必须是物理网卡**（WLAN / 以太网），不能用虚拟网卡。
+                    // 1.0.45 的关键修正（两处）：
                     //
-                    // 1.0.41 曾改成「FerryTun（虚拟网卡）优先」，理由是它代表
-                    // 「已经借到网的那条路」。这是个错误：用户的实测显示
-                    // 1.0.40（用物理网卡）能开热点，1.0.43（FerryTun 优先）
-                    // 反而开不起来，卡在 InTransition。
-                    // 虚拟网卡当共享源时，ICS 的 NAT 方向无法确定，
-                    // 热点状态机就会卡住。改回 1.0.40 的行为：物理网卡优先。
+                    // ① 物理网卡只要「已连接」（level != None）就能当共享源，
+                    //    **不再要求 InternetAccess**。
                     //
-                    // 怎么判断是不是虚拟网卡：看 IanaInterfaceType。
-                    //   71 = IEEE 802.11 无线（WLAN）
-                    //    6 = 以太网（Ethernet）
-                    //  其他（53 =  проприетарный tunnel 等）一律跳过。
-                    int iana = 0;
-                    try
+                    //   为什么（2026-10-29 用户机实测）：
+                    //   渡口的使用场景就是「校园网禁网」—— 那时 WLAN 连着 AP，
+                    //   但级别是 LocalAccess（没有外网权限），而全机唯一的
+                    //   InternetAccess 是 FerryTun（TUN 虚拟网卡，iana=53）。
+                    //   1.0.44 要求 InternetAccess，于是永远选不到物理网卡，
+                    //   只能落到 FerryTun → 卡死。用户看到的就是「热点开不起来」。
+                    //   实测该机 GetConnectionProfiles：29 个历史 WLAN 配置档全是
+                    //   None，当前连着的 GDPZ-student-5G 是 LocalAccess，
+                    //   FerryTun 是唯一的 InternetAccess。
+                    //
+                    // ② 物理/虚拟不能只看 IanaInterfaceType，必须按适配器描述排除。
+                    //   同一台机器上就有两个骗子：
+                    //     Radmin VPN —— 虚拟以太网，iana=6，Up（用户装着实机在用）
+                    //     etgame     —— 游戏加速器隧道，iana=53，Up
+                    //   只看 iana 会把 Radmin 当以太网选走，ICS 照样卡住。
+                    var desc = AdapterDescOf(p);
+                    int iana = IanaOf(p);
+                    bool looksPhysical = (iana == 71 || iana == 6) && !IsVirtualAdapter(desc);
+                    if (looksPhysical && level != "None")
                     {
-                        var ad = t.GetProperty("NetworkAdapter");
-                        var adVal = ad == null ? null : ad.GetValue(p, null);
-                        if (adVal != null)
-                        {
-                            var ia = adVal.GetType().GetProperty("IanaInterfaceType");
-                            if (ia != null) iana = Convert.ToInt32(ia.GetValue(adVal, null));
-                        }
+                        // 优先挑「真正连着」的那块：无线网卡（71）比以太网（6）更常见
+                        if (physical == null || IanaOf(physical) != 71) physical = p;
+                        continue;
                     }
-                    catch (Exception) { }
-
-                    bool isPhysical = (iana == 71 || iana == 6);
-                    if (level == "InternetAccess" && isPhysical) return p;
                     if (level == "InternetAccess" && internet == null) internet = p;
-                    // 没找到 InternetAccess 时留一个「非 None」的兜底，
-                    // 总比完全没有共享源好（例如刚连上还没探测完连通性）。
                     if (fallback == null && level != "None") fallback = p;
                 }
-                return internet != null ? internet : fallback;
+
+                if (physical != null) return physical;
+                // 兜底也必须是物理网卡 —— 虚拟网卡宁可不用（会卡死），
+                // 让调用方报「找不到可共享的网络连接」，比卡 25 秒强。
+                if (internet != null && IsPhysicalProfile(internet)) return internet;
+                if (fallback != null && IsPhysicalProfile(fallback)) return fallback;
+                return null;
             }
             catch (Exception) { return null; }
+        }
+
+        static bool IsPhysicalProfile(object p)
+        {
+            int iana = IanaOf(p);
+            if (iana != 71 && iana != 6) return false;
+            return !IsVirtualAdapter(AdapterDescOf(p));
         }
 
         /// <summary>
@@ -286,7 +420,32 @@ namespace Ferry
                 if (ics != "") return ics;
 
                 var mgr = Manager();
-                if (mgr == null) return "找不到可共享的网络连接（本机当前没有能上网的接口）";
+                if (mgr == null) return "找不到可共享的网络连接（本机当前没有已连接的物理网卡）";
+
+                // ── 卡死自愈：状态机停在 InTransition 时先自己救一次 ──
+                //
+                // 2026-10-29 用户机实测：1.0.41 用 FerryTun 当共享源把状态机卡在
+                // InTransition 之后，后面所有版本都开不起来 ——
+                //   StopTetheringAsync 超时、StartTetheringAsync 超时、
+                //   换频段 / 换 SSID / 重启 WlanSvc 全部无效。
+                // 而「重启 ICS 服务」（含按 PID 杀掉停在 STOP_PENDING 的 svchost）
+                // 在实测里能把它救回来，不必让用户重启电脑。
+                if (string.Equals(State(), "InTransition", StringComparison.OrdinalIgnoreCase))
+                {
+                    StopAndWait(mgr, 6000);
+                    if (string.Equals(State(), "InTransition", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var icsErr = RestartIcs();
+                        if (icsErr != "")
+                            return "热点状态机卡在「切换中」，ICS 也重启不了（" + icsErr + "）。请重启电脑后重试。";
+                        Thread.Sleep(2000);
+                        mgr = Manager();
+                        if (mgr == null)
+                            return "热点状态机卡在「切换中」。请重启电脑后重试。";
+                    }
+                    if (string.Equals(State(), "InTransition", StringComparison.OrdinalIgnoreCase))
+                        return "热点状态机卡在「切换中」（InTransition），软件层救不回来。请重启电脑后重试 —— 这是无线网卡 SoftAP 驱动的已知限制。";
+                }
 
                 // 频段选择 + 失败降级（参考微软官方 TetheringOperationStatus 文档）。
                 //
@@ -381,7 +540,38 @@ namespace Ferry
                 var last = State();
                 if (string.Equals(last, "Off", StringComparison.OrdinalIgnoreCase))
                     return "热点没起来（状态仍是 Off）。可能是无线网卡被占用或驱动异常。";
-                return "热点已启动，但网卡没拿到 192.168.137.1（无线网卡 SoftAP 可能卡死，重启电脑可恢复）";
+
+                // 网卡停在 169.254.x.x：ICS 的 NAT/DHCP 没接管 AP 网卡。
+                // 重启一次 ICS 再试 —— 实测 ICS 半死时 API 照样返回 Success，
+                // 网卡却永远拿不到 192.168.137.1，而重启 ICS 后重来一次能好。
+                if (!NicReady())
+                {
+                    if (RestartIcs() == "")
+                    {
+                        var mgr2 = Manager();
+                        if (mgr2 != null)
+                        {
+                            try
+                            {
+                                StopAndWait(mgr2, 6000);
+                                ConfigureBand(mgr2, preferBand);
+                                var sm2 = MethodNoArg(mgr2.GetType(), "StartTetheringAsync");
+                                if (sm2 != null) AwaitOpResult(sm2.Invoke(mgr2, null));
+                                var until2 = DateTime.UtcNow.AddMilliseconds(waitMs);
+                                while (DateTime.UtcNow < until2)
+                                {
+                                    if (NicReady()) return "";
+                                    Thread.Sleep(400);
+                                }
+                            }
+                            catch (Exception) { }
+                        }
+                    }
+                }
+
+                return "热点已启动，但 AP 网卡没拿到 192.168.137.1（ICS 的 NAT/DHCP 没接管它）。" +
+                       "这是无线网卡 SoftAP 驱动卡死的典型表现，重启电脑可恢复；" +
+                       "重启后仍这样，请更新无线网卡驱动。";
             }
             catch (Exception e)
             {
@@ -513,6 +703,88 @@ namespace Ferry
             {
                 p.StandardOutput.ReadToEnd();
                 p.WaitForExit(15000);
+            }
+        }
+
+        /// <summary>取 SharedAccess 的进程 PID（0 = 取不到）。</summary>
+        static int IcsPid()
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("sc.exe", "queryex SharedAccess")
+                {
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    var outp = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit(5000);
+                    var m = System.Text.RegularExpressions.Regex.Match(outp, @"PID\s*:\s*(\d+)");
+                    return m.Success ? Convert.ToInt32(m.Groups[1].Value) : 0;
+                }
+            }
+            catch (Exception) { return 0; }
+        }
+
+        /// <summary>
+        /// 重启 ICS（SharedAccess）。返回空字符串表示最终在跑。
+        ///
+        /// 为什么需要「按 PID 结束进程」：
+        ///   2026-10-29 用户机实测，卡死的 SharedAccess 停在 STOP_PENDING 不动，
+        ///   `sc stop` 发出去了、`sc query` 一直显示 STOP_PENDING，等 4 分钟都不变。
+        ///   这时唯一能让它下来的办法是结束承载它的 svchost 进程。
+        ///   ICS 是纯软件服务（NAT + DHCP 分配器），杀掉重启没有任何副作用，
+        ///   不像网卡驱动那样要重装。
+        ///
+        /// 为什么热点开不起来要动 ICS：
+        ///   StartTetheringAsync 只负责「让网卡进 SoftAP 模式」，
+        ///   192.168.137.1 是 ICS 的 NAT/DHCP 分配器配上去的。
+        ///   ICS 半死时 API 照样返回 Success，网卡却永远停在 169.254.x.x ——
+        ///   用户看到的就是「热点开了但手机连上没有网」。
+        /// </summary>
+        public static string RestartIcs()
+        {
+            try
+            {
+                RunSc("stop SharedAccess");
+                var until = DateTime.UtcNow.AddSeconds(6);
+                while (DateTime.UtcNow < until && IcsRunning()) Thread.Sleep(400);
+
+                if (IcsRunning())
+                {
+                    // 卡在 STOP_PENDING：按 PID 结束承载它的 svchost
+                    var pid = IcsPid();
+                    if (pid > 0)
+                    {
+                        var psi = new System.Diagnostics.ProcessStartInfo("taskkill", "/f /pid " + pid)
+                        {
+                            RedirectStandardOutput = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        using (var p = System.Diagnostics.Process.Start(psi))
+                        {
+                            p.StandardOutput.ReadToEnd();
+                            p.WaitForExit(10000);
+                        }
+                    }
+                    Thread.Sleep(2500);
+                }
+
+                RunSc("start SharedAccess");
+                until = DateTime.UtcNow.AddSeconds(12);
+                while (DateTime.UtcNow < until)
+                {
+                    if (IcsRunning()) return "";
+                    Thread.Sleep(500);
+                }
+                return "ICS 服务重启后仍起不来";
+            }
+            catch (Exception e)
+            {
+                return "重启 ICS 失败：" + Innermost(e).Message;
             }
         }
 

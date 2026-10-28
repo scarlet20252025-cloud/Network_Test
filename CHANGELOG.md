@@ -1,3 +1,184 @@
+## v0.14.42 — 2026-10-29
+
+> 客户端 1.0.45：热点共享源按「已连接的物理网卡」判（不再要求 InternetAccess）；
+> 卡死状态自动自愈；修隧道模式下 UDP 上游指错（一条静默的 bug）。
+
+### 一、热点：1.0.44 的修法在这个场景下必然选错
+
+1.0.44 要求共享源既「物理网卡」又「InternetAccess」。但渡口的主场景就是
+**校园网禁网** —— 那时物理网卡只有 `LocalAccess`，全机唯一的
+`InternetAccess` 是 `FerryTun`（TUN 虚拟网卡，iana=53）。
+
+用户机实测（2026-10-29 00:40）：
+
+```
+GetConnectionProfiles：
+  GDPZ-student-5G   LocalAccess   iana=71    ← 当前连着的校园网
+  其余 28 个历史 WLAN 配置档  None    iana=71
+  FerryTun          InternetAccess iana=53   ← 唯一「有外网」的
+```
+
+于是永远选不到物理网卡，只能落到 FerryTun。而 FerryTun 当共享源**必卡死** ——
+这是 1.0.41 的错误，本次复现坐实了：
+
+| 共享源 | StartTetheringAsync | state |
+|---|---|---|
+| `GDPZ-student-5G`（物理） | `Success` | `On` |
+| `FerryTun`（虚拟） | **25 秒超时** | `InTransition` 卡死 |
+
+### 二、卡死之后不会自愈，这是更致命的一半
+
+`InTransition` 一旦卡上，后续操作全部超时，换频段 / 换 SSID / 重启 WlanSvc
+一律无效：
+
+```
+stop  = timeout(8000)
+start = timeout(25000)
+[TwoPointFourGigahertz] cfg=CFG-THROW  START=THROW:timeout  state=InTransition
+[Auto]                  cfg=CFG-THROW  START=THROW:timeout  state=InTransition
+```
+
+唯一能救回来的是重启 ICS：
+
+```
+sc queryex SharedAccess → STOP_PENDING, PID 20528
+taskkill /f /pid 20528  → 成功
+sc start SharedAccess   → Running
+```
+
+`sc stop` 在 `STOP_PENDING` 上永远等不回来，必须按 PID 结束那个 svchost。
+
+### 改法
+
+| 项 | 改法 |
+|---|---|
+| 共享源判据 | 从「物理网卡 + InternetAccess」改成「**已连接的物理网卡**（`level != None`）」 |
+| 物理/虚拟判定 | 不再只看 `IanaInterfaceType`，按**适配器描述**排除虚拟网卡 |
+| AP 网卡排除 | 按适配器描述含 `Wi-Fi Direct` 判断（不靠名字前缀 —— 热点起来后它叫「本地连接* 2」，原判据挡不住） |
+| 虚拟网卡 | 一律不当共享源（宁可报「找不到可共享的网络连接」，也不卡 25 秒） |
+| 卡死自愈 | 启动前发现 `InTransition`，先 `StopAndWait`，仍卡着就 `RestartIcs()` 再试 |
+| 网卡停在 169.254 | 重启 ICS 后重试一次 Start（ICS 半死时 API 照样返回 Success） |
+| 新增 `RestartIcs()` | `sc stop` → 卡住就 `taskkill /f /pid` → `sc start` |
+
+### 三之二、改完第一版就踩的坑：只看 `iana` 不够
+
+按「物理网卡优先」改完之后跑验证，同一台机器上冒出两个**长得像物理网卡**的假货：
+
+```
+Meta Tunnel                                 [iana=53, Up]   FerryTun
+Famatech Radmin VPN Ethernet Adapter        [iana=6,  Up]   ← 虚拟以太网，会被当成以太网选走
+etgame Tunnel                               [iana=53, Up]   ← 游戏加速器
+Microsoft Wi-Fi Direct Virtual Adapter #2   [Up]            ← 热点自己的 AP 网卡
+Realtek 8852BE Wireless LAN WiFi 6 PCI-E    [iana=71, Up]   ← 真正的物理网卡
+```
+
+`Radmin VPN` 是 iana=6（以太网），如果用户装着实机在用，一点名就必被选中，
+ICS 照样卡住。所以判定必须再加一道**按适配器描述排除**：
+`wi-fi direct` / `virtual` / `vpn` / `tunnel` / `teredo` / `6to4` / `ip-https` /
+`wan miniport` / `hyper-v` / `tap-` / `wintun` / `wireguard` / `meta `。
+
+### 三之三、更阴的一个：WinRT 与 .NET 的 Guid 格式不一样
+
+第一次跑「实际选中」，结果是 **null**（「本机没有已连接的物理网卡」），
+但机器明明连着 WiFi。测试脚本打印出真相：
+
+```
+WinRT NetworkAdapter.NetworkAdapterId : 240a0b06-fe61-4787-9314-52f74b98e203   （小写、无花括号）
+.NET  NetworkInterface.Id             : {240A0B06-FE61-4787-9314-52F74B98E203}（大写、带花括号）
+```
+
+`string.Equals(..., OrdinalIgnoreCase)` 永远不相等 → 任何按 id 找网卡描述的逻辑
+都会「找不到」→ 于是**所有**网卡被当成虚拟网卡排除 → 报「没有可用共享源」。
+
+修法：`NormalizeId()` 用 `Guid.TryParse` 归一化后再比。
+
+> 教训：这类「格式差异」比逻辑错误更难发现 —— 逻辑看一遍是对的，
+> 但比较的两侧根本不是同一个东西。**验证脚本要打印实际取到的值**，
+> 不能只打印布尔结果。
+
+### 三之四、还有一个没突破的：AP 网卡停在 169.254
+
+共享源换对之后：
+
+```
+START = Success   state = On
+AP 网卡 = 本地连接* 2 (idx=18, Microsoft Wi-Fi Direct Virtual Adapter #2, Up)
+IP     = 169.254.154.25/16      ← 60 秒内一直是这个
+192.168.137.1 = 始终没出现
+netstat 查 67 端口（ICS 的 DHCP 分配器） = 没有任何监听
+```
+
+`Hotspot.cs` 文件头 2026-10-27 就记过：**SoftAP 驱动状态卡死时软件层全部无效，
+只能重启电脑。** 本版只做到「不再自己把自己卡死 + 卡死了会尽力救」，
+这一层要重启机器后再验。
+
+> 另一半是产品级死结，需要决策（见 `docs/热点与游戏延迟-20261029.md`）：
+> 若共享源是物理 WLAN（禁网中），ICS 把流量 NAT 到 WLAN 出去 → 客户端没网；
+> 要真正共享渡口的网，共享源必须是 FerryTun，而它必卡死。
+
+### 四、修一条静默的 bug：隧道模式下 UDP 上游指错
+
+`FerryRuntime` 里上游只有一个：
+
+```csharp
+if (_cfg.DirectSocks) { upstreamHost = _cfg.RemoteHost; upstreamPort = _cfg.RelayPort; }
+_proxy = new ProxyServer(_httpPort, upstreamPort, upstreamHost, _log);
+```
+
+`DirectSocks = false`（隧道模式）时，`upstreamPort` 是**本机 ssh 的 SOCKS 端口**。
+而 OpenSSH 的 `-D` **在协议层面就不实现 UDP ASSOCIATE（CMD=0x03）** ——
+所以隧道模式下 UDP 关联必然失败，且失败得完全无声：日志一个字都没有，
+用户看到的是「游戏 / 语音一直连不上」。
+
+修法：`ProxyServer.SetUdpUpstream(host, port)`，UDP 上游**永远指向远端中继**
+（`RemoteHost:RelayPort`），TCP 继续走 SSH。远端的 `ferry-socks5-server.py`
+本来就同时支持 CONNECT 和 UDP ASSOCIATE。代价是这段 UDP 明文 ——
+但 UDP 走 SSH 本来就不可能。
+
+### 五、关于「最新版打游戏延迟高，0.9.30 完全没问题」
+
+这不是回归，是 **UDP 从「坏的」变成「好的」的副作用**。详见
+`docs/热点与游戏延迟-20261029.md`。要点：
+
+- 0.9.30 的 `ferry-udp` 指向 `10.13.24.1:1080`（远端 TCP 端口），
+  按 RFC 1928，UDP 端口是每条 ASSOCIATE 新开的随机端口 —— 所以那时
+  **UDP 根本没通**，延迟低是因为游戏没在走隧道。
+- 1.0.9 起 UDP 真的通了：`游戏 → TUN → mihomo → 127.0.0.1:10801 →
+  本地代理 → 10.13.24.1:1080 → 远端中继 → 游戏服务器`。
+  多绕一整圈，延迟必然升高。
+- 用户机当前 `directSocks: true` + `useTun: true`，两个条件同时成立，
+  游戏 UDP 才真的绕远端。
+
+**本版不改这个行为** —— 改之前要知道反馈者打什么游戏、当时是否禁网、
+具体延迟数值。盲目把 UDP 改成 DIRECT 会让禁网用户在 TUN 模式下游戏彻底连不上。
+
+### 验证
+
+- `tools/verify-udp-perflow.cs` 12 项 ALL PASS（UDP 每流独立未回归）
+- 新增 `tools/verify-udp-upstream.cs` 5 项 ALL PASS，含**真实远端往返**：
+  ```
+  PASS  ProxyServer.SetUdpUpstream exists
+  PASS  UDP ASSOCIATE accepted (upstream = 10.13.24.1:1080)
+  PASS  got UDP reply through remote relay (118 bytes)
+  PASS  dead UDP upstream rejected (took 2033ms)
+  ```
+- 新增 `tools/verify-hotspot-picker.cs` 18 项 ALL PASS，用本机真实适配器列表验证：
+  ```
+  VIRT Meta Tunnel  [53, Up]
+  VIRT Famatech Radmin VPN Ethernet Adapter  [Ethernet, Up]
+  VIRT etgame Tunnel  [53, Up]
+  VIRT Microsoft Wi-Fi Direct Virtual Adapter #2  [Wireless80211, Up]
+  PHYS Realtek 8852BE Wireless LAN WiFi 6 PCI-E NIC  [Wireless80211, Up]
+  选中: GDPZ-student-5G   [Realtek 8852BE Wireless LAN WiFi 6 PCI-E NIC]
+  PASS  did NOT pick FerryTun (the InTransition trap)
+  ```
+- 新增 `tools/verify.cmd`：本机路径含中文，`cmd` 传参给 `csc` 会乱码成
+  「找不到源文件」，这个批处理把路径写在文件里绕开它：
+  ```cmd
+  tools\verify.cmd verify-udp-upstream.cs
+  tools\verify.cmd verify-hotspot-picker.cs ferry-client/src/Hotspot.cs
+  ```
+
 ## v0.14.41 — 2026-10-29
 
 > 客户端 1.0.44：回到 1.0.40 的共享源选择 + 按微软官方错误码做频段降级。

@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "1.0.44"
+#define AppVersion "1.0.45"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
