@@ -1,3 +1,65 @@
+## v0.14.33 — 2026-10-28
+
+> 客户端 1.0.36：主界面加「移动热点」开关（两段式拨动），手机连上就能借网。
+
+### 为什么加这个
+
+借网场景里经常是「一台电脑有网，手机没有」。以前要用户自己去系统设置里翻
+「移动热点」，而那个开关在 Win11 里藏得比较深，而且**能不能开**取决于无线网卡
+——新网卡（高通 FastConnect 等）在 `netsh wlan show drivers` 里直接是
+`Hosted network supported: No`，老办法 `netsh wlan set hostednetwork` 完全无效。
+
+现在主界面「全局模式」下面多一行：
+
+```
+移动热点    ［○——］        ← 两段式拨动开关
+```
+
+打开后手机搜到热点连上，流量会走渡口（全局模式下走 FerryTun，规则照旧分流）。
+
+### 实现要点
+
+| 点 | 做法 | 为什么 |
+|---|---|---|
+| API | WinRT `NetworkOperatorTetheringManager`，**全程反射** | 目标机器只有 .NET Framework 4.8，不带 `Windows.winmd`；用 `Type.GetType("..., ContentType=WindowsRuntime")` 运行时取类型，不需要任何 SDK |
+| 共享源 | 挑第一个 `InternetAccess` 级别的连接配置档 | 写死网卡名在换机器/换模式（物理网卡 ↔ TUN）时失效；TUN 的级别也是 InternetAccess，所以两种模式都能共享 |
+| 开关控件 | 自己画的 `ToggleSwitch`（轨道 44x24 + 滑块 18） | WPF 没有内置 ToggleSwitch，CheckBox 的勾选框和系统设置页观感差很远；用户明确要「两段式拨动」 |
+| 成功判据 | **网卡拿到 192.168.137.1**，不看 API 返回值 | `StartTetheringAsync` 返回 Success 不代表 SoftAP 真起来了（踩坑 75） |
+| 线程 | 启停都在后台线程，回调切回 Dispatcher | WinRT 调用会阻塞到热点起来/超时，放 UI 线程会冻住界面 |
+
+### 踩到的两个坑（都写进代码注释了）
+
+1. **`Assembly.Load("System.Runtime.WindowsRuntime")` 用简名会抛 FileNotFoundException**
+   —— 它在 GAC_MSIL 里，简名解析不到，必须给完整强名称
+   （`Version=4.0.0.0, PublicKeyToken=b77a5c561934e089`）。
+   这个错会让整个热点功能报「本机不支持」，而其实是加载方式不对。
+
+2. **热点起来后网卡状态仍是 Disconnected** —— SoftAP 复用同一块物理网卡，
+   适配器 `OperationalStatus` 不会变成 Up，但 `192.168.137.1` 已经挂上去了。
+   第一版按 `Status == Up` 过滤，把「热点其实正常」误判成「驱动卡死」，
+   给用户报了个假失败。改成只看地址在不在。
+
+### 验证（测试机 10.113.66.6，Intel AC 7265）
+
+```
+PASS  WinRT loads: ok
+before: state=Off nic=True ssid=PC_5G
+start -> ''
+after start: state=InTransition nic=True ssid=PC_5G
+PASS  tethering state is On
+PASS  hotspot NIC got 192.168.137.1
+PASS  tethering state is not On after stop
+ALL PASS
+```
+
+另外单独确认过：状态查询本身不会卡住（连查 8 次都正常返回），
+`InTransition` 是**开/关动作刚发生**时的过渡态，不是永久卡死。
+
+### 界面
+
+`tools/render-ui.ps1` 离屏渲染确认：开关在「全局模式」下面一行，右侧对齐，
+关闭态是灰色轨道 + 左置白色滑块，与 Win11 设置页一致。
+
 ## v0.14.32 — 2026-10-28
 
 > 客户端 1.0.35：DNS 劫持回到 `any:53`——让「翻墙客户端」零配置就能用。

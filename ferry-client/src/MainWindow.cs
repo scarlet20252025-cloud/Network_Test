@@ -48,6 +48,8 @@ namespace Ferry
         TextBlock _lblActTitle, _lblActHint;
         TextBox _txtCode;
         Button _btnActivate, _btnOn, _btnOff, _btnRefresh, _btnSettings, _btnUpd, _btnGlobal;
+        TextBlock _rowHotspot;
+        ToggleSwitch _swHotspot;
         TextBox _log;
         Border _actCard;
         StackPanel _mainStack;
@@ -58,6 +60,7 @@ namespace Ferry
 
         // ── 状态 ──
         bool _busy, _hasNet = true, _probingNet;
+        bool _hsBusy;
         string _exitVia = "";
         string _updPrompted = "";
         string _latestVer = "";
@@ -242,6 +245,34 @@ namespace Ferry
             _btnGlobal.Click += delegate { OnGlobalClicked(); };
             Grid.SetColumn(_btnGlobal, 1);
             tunRow.Children.Add(_btnGlobal);
+
+            // ── 移动热点行（两段式拨动开关）──
+            //
+            // 为什么放在全局模式下面：这两个是「共享出口」的两种形态 ——
+            // 全局模式解决「本机程序不认代理」，热点解决「别的设备也要上网」。
+            // 热点共享的是本机当前出口（全局模式下就是 FerryTun），
+            // 所以摆在它旁边最符合直觉。
+            var hsRow = new Grid { Margin = new Thickness(0, 8, 0, 0) };
+            hsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            hsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            cardStack.Children.Add(hsRow);
+
+            _rowHotspot = new TextBlock
+            {
+                Text = "移动热点    未开启",
+                FontSize = Palette.FsSmall,
+                Foreground = Palette.MutedB,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(_rowHotspot, 0);
+            hsRow.Children.Add(_rowHotspot);
+
+            _swHotspot = new ToggleSwitch();
+            _swHotspot.Margin = new Thickness(10, 0, 0, 0);
+            _swHotspot.Toggled += delegate { OnHotspotToggled(); };
+            Grid.SetColumn(_swHotspot, 1);
+            hsRow.Children.Add(_swHotspot);
 
             // ── 激活卡 ──
             _actCard = MakeCard();
@@ -1053,6 +1084,63 @@ namespace Ferry
             Application.Current.Shutdown();
         }
 
+        // ── 移动热点 ──
+        //
+        // 开关只表达意图；真正启停在后台线程（WinRT 调用会阻塞到热点起来，
+        // 放 UI 线程上会冻住界面）。失败时把意图改回 false —— 否则开关停在
+        // 「开」的位置、热点其实没起来，用户以为开好了。
+        void OnHotspotToggled()
+        {
+            if (_hsBusy) return;
+            bool want = _swHotspot.IsOn;
+
+            if (!want)
+            {
+                _hsBusy = true;
+                _cfg.HotspotOn = false;
+                try { _cfg.Save(_cfgPath); } catch (Exception) { }
+                Log("正在关闭移动热点…");
+                RefreshUi();
+                Hotspot.StopAsync(delegate (string err)
+                {
+                    Dispatcher.BeginInvoke(new Action(delegate
+                    {
+                        _hsBusy = false;
+                        if (!string.IsNullOrEmpty(err)) Log("关闭热点失败：" + err);
+                        else Log("移动热点已关闭");
+                        RefreshUi();
+                    }));
+                });
+                return;
+            }
+
+            _hsBusy = true;
+            _cfg.HotspotOn = true;
+            try { _cfg.Save(_cfgPath); } catch (Exception) { }
+            Log("正在开启移动热点…");
+            RefreshUi();
+
+            Hotspot.StartAsync(_cfg.HotspotSsid, _cfg.HotspotPass, delegate (string err)
+            {
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    _hsBusy = false;
+                    if (!string.IsNullOrEmpty(err))
+                    {
+                        _cfg.HotspotOn = false;
+                        try { _cfg.Save(_cfgPath); } catch (Exception) { }
+                        Log("开启热点失败：" + err);
+                    }
+                    else
+                    {
+                        var ssid = Hotspot.CurrentSsid();
+                        Log("移动热点已开启" + (string.IsNullOrEmpty(ssid) ? "" : "：" + ssid));
+                    }
+                    RefreshUi();
+                }));
+            });
+        }
+
         // ── 系统代理守护 ──
         //
         // 为什么需要：Clash Verge 启动时会把系统代理设成它自己的 127.0.0.1:7897。
@@ -1512,6 +1600,52 @@ namespace Ferry
                 _rowTun.Foreground = Palette.MutedB;
                 _btnGlobal.Content = "开启全局模式";
                 _btnGlobal.Background = Palette.AccentB;
+            }
+
+            // ══════════ 移动热点状态 ══════════
+            //
+            // 和全局模式同一个原则：开关显示**用户意图**（_cfg.HotspotOn），
+            // 文字说明**实际状态**（Hotspot.State() / 网卡有没有拿到 192.168.137.1）。
+            // 两者不一致时文字要写清楚，否则「开关是开的、热点其实没起来」会让人
+            // 以为手机连不上是手机的问题。
+            {
+                var hsState = Hotspot.State();
+                // 实测热点起来后状态可能停在 InTransition（已经在广播了），
+                // 只认 "On" 会把它显示成「正在开启…」永远转圈。
+                bool hsOn = hsState.Length > 0
+                            && !string.Equals(hsState, "Off", StringComparison.OrdinalIgnoreCase);
+                bool hsNic = hsOn && Hotspot.NicReady();
+                _swHotspot.SetSilently(_cfg.HotspotOn);
+
+                if (hsOn && hsNic)
+                {
+                    var ssid = Hotspot.CurrentSsid();
+                    _rowHotspot.Text = "移动热点    已开启" +
+                        (string.IsNullOrEmpty(ssid) ? "" : "（" + ssid + "）");
+                    _rowHotspot.Foreground = Palette.GoodB;
+                }
+                else if (hsOn && !hsNic)
+                {
+                    // API 说开着，但网卡没拿到地址 —— 手机连得上也上不了网。
+                    _rowHotspot.Text = "移动热点    已开启但网卡未就绪（重启电脑可恢复）";
+                    _rowHotspot.Foreground = Palette.WarnB;
+                }
+                else if (_cfg.HotspotOn)
+                {
+                    _rowHotspot.Text = "移动热点    正在开启…";
+                    _rowHotspot.Foreground = Palette.MutedB;
+                }
+                else if (hsState.Length == 0)
+                {
+                    _rowHotspot.Text = "移动热点    本机不支持";
+                    _rowHotspot.Foreground = Palette.MutedB;
+                }
+                else
+                {
+                    _rowHotspot.Text = "移动热点    未开启";
+                    _rowHotspot.Foreground = Palette.MutedB;
+                }
+                _swHotspot.IsEnabled = !_busy && !_hsBusy;
             }
 
             _btnOn.IsEnabled = !_busy && !borrowing;

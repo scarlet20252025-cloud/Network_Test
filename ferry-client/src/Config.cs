@@ -52,6 +52,17 @@ namespace Ferry
         /// <summary>远端 UDP 中继端口。0 = 用默认 1080。</summary>
         public int UdpRelayPort = 1080;
 
+        // ── 移动热点（Win11 自带「移动热点」，用 WinRT 启停）──
+        /// <summary>
+        /// 热点开关的**意图**。和 UseTun 一样：只记用户想要什么，
+        /// 实际有没有开起来由运行时检测（驱动可能卡死）。
+        /// </summary>
+        public bool HotspotOn = false;
+        /// <summary>热点 SSID。空 = 用系统里已有的配置，不改它。</summary>
+        public string HotspotSsid = "";
+        /// <summary>热点密码（至少 8 位）。空 = 不改。</summary>
+        public string HotspotPass = "";
+
         // ── 直连模式（A 方案）──
         /// <summary>
         /// TCP 也直连远端 SOCKS5，不再走 SSH 隧道。
@@ -199,6 +210,9 @@ namespace Ferry
                 c.UdpRelayPort = MiniJson.Int(d, "udpRelayPort", 1080);
                 c.DirectSocks = MiniJson.Bool(d, "directSocks", true);
                 c.RelayPort = MiniJson.Int(d, "relayPort", 1080);
+                c.HotspotOn = MiniJson.Bool(d, "hotspotOn", false);
+                c.HotspotSsid = MiniJson.Str(d, "hotspotSsid", "");
+                c.HotspotPass = MiniJson.Str(d, "hotspotPass", "");
                 // UDP 中继默认跟远端同一台机（pcs 上的 Python 中继）
                 if (string.IsNullOrEmpty(c.UdpRelayHost)) c.UdpRelayHost = c.RemoteHost;
             }
@@ -235,7 +249,10 @@ namespace Ferry
             sb.Append("  \"udpRelayHost\": ").Append(Quote(UdpRelayHost)).Append(",\n");
             sb.Append("  \"udpRelayPort\": ").Append(UdpRelayPort).Append(",\n");
             sb.Append("  \"directSocks\": ").Append(DirectSocks ? "true" : "false").Append(",\n");
-            sb.Append("  \"relayPort\": ").Append(RelayPort).Append("\n");
+            sb.Append("  \"relayPort\": ").Append(RelayPort).Append(",\n");
+            sb.Append("  \"hotspotOn\": ").Append(HotspotOn ? "true" : "false").Append(",\n");
+            sb.Append("  \"hotspotSsid\": ").Append(Quote(HotspotSsid)).Append(",\n");
+            sb.Append("  \"hotspotPass\": ").Append(Quote(HotspotPass)).Append("\n");
             sb.Append("}\n");
             var tmp = path + ".tmp";
             var body = sb.ToString();
