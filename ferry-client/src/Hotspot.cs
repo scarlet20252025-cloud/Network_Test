@@ -227,11 +227,34 @@ namespace Ferry
                     try { level = Convert.ToString(gm.Invoke(p, null)); }
                     catch (Exception) { continue; }
 
-                    // 优先用渡口的 TUN（FerryTun）：它是「已经借到网」的那条路，
-                    // 用它当共享源，手机走的就是渡口的分流规则。
-                    // 次要选物理网卡；两者都 InternetAccess 时 FerryTun 优先，
-                    // 因为用户的物理出口在断网时段本来就不通。
-                    if (level == "InternetAccess" && pn == "FerryTun") return p;
+                    // 共享源**必须是物理网卡**（WLAN / 以太网），不能用虚拟网卡。
+                    //
+                    // 1.0.41 曾改成「FerryTun（虚拟网卡）优先」，理由是它代表
+                    // 「已经借到网的那条路」。这是个错误：用户的实测显示
+                    // 1.0.40（用物理网卡）能开热点，1.0.43（FerryTun 优先）
+                    // 反而开不起来，卡在 InTransition。
+                    // 虚拟网卡当共享源时，ICS 的 NAT 方向无法确定，
+                    // 热点状态机就会卡住。改回 1.0.40 的行为：物理网卡优先。
+                    //
+                    // 怎么判断是不是虚拟网卡：看 IanaInterfaceType。
+                    //   71 = IEEE 802.11 无线（WLAN）
+                    //    6 = 以太网（Ethernet）
+                    //  其他（53 =  проприетарный tunnel 等）一律跳过。
+                    int iana = 0;
+                    try
+                    {
+                        var ad = t.GetProperty("NetworkAdapter");
+                        var adVal = ad == null ? null : ad.GetValue(p, null);
+                        if (adVal != null)
+                        {
+                            var ia = adVal.GetType().GetProperty("IanaInterfaceType");
+                            if (ia != null) iana = Convert.ToInt32(ia.GetValue(adVal, null));
+                        }
+                    }
+                    catch (Exception) { }
+
+                    bool isPhysical = (iana == 71 || iana == 6);
+                    if (level == "InternetAccess" && isPhysical) return p;
                     if (level == "InternetAccess" && internet == null) internet = p;
                     // 没找到 InternetAccess 时留一个「非 None」的兜底，
                     // 总比完全没有共享源好（例如刚连上还没探测完连通性）。
@@ -265,35 +288,19 @@ namespace Ferry
                 var mgr = Manager();
                 if (mgr == null) return "找不到可共享的网络连接（本机当前没有能上网的接口）";
 
-                // 频段必须显式设成 2.4GHz。
+                // 频段选择 + 失败降级（参考微软官方 TetheringOperationStatus 文档）。
                 //
-                // 实测（2026-10-28，Realtek 8852BE）：Band 默认 Auto 时，
-                // 系统选 5GHz 去开 SoftAP，而这台机器正用 5GHz 连校园网
-                // （信道 40）—— 同一张网卡不能在 5GHz 上同时做 station 和 AP，
-                // 于是 StartTetheringAsync 直接返回 WiFiDeviceOff。
-                // 改成 TwoPointFourGigahertz 之后同一段代码返回 Success。
-                try
-                {
-                    var cfg0 = MethodNoArg(mgr.GetType(), "GetCurrentAccessPointConfiguration").Invoke(mgr, null);
-                    if (cfg0 != null)
-                    {
-                        var bandT = Type.GetType(
-                            "Windows.Networking.NetworkOperators.TetheringWiFiBand, " +
-                            "Windows.Networking.NetworkOperators, ContentType=WindowsRuntime");
-                        var bp = cfg0.GetType().GetProperty("Band");
-                        if (bandT != null && bp != null && bp.CanWrite)
-                        {
-                            bp.SetValue(cfg0, Enum.Parse(bandT, "TwoPointFourGigahertz"), null);
-                            var cm = MethodNoArg(mgr.GetType(), "ConfigureAccessPointAsync");
-                            if (cm != null)
-                            {
-                                var op = cm.Invoke(mgr, new object[] { cfg0 });
-                                AwaitOpResult(op);
-                            }
-                        }
-                    }
-                }
-                catch (Exception) { /* 设不了频段就按系统默认来，不影响后面的启动 */ }
+                // 关键认知（2026-10-28 查 MicrosoftDocs/winrt-api 得到）：
+                //   BandInterference(11) = 主连接占用某个频段时，AP 不能再用同一频段。
+                //   典型例子：station 连着 5GHz，AP 就不能配 5GHz。
+                // 这台机器正是这个情况：WiFi 连着 GDPZ-student-5G（5GHz 信道 40），
+                // 之前固定写 TwoPointFourGigahertz 其实是对的，但**没有降级逻辑**——
+                // 一旦系统因为其它原因（信道限制/地区码）拒绝 2.4G，就直接失败。
+                //
+                // 正确做法：先 2.4G（避开和主连接 5GHz 的干扰），被拒就退到 Auto，
+                // 并把 Windows 返回的具体状态写进日志，而不是笼统报「网卡未就绪」。
+                // 记住首选频段，启动时按「2.4G → Auto」依次尝试。
+                var preferBand = "TwoPointFourGigahertz";
 
                 // 改 SSID/密码要先停再改再起 —— 热点开着的时候配置改不动。
                 if (!string.IsNullOrEmpty(ssid) || !string.IsNullOrEmpty(pass))
@@ -321,10 +328,39 @@ namespace Ferry
 
                 var startM = MethodNoArg(mgr.GetType(), "StartTetheringAsync");
                 if (startM == null) return "这台系统的热点 API 不完整（缺 StartTetheringAsync）";
-                var startOp = startM.Invoke(mgr, null);
-                var status = AwaitOpResult(startOp);
-                if (!string.IsNullOrEmpty(status) && status != "Success")
-                    return "启动热点失败：" + status;
+
+                // 按频段顺序尝试：先 2.4G（避开主连接 5GHz 的干扰），
+                // 被 RadioRestriction / BandInterference / WiFiDeviceOff 拒了就退到 Auto。
+                var bands = new string[] { preferBand, "Auto" };
+                string lastStatus = "";
+                string bandUsed = "";
+                foreach (var band in bands)
+                {
+                    if (!ConfigureBand(mgr, band)) continue;
+                    bandUsed = band;
+
+                    var startOp = startM.Invoke(mgr, null);
+                    var status = AwaitOpResult(startOp);
+                    lastStatus = status;
+                    _lastBandTried = band;
+
+                    if (status == "Success") break;
+
+                    // 这几类都是「频段/无线电」问题，换下一个频段再试
+                    if (status == "RadioRestriction" || status == "BandInterference" || status == "WiFiDeviceOff")
+                    {
+                        _lastStatus = status;
+                        continue;
+                    }
+                    // 其它错误（授权失败、设备关闭等）换频段也没用，直接报
+                    return "启动热点失败：" + ExplainStatus(status) + "（Windows 状态：" + status + "）";
+                }
+
+                if (!string.IsNullOrEmpty(lastStatus) && lastStatus != "Success")
+                {
+                    return "启动热点失败：" + ExplainStatus(lastStatus) + "（Windows 状态：" + lastStatus
+                           + "，已试频段：" + string.Join("→", bands) + "）";
+                }
 
                 // API 说 Success 不代表真起来了（见文件头注释）—— 继续等两个信号：
                 //   ① TetheringOperationalState 变成 On（或正在切换）
@@ -477,6 +513,103 @@ namespace Ferry
             {
                 p.StandardOutput.ReadToEnd();
                 p.WaitForExit(15000);
+            }
+        }
+
+        /// <summary>上一次启动尝试的频段（诊断用）。</summary>
+        static string _lastBandTried = "";
+        /// <summary>上一次被拒的状态（诊断用）。</summary>
+        static string _lastStatus = "";
+
+        /// <summary>
+        /// 把热点 AP 配到指定频段。返回是否成功。
+        /// 用新建的配置对象，避免旧对象残留导致 Band 写不进去。
+        /// </summary>
+        static bool ConfigureBand(object mgr, string bandName)
+        {
+            try
+            {
+                var appT = Type.GetType(
+                    "Windows.Networking.NetworkOperators.NetworkOperatorTetheringAccessPointConfiguration, " +
+                    "Windows.Networking.NetworkOperators, ContentType=WindowsRuntime");
+                var bandT = Type.GetType(
+                    "Windows.Networking.NetworkOperators.TetheringWiFiBand, " +
+                    "Windows.Networking.NetworkOperators, ContentType=WindowsRuntime");
+                if (appT == null || bandT == null) return false;
+
+                var cfg = Activator.CreateInstance(appT);
+                var bp = appT.GetProperty("Band");
+                if (bp == null || !bp.CanWrite) return false;
+                bp.SetValue(cfg, Enum.Parse(bandT, bandName), null);
+
+                // 保留现有 SSID/密码，只改频段
+                try
+                {
+                    var cur = MethodNoArg(mgr.GetType(), "GetCurrentAccessPointConfiguration").Invoke(mgr, null);
+                    if (cur != null)
+                    {
+                        var sp = appT.GetProperty("Ssid");
+                        var pp = appT.GetProperty("Passphrase");
+                        if (sp != null && sp.CanRead)
+                        {
+                            var v = sp.GetValue(cur, null);
+                            if (v != null && !string.IsNullOrEmpty(Convert.ToString(v)))
+                                sp.SetValue(cfg, v, null);
+                        }
+                        if (pp != null && pp.CanRead)
+                        {
+                            var v = pp.GetValue(cur, null);
+                            if (v != null && !string.IsNullOrEmpty(Convert.ToString(v)))
+                                pp.SetValue(cfg, v, null);
+                        }
+                    }
+                }
+                catch (Exception) { }
+
+                var cm = MethodNoArg(mgr.GetType(), "ConfigureAccessPointAsync");
+                if (cm == null) return false;
+                var op = cm.Invoke(mgr, new object[] { cfg });
+                AwaitOpResult(op);
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
+        /// <summary>
+        /// 把 Windows 返回的 tethering 状态翻成能看懂的中文原因。
+        ///
+        /// 状态值来自 MicrosoftDocs/winrt-api 的 TetheringOperationStatus 文档。
+        /// 以前失败时只报「网卡未就绪」，用户完全不知道该怎么办 ——
+        /// 现在按状态给具体建议（尤其是 BandInterference 这种）。
+        /// </summary>
+        static string ExplainStatus(string status)
+        {
+            switch (status)
+            {
+                case "Success": return "成功";
+                case "Unknown": return "未知错误";
+                case "MobileBroadbandDeviceOff":
+                    return "移动宽带设备已关闭";
+                case "WiFiDeviceOff":
+                    return "无线设备不可用（检查 Wi-Fi 开关 / 飞行模式；若 Wi-Fi 已开，通常是频段与主连接冲突）";
+                case "EntitlementCheckTimeout":
+                    return "运营商授权检查超时";
+                case "EntitlementCheckFailure":
+                    return "当前账户不支持网络共享";
+                case "OperationInProgress":
+                    return "另一个热点操作正在进行中（状态机卡住了，稍后重试或重启电脑）";
+                case "BluetoothDeviceOff":
+                    return "蓝牙设备已关闭";
+                case "NetworkLimitedConnectivity":
+                    return "当前网络连接受限";
+                case "AlreadyOn":
+                    return "热点已经在运行";
+                case "RadioRestriction":
+                    return "该频段受无线电限制（例如 6GHz 需要双天线；可改用 2.4GHz 或自动频段）";
+                case "BandInterference":
+                    return "频段干扰：主连接占用的频段与热点 AP 冲突（例如主连接走 5GHz 时，热点不能再配 5GHz；请改用 2.4GHz 或自动频段）";
+                default:
+                    return status;
             }
         }
 

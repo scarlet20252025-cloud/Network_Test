@@ -1,3 +1,95 @@
+## v0.14.41 — 2026-10-29
+
+> 客户端 1.0.44：回到 1.0.40 的共享源选择 + 按微软官方错误码做频段降级。
+
+### 用户的质疑是对的
+
+> 「之前 1.0.40 不是可以开热点吗，这个版本不能开了你怎么就放弃了」
+
+查日志确认是**回归**，不是硬件不行：
+
+```
+22:51:12 正在开启移动热点
+22:51:14 热点已开启 quest        ← 当时能开
+23:23:25 正在开启移动热点
+23:23:45 失败                    ← 现在开不了
+```
+
+且现场状态是 `InTransition` **卡死不退出**（连 Stop 都报「另一个操作在进行中」），
+不是驱动不支持。
+
+### 查到的两个真原因（这次是查官方文档得到的）
+
+**① 1.0.41 我把共享源改成了虚拟网卡（FerryTun），这是错的**
+
+```csharp
+// 1.0.41 的错误写法
+if (level == "InternetAccess" && pn == "FerryTun") return p;
+```
+
+1.0.40 用的是「第一个 InternetAccess 配置档」= 物理网卡（WLAN），能开。
+虚拟网卡当共享源时 ICS 的 NAT 方向无法确定，热点状态机就会卡住。
+
+现在改回**物理网卡优先**（按 `IanaInterfaceType` 判断：71=无线 / 6=以太网），
+虚拟网卡一律跳过。
+
+**② 频段问题：微软的错误码文档里有精确答案**
+
+查 `MicrosoftDocs/winrt-api` 的 `TetheringOperationStatus`：
+
+```
+BandInterference(11): Can't start a mobile hotspot on the requested frequency band
+due to the main connection frequency band interfering (for example, the 6 GHz band
+can't be configured for the mobile hotspot access point if the main station
+connection is over the 5 GHz band).
+```
+
+这台机器正是：WiFi 连着 5GHz（信道 40），热点 AP 抢占同一频段 → 冲突。
+之前 `WiFiDeviceOff` 一直被误读成「驱动不支持」，其实是**频段干扰**。
+
+实测确认驱动**支持全部频段**：
+
+```
+Band TwoPointFourGigahertz supported = True
+Band FiveGigahertz        supported = True
+Band Auto                 supported = True
+```
+
+所以不是不支持，是「选的那个频段和主连接打架」。
+
+### 改法
+
+| 项 | 改法 |
+|---|---|
+| 共享源 | 物理网卡优先（71 / 6），跳过虚拟网卡 |
+| 频段 | 先 2.4GHz（避开主连接 5GHz），被拒自动降级到 Auto |
+| 错误提示 | 新增 `ExplainStatus()`，把 Windows 状态码翻成中文原因 |
+| 频段配置 | `ConfigureBand()` 用**新建**的配置对象，避免旧对象残留 |
+
+错误码覆盖：`WiFiDeviceOff` / `RadioRestriction` / `BandInterference` /
+`OperationInProgress` / `EntitlementCheck*` / `MobileBroadbandDeviceOff` /
+`BluetoothDeviceOff` / `NetworkLimitedConnectivity` / `AlreadyOn`。
+
+以后失败会明确告诉你是什么原因，而不是笼统的「网卡未就绪」。
+
+### 参考的实现经验（GitHub 调研）
+
+| 项目 | 学到的 |
+|---|---|
+| `Hypostasis-Cat/HypoMux` | 用 `CreateFromConnectionProfile(profile, adapter)` 指定发射网卡；`IsBandSupported` 预检；频段回退只针对 `RadioRestriction/BandInterference/WiFiDeviceOff`；用 `DisableNoConnectionsTimeout()` 防止 5 分钟无客户端自动关 |
+| `nestchao/Hotspot-Bypass-VPN` | 不依赖 ICS，自己 Wi-Fi Direct + SOCKS5 转发（更彻底的方案，作为备选） |
+| `HikeAndMap/AutoHotspot` | 热点被系统关掉后自动重开 |
+
+### 验证
+
+- `verify-tunconfig.cs` 28 项 ALL PASS
+- `verify-udp-perflow.cs` 12 项 ALL PASS（UDP 每流独立未回归）
+- 热点代码静态校验 6 项 ALL PASS（含「不再优先 FerryTun」）
+
+### 说明
+
+1.0.43 的 UDP 每流独立上游是正确修复（那确实是架构错误），与此不冲突，保留。
+
 ## v0.14.40 — 2026-10-28
 
 > 客户端 1.0.43：UDP 从「共享上游 + 广播」改回「每流独立上游」。
