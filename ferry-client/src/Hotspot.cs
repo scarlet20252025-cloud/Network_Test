@@ -194,7 +194,7 @@ namespace Ferry
         {
             var mgr = Manager();
             if (mgr == null) return null;
-            var m = mgr.GetType().GetMethod("GetCurrentAccessPointConfiguration");
+            var m = MethodNoArg(mgr.GetType(), "GetCurrentAccessPointConfiguration");
             return m == null ? null : m.Invoke(mgr, null);
         }
 
@@ -209,7 +209,7 @@ namespace Ferry
         {
             try
             {
-                var m = _netInfo.GetMethod("GetConnectionProfiles");
+                var m = MethodNoArg(_netInfo, "GetConnectionProfiles");
                 var profiles = (IEnumerable)m.Invoke(null, null);
                 object fallback = null;
                 foreach (var p in profiles)
@@ -220,7 +220,7 @@ namespace Ferry
                     string pn = pnProp == null ? "" : Convert.ToString(pnProp.GetValue(p, null));
                     if (pn.StartsWith("Hotspot", StringComparison.OrdinalIgnoreCase)) continue;
 
-                    var gm = t.GetMethod("GetNetworkConnectivityLevel");
+                    var gm = MethodNoArg(t, "GetNetworkConnectivityLevel");
                     if (gm == null) continue;
                     string level;
                     try { level = Convert.ToString(gm.Invoke(p, null)); }
@@ -259,7 +259,7 @@ namespace Ferry
                 if (!string.IsNullOrEmpty(ssid) || !string.IsNullOrEmpty(pass))
                 {
                     StopAndWait(mgr, 8000);
-                    var cfg = mgr.GetType().GetMethod("GetCurrentAccessPointConfiguration").Invoke(mgr, null);
+                    var cfg = MethodNoArg(mgr.GetType(), "GetCurrentAccessPointConfiguration").Invoke(mgr, null);
                     var ct = cfg.GetType();
                     if (!string.IsNullOrEmpty(ssid))
                     {
@@ -271,7 +271,7 @@ namespace Ferry
                         var p = ct.GetProperty("Passphrase");
                         if (p != null && p.CanWrite) p.SetValue(cfg, pass, null);
                     }
-                    var cm = mgr.GetType().GetMethod("ConfigureAccessPointAsync");
+                    var cm = MethodNoArg(mgr.GetType(), "ConfigureAccessPointAsync");
                     if (cm != null)
                     {
                         var op = cm.Invoke(mgr, new object[] { cfg });
@@ -279,7 +279,7 @@ namespace Ferry
                     }
                 }
 
-                var startM = mgr.GetType().GetMethod("StartTetheringAsync");
+                var startM = MethodNoArg(mgr.GetType(), "StartTetheringAsync");
                 if (startM == null) return "这台系统的热点 API 不完整（缺 StartTetheringAsync）";
                 var startOp = startM.Invoke(mgr, null);
                 var status = AwaitOpResult(startOp);
@@ -333,7 +333,7 @@ namespace Ferry
 
         static void StopAndWait(object mgr, int waitMs)
         {
-            var st = mgr.GetType().GetMethod("StopTetheringAsync");
+            var st = MethodNoArg(mgr.GetType(), "StopTetheringAsync");
             if (st == null) return;
             try { AwaitOpResult(st.Invoke(mgr, null)); }
             catch (Exception) { }
@@ -360,6 +360,26 @@ namespace Ferry
             if (result == null) return "";
             var sp = result.GetType().GetProperty("Status");
             return sp == null ? "" : Convert.ToString(sp.GetValue(result, null));
+        }
+
+        /// <summary>
+        /// 按名字取**无参**方法，绕开重载歧义。
+        ///
+        /// 为什么不能用 GetMethod(name)：`NetworkOperatorTetheringManager` 上
+        /// `StartTetheringAsync` 有**两个重载**（无参 / 带 ConnectionProfile），
+        /// 直接按名字取会抛 AmbiguousMatchException。2026-10-28 用户机上实测：
+        /// 报错是「发现不明确的匹配」，热点开关永远打不开。
+        /// （测试机的 WinRT 投影恰好只暴露了一个重载，所以那边跑得好好的 ——
+        ///  这类「只在别人机器上炸」的反射问题，必须按最严格的方式写。）
+        /// </summary>
+        static MethodInfo MethodNoArg(Type t, string name)
+        {
+            foreach (var m in t.GetMethods())
+            {
+                if (m.Name != name) continue;
+                if (m.GetParameters().Length == 0) return m;
+            }
+            return null;
         }
 
         static Exception Innermost(Exception e)

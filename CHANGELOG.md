@@ -1,3 +1,86 @@
+## v0.14.34 — 2026-10-28
+
+> 客户端 1.0.37：修「一借网，DSH/Clash 就掉线」+ 热点开关打不开。
+
+### 一、DSH 掉线：境外判定把它交给了连不上的 Clash
+
+用户实测：开借网 + 全局模式后，国内外网站都能上，但 **DSH（当前 agent 客户端）
+直接掉线**；关掉 Clash 就恢复。日志里没有一条「改走渡口」的回退记录 ——
+说明连接压根没失败，而是**被分流到了错误的出口**。
+
+把 DSH 的模型端点喂给 `IsDomestic` 验证（`tools/verify-domains.cs` 的思路）：
+
+```
+CN      copilot.tencent.com
+FOREIGN api-top.com              ← DSH 中转站
+FOREIGN newapi.dragon3api.com    ← DSH 中转站
+FOREIGN api.deepseek.com
+FOREIGN dsh-otel-collector.deepseeksvc.com
+```
+
+它们被判成境外 → `ConnectSmart` 交给本机 Clash → 而断网时段 Clash 的机场
+本来就连不上 → 请求超时 → 会话掉线。**这不是 Clash 抢网，是渡口把流量送错了门。**
+
+1.0.34 的 `ferry-clash` 也有同一个毛病：它把翻墙客户端的出站**无条件**绑进隧道。
+有网时段物理出口是通的，Clash 直连机场又快又稳；强制它绕渡口（校内主机 → 公网）
+到境外极慢 —— 实测经渡口访问 github 要 20 秒。于是「一借网，Clash 就哑了」。
+
+### 改法：`clash-egress` fallback 组
+
+```yaml
+proxy-groups:
+  - name: clash-egress
+    type: fallback
+    proxies: [DIRECT, ferry-clash]
+    url: 'http://connect.rom.miui.com/generate_204'
+    interval: 30
+    timeout: 3000
+```
+
+翻墙客户端的 `PROCESS-NAME` 规则指向这个组：
+
+| 时段 | 物理出口 | fallback 选中 | 效果 |
+|---|---|---|---|
+| 有网 | 通 | `DIRECT` | Clash 直连机场，快 |
+| 断网 | 断 | `ferry-clash` | 借渡口出去，能用 |
+
+mihomo 每 30 秒按测活地址重测一次，切换不需要重启。
+
+实测（测试机 10.113.66.6）：
+
+```
+[TCP] 198.18.0.1:12469(clash-verge.exe) --> 36.141.40.13:764
+      match ProcessName(clash-verge.exe) using clash-egress[DIRECT]
+```
+
+### 二、热点开关打不开：反射的重载歧义
+
+用户机报「启动热点异常：发现不明确的匹配」，而测试机上一切正常。
+
+根因：`NetworkOperatorTetheringManager.StartTetheringAsync` 有**两个重载**
+（无参 / 带 ConnectionProfile）。`Type.GetMethod("StartTetheringAsync")`
+在有两个重载时抛 `AmbiguousMatchException`。测试机的 WinRT 投影恰好只暴露
+一个重载，所以那边跑得好好的 —— 这类「只在别人机器上炸」的反射问题，
+必须按最严格的方式写。
+
+改法：新增 `MethodNoArg(Type, name)`，遍历 `GetMethods()` 按「名字 + 参数个数 0」
+精确取，全部无参方法都走它。
+
+### 验证
+
+- `tools/verify-tunconfig.cs` 扩到 28 项断言，含 `clash-egress` 是 fallback、
+  `proxies: [DIRECT, ferry-clash]` 顺序正确、翻墙进程**不能**被钉死在 `ferry-clash`。
+- 生成的配置过 `mihomo -t`。
+- 测试机上验证 fallback 在有网时确实选 `DIRECT`。
+- 热点：本机复现出 `AmbiguousMatchException` 并确认修复（`hotspotcheck.exe` ALL PASS）。
+
+### 还没解决的
+
+`api.deepseek.com`、`dsh-otel-collector.deepseeksvc.com` 这些仍然判成境外。
+但它们是 DSH 的遥测/直连端点，走 Clash 在有网时段能通（Clash 会按自己的
+规则处理），所以暂不扩表 —— 扩表的判据是「漏了会有大量用户访问不到」，
+这两条不满足。
+
 ## v0.14.33 — 2026-10-28
 
 > 客户端 1.0.36：主界面加「移动热点」开关（两段式拨动），手机连上就能借网。

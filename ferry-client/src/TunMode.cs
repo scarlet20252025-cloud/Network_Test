@@ -361,6 +361,26 @@ namespace Ferry
             }
 
             sb.AppendLine("proxy-groups:");
+            if (_bypassPort > 0)
+            {
+                // 翻墙客户端的出口：**DIRECT 优先，直连不通才走渡口**。
+                //
+                // 为什么不能固定用 ferry-clash（1.0.34 的做法）：
+                //   有网时段物理出口是通的，Clash 直连机场又快又稳；强制它绕
+                //   渡口（校内主机 → 公网）到境外极慢 —— 实测经渡口访问 github
+                //   要 20 秒。结果就是「一借网，Clash 就哑了」。
+                //   而断网时段物理出口断了，DIRECT 必然失败，这时才该借渡口。
+                //
+                // 用 mihomo 自带的 fallback：按 url 测活，第一个可用的一直用。
+                // 测活地址用国内的 generate_204 —— 有网时 DIRECT 通、断网时不通，
+                // 判据正好和「能不能直连」一致。
+                sb.AppendLine("  - name: clash-egress");
+                sb.AppendLine("    type: fallback");
+                sb.AppendLine("    proxies: [DIRECT, ferry-clash]");
+                sb.AppendLine("    url: 'http://connect.rom.miui.com/generate_204'");
+                sb.AppendLine("    interval: 30");
+                sb.AppendLine("    timeout: 3000");
+            }
             sb.AppendLine("  - name: ferry");
             sb.AppendLine("    type: select");
             sb.AppendLine("    proxies: [ferry-tcp]");
@@ -399,7 +419,7 @@ namespace Ferry
             // `if (_clashPort > 0)` 才写，成了竞态：用户机 23:44 的日志是
             // 「没有检测到本机代理」，于是这条防回环保险一条都没生成。
             // 名字两种写法都写：mihomo 各版本对是否带 .exe 的处理不一致，实测都能匹配。
-            var clashDest = _bypassPort > 0 ? "ferry-clash" : "DIRECT";
+            var clashDest = _bypassPort > 0 ? "clash-egress" : "DIRECT";
             foreach (var proc in new string[] {
                 "clash-verge", "clash-verge-service", "verge-mihomo",
                 "clash-meta", "Clash for Windows", "v2rayN", "v2ray",

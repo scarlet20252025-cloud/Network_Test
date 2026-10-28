@@ -50,10 +50,14 @@ static class TunCfgCheck
         Ok(yaml.Contains("find-process-mode: strict"), "A: find-process-mode is strict (not always)");
         Ok(!yaml.Contains("find-process-mode: always"), "A: no always mode");
         Ok(CountOf(yaml, "- PROCESS-NAME,") == 26, "A: 13 procs x 2 spellings = 26 PROCESS-NAME rules");
-        Ok(yaml.Contains("- PROCESS-NAME,clash-verge,ferry-clash"), "A: clash-verge goes through ferry-clash (not DIRECT)");
-        Ok(yaml.Contains("- PROCESS-NAME,clash-verge.exe,ferry-clash"), "A: clash-verge.exe same");
-        Ok(yaml.Contains("- PROCESS-NAME,verge-mihomo.exe,ferry-clash"), "A: verge-mihomo.exe same");
+        Ok(!yaml.Contains("- PROCESS-NAME,clash-verge,ferry-clash"), "A: clash procs NOT pinned to tunnel only");
+        Ok(yaml.Contains("- PROCESS-NAME,clash-verge.exe,clash-egress"), "A: clash-verge.exe same");
+        Ok(yaml.Contains("- PROCESS-NAME,verge-mihomo.exe,clash-egress"), "A: verge-mihomo.exe same");
         Ok(yaml.Contains("- name: ferry-clash"), "A: ferry-clash proxy exists");
+        Ok(yaml.Contains("- name: clash-egress"), "A: clash-egress fallback group exists");
+        Ok(yaml.Contains("type: fallback"), "A: clash-egress is fallback (DIRECT first, tunnel second)");
+        Ok(yaml.Contains("proxies: [DIRECT, ferry-clash]"), "A: DIRECT preferred, tunnel only when direct fails");
+        Ok(yaml.Contains("- PROCESS-NAME,clash-verge,clash-egress"), "A: clash procs go to clash-egress");
         Ok(yaml.Contains("port: 10805"), "A: ferry-clash points at bypass port");
         Ok(!yaml.Contains("- PROCESS-NAME,clash-verge,DIRECT"), "A: no DIRECT for clash (would be dead when network is down)");
         Ok(yaml.Contains("MATCH,ferry"), "A: MATCH,ferry fallback");
@@ -83,7 +87,7 @@ static class TunCfgCheck
         File.WriteAllText(Path.Combine(dir, "tun-config-noclash.yaml"), yaml2);
         Ok(CountOf(yaml2, "- PROCESS-NAME,") == 26,
             "B: clashPort=0 STILL writes 26 PROCESS-NAME rules (the actual bug)");
-        Ok(yaml2.Contains("- PROCESS-NAME,clash-verge.exe,ferry-clash"), "B: clash-verge.exe present without detection");
+        Ok(yaml2.Contains("- PROCESS-NAME,clash-verge.exe,clash-egress"), "B: clash-verge.exe present without detection");
         Ok(yaml2.Contains("MATCH,ferry"), "B: still falls back to ferry");
 
         // 两个场景除 clashPort 外应当逐字相同（证明规则不再依赖检测结果）
