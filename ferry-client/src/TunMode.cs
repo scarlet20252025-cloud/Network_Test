@@ -280,24 +280,22 @@ namespace Ferry
             sb.AppendLine("  auto-detect-interface: true");
             sb.AppendLine("  strict-route: false");
             sb.AppendLine("  dns-hijack:");
-            // 只劫持 TUN 自己的网关地址（mihomo 把系统 DNS 指到这里）。
+            // 劫持所有 53 端口（any:53），包括用户翻墙客户端自己的 DNS 查询。
             //
-            // 1.0.31 及之前是 `any:53`，它会把**用户自己的翻墙客户端**的 DNS
-            // 查询也一起劫持。实测用户机：Clash 内核的出站连接目标全是
-            // `198.18.0.x`（fake-ip），于是它拿着假地址去连机场 ——
-            // PROCESS-NAME 放行成 DIRECT 也没用，fake-ip 根本没有对应主机，
-            // 表现就是「节点全部 Timeout」。
+            // 1.0.32 曾把它收窄成只劫持网关（198.18.0.2:53），因为那时观察到
+            // Clash 拿到 fake-ip 后连不上机场。但真正的病根不是 fake-ip，
+            // 而是规则把它的出站写成了 DIRECT —— DIRECT 到假地址当然连不上。
             //
-            // 收窄到网关地址后，两条路各归各的：
-            //   系统解析（DNS 指向 198.18.0.2）→ 仍然 fake-ip，渡口分流不变
-            //   Clash 自己的 DNS（223.5.5.5 / DoH）→ 不被劫持 → 走 TUN 的
-            //     NETWORK,udp → ferry-udp → 远端中继 → 拿真实 IP
+            // 1.0.34 起翻墙客户端的出站走 ferry-clash（本地代理的直通端口），
+            // mihomo 会在转发前把 fake-ip **还原成域名**（实测日志：
+            //   --> g.o.b.v.l.f.3...qpon:764 match ProcessName(clash-verge.exe) using ferry-clash
+            // 目标已经是域名，不是 198.18.x.x）。所以拿 fake-ip 不再有害。
             //
-            // 测试机实测（10.113.66.6，上游用 pcs 的真实 socks5 relay）：
-            //   dns-hijack: any:53        → 问 223.5.5.5 得到 198.18.0.4
-            //   dns-hijack: 198.18.0.2:53 → 问 223.5.5.5 得到真实地址，
-            //                                问 198.18.0.2 仍是 fake-ip
-            sb.AppendLine("    - 198.18.0.2:53");
+            // 回到 any:53 的理由是「零配置」：用户在 Clash 里配的 DNS 通常是
+            // UDP（119.29.29.29 / 223.5.5.5），断网时段这些查询出不去，
+            // 只有让 TUN 接住它们，Clash 才拿得到地址 —— 否则每个用户都得
+            // 自己去改 Clash 的 DNS，那才是真的麻烦。
+            sb.AppendLine("    - any:53");
             sb.AppendLine("  route-exclude-address:");
             sb.AppendLine("    - 127.0.0.0/8");
             sb.AppendLine("    - 169.254.0.0/16");
