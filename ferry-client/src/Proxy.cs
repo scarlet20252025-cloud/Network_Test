@@ -509,78 +509,53 @@ namespace Ferry
         {
             public Socket Sock;            // 对客户端收发的本地 socket
             public IPEndPoint Peer;        // 客户端实际的 UDP 源地址
-            public DateTime LastSend;      // 最近一次发包（用于回包分发）
-            /// <summary>最近一次收到回包。判断「这条流还活着」要同时看收发两侧 ——
-            /// 游戏这类下行远大于上行的流量，光看 LastSend 会被误杀（见 UpRecvLoop）。</summary>
+            public DateTime LastSend;      // 最近一次发包（用于空闲判定）
+
+            /// <summary>
+            /// 1.0.43 起每条流**独占**自己的上游：独立控制连接 + 独立 UDP 端点。
+            ///
+            /// 为什么改回独立（1.0.29 曾改成共享，是个错误）：
+            ///   共享上游只有一个 UDP socket，收到回包后只能**广播**给所有活跃流。
+            ///   于是 A 应用的回包会被发给 B、C、D —— 协议错乱。
+            ///   热点场景（手机上几十个应用）尤其明显：
+            ///   表现是「热点一开，本机和手机的网络都不正常」。
+            ///
+            /// 1.0.28 的独立版为什么会撞上限：它没有空闲回收，流永远不释放。
+            /// 现在配套了 45s/90s 回收 + 512 上限，独立上游就不会堆积。
+            /// </summary>
+            public Socket UpCtrl;          // 上游 TCP 控制连接（必须保持打开）
+            public Socket UpSock;          // 本流专用的上游 UDP socket
+            public IPEndPoint UpEp;        // 上游给本流分配的 UDP 端点
+            public Thread UpThread;        // 本流的下游收包线程
+
+            /// <summary>最近一次收到回包。判活看收发两侧（下行大的流不能被误杀）。</summary>
             public DateTime LastRecv;
             public volatile bool Alive = true;
         }
 
-        // ── 共享的上游关联 ──
+        // ── UDP 流表 ──
         //
-        // SOCKS5 的 UDP ASSOCIATE 设计上就是「一个关联承载所有目标」
-        // （每条数据报自带目标地址）。为每个客户端流各建一条上游连接，
-        // 会让远端同时挂几十条控制连接 + 几十个 UDP socket，
-        // 远端是单进程 async，accept 一忙新的 ASSOCIATE 就超时 ——
-        // 日志里那些「上游不支持或连不上」就是这么来的。
+        // 1.0.43 起每条流独占自己的上游（见 UdpRelay 的注释），
+        // 这里只保留一个流列表，供空闲淘汰遍历。
         static readonly object _upLock = new object();
-        static Socket _upCtrl;             // 上游 TCP 控制连接（必须保持打开）
-        static Socket _upSock;             // 上游 UDP socket
-        static IPEndPoint _upEp;           // 上游分配的 UDP 端点
-        static Thread _upRecvThread;
         static readonly List<UdpRelay> _relays = new List<UdpRelay>();
 
-        /// <summary>确保共享上游在。失败返回 null（调用方回 SOCKS5 错误）。</summary>
-        Socket EnsureUpstream(out IPEndPoint ep, int socksPort, string socksHost)
-        {
-            lock (_upLock)
-            {
-                ep = _upEp;
-                if (_upCtrl != null && _upSock != null && _upEp != null) return _upSock;
 
-                DropUpstreamLocked();
 
-                IPEndPoint up;
-                var ctrl = AssociateUpstream(socksPort, socksHost, out up, 8000);
-                if (ctrl == null) return null;
 
-                var us = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                // 必须绑 Any：绑 loopback 的话源地址是 127.0.0.1，
-                // 发往远端（10.13.24.1）的包出不去，回的包也收不到 ——
-                // 实测表现是「关联建立成功但一个 DNS 应答都没有」。
-                us.Bind(new IPEndPoint(IPAddress.Any, 0));
-                us.ReceiveTimeout = 1000;
-
-                _upCtrl = ctrl;
-                _upSock = us;
-                _upEp = up;
-                ep = up;
-
-                var sock = us;
-                _upRecvThread = new Thread(delegate () { UpRecvLoop(sock); });
-                _upRecvThread.IsBackground = true;
-                _upRecvThread.Name = "ferry-udp-up";
-                _upRecvThread.Start();
-
-                _log("UDP 上游已就绪（共享）：" + up + "（此后所有客户端流共用这一条）");
-                return us;
-            }
-        }
-
-        void DropUpstreamLocked()
-        {
-            try { if (_upSock != null) _upSock.Close(); } catch (Exception) { }
-            try { if (_upCtrl != null) _upCtrl.Close(); } catch (Exception) { }
-            _upSock = null;
-            _upCtrl = null;
-            _upEp = null;
-        }
-
-        /// <summary>从上游收包，分发给最近发过包的客户端流。</summary>
-        void UpRecvLoop(Socket sock)
+        /// <summary>
+        /// 单条 UDP 流的下游：从本流专用的上游 socket 收包，**只回给本流的 Peer**。
+        ///
+        /// 取代旧版「共享上游 + 广播」：那时一个 socket 收到回包后要发给所有
+        /// 活跃流，A 应用的包会被送到 B、C、D —— 手机上几十个应用时协议错乱，
+        /// 表现是「热点一开，本机和手机的网络都不正常」。
+        /// 这里每个包只回给发起它的那个客户端地址，语义正确。
+        /// </summary>
+        void UpRecvLoopFor(UdpRelay r)
         {
             var buf = new byte[65535];
-            while (_running)
+            var sock = r.UpSock;
+            while (_running && r.Alive)
             {
                 try
                 {
@@ -589,36 +564,16 @@ namespace Ferry
                     if (n <= 0) continue;
                     Interlocked.Add(ref _udpPktsDown, 1);
 
-                    var nowTime = DateTime.UtcNow;
-                    UdpRelay[] copy;
-                    lock (_relays) { copy = _relays.ToArray(); }
-                    foreach (var r in copy)
+                    var peer = r.Peer;
+                    if (!r.Alive || peer == null) continue;
+                    try
                     {
-                        if (!r.Alive || r.Peer == null) continue;
-                        // 判「这条流还活着」要看**收发两侧**，不能只看发。
-                        //
-                        // 原来是 `(now - LastSend) > 5s 就跳过`。对 DNS 这种
-                        // 一问一答没影响，但游戏/语音是**下行远大于上行**的：
-                        // 玩家站着不动、或者资产下载时上行只有零星 ACK，
-                        // 5 秒不发包的流就被判死，回包全丢 —— 表现就是
-                        // 「连接还在、但一直卡着不动」。
-                        //
-                        // 2026-10-28 Hytale 现场：日志里 `ReceiveLoop: No packets
-                        // received for 5.0s (total: 10085)` 刷屏，然后
-                        // `QuicheException: Connection timed out`。
-                        var idle = Math.Min(
-                            (nowTime - r.LastSend).TotalSeconds,
-                            (nowTime - r.LastRecv).TotalSeconds);
-                        if (idle > UdpIdleSec) continue;
-                        try
-                        {
-                            r.Sock.SendTo(buf, 0, n, SocketFlags.None, r.Peer);
-                            r.LastRecv = nowTime;
-                        }
-                        catch (Exception) { }
+                        r.Sock.SendTo(buf, 0, n, SocketFlags.None, peer);
+                        r.LastRecv = DateTime.UtcNow;
                     }
+                    catch (Exception) { }
                 }
-                catch (SocketException) { }      // 超时，回循环顶看 _running
+                catch (SocketException) { }      // 超时，继续
                 catch (ObjectDisposedException) { break; }
                 catch (Exception) { }
             }
@@ -630,14 +585,39 @@ namespace Ferry
             var relay = new UdpRelay();
             try
             {
+                // 每条流独占一个上游（见 UdpRelay 的注释）。
                 IPEndPoint upEp;
-                var upSock = EnsureUpstream(out upEp, _socksPort, _socksHost);
-                if (upSock == null)
+                var upCtrl = AssociateUpstream(_socksPort, _socksHost, out upEp, 8000);
+                if (upCtrl == null)
                 {
                     _log("UDP 关联失败：上游不支持或连不上 " + _socksHost + ":" + _socksPort);
                     ReplySocks5(ns, 0x01);
                     return;
                 }
+                var upSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                // 必须绑 Any：绑 loopback 源地址是 127.0.0.1，
+                // 发往远端的包出不去，回包也收不到（实测「关联成功但零应答」）。
+                try
+                {
+                    upSock.Bind(new IPEndPoint(IPAddress.Any, 0));
+                    upSock.ReceiveTimeout = 1000;
+                }
+                catch (Exception)
+                {
+                    try { upCtrl.Close(); } catch (Exception) { }
+                    ReplySocks5(ns, 0x01);
+                    return;
+                }
+                relay.UpCtrl = upCtrl;
+                relay.UpSock = upSock;
+                relay.UpEp = upEp;
+
+                // 本流自己的下游线程：收到包只回给本流的 Peer，不广播。
+                var relayRef = relay;
+                relay.UpThread = new Thread(delegate () { UpRecvLoopFor(relayRef); });
+                relay.UpThread.IsBackground = true;
+                relay.UpThread.Name = "ferry-udp-down";
+                relay.UpThread.Start();
 
                 clientSock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 clientSock.Bind(new IPEndPoint(IPAddress.Loopback, 0));
@@ -654,16 +634,56 @@ namespace Ferry
                 ns.Flush();
                 UdpAssocOpened();
 
+                // 监视控制连接：对端一断，立刻终止这条关联。
+                //
+                // RFC 1928：UDP 关联依附于建立它的那条 TCP 控制连接，
+                // 控制连接没了，中继就该回收。
+                //
+                // 为什么必须显式做：主循环阻塞在 clientSock.ReceiveFrom 上
+                // （最多 1 秒），它感知不到 TCP 那边发生的事。
+                // 压测实测：客户端全部断开后 6 秒，100 条关联**一条都没释放**，
+                // 名额全占着 —— 这正是 1.0.28「每流独立 + 无回收」打爆远端的原因。
+                // 靠 90 秒空闲回收兜底太慢：热点场景几秒就能堆满。
+                //
+                // 做法：这里阻塞读 ns（对端关闭时返回 0），一旦结束就关掉
+                // clientSock —— 主循环的 ReceiveFrom 随即抛异常退出，
+                // finally 里回收名额并关闭本流的专用上游。
+                var watchNs = ns;
+                var watchSock = clientSock;
+                var watchRelay = relay;
+                var watcher = new Thread(delegate ()
+                {
+                    try
+                    {
+                        var probe = new byte[1];
+                        while (_running && watchRelay.Alive)
+                        {
+                            int r = watchNs.Read(probe, 0, 1);
+                            if (r <= 0) break;      // 对端关闭
+                        }
+                    }
+                    catch (Exception) { }
+                    finally
+                    {
+                        watchRelay.Alive = false;
+                        try { if (watchSock != null) watchSock.Close(); } catch (Exception) { }
+                    }
+                });
+                watcher.IsBackground = true;
+                watcher.Name = "ferry-udp-watch";
+                watcher.Start();
+
                 IPEndPoint udpPeer = null;
                 var buf = new byte[65535];
 
-                // 上行：客户端 → 共享上游
+                // 上行：客户端 → 本流专用上游
                 var lastActive = DateTime.UtcNow;
                 var cs = clientSock;
                 for (; ; )
                 {
                     if ((DateTime.UtcNow - lastActive).TotalSeconds > UdpAssocIdleSec) break;
                     if (!_running) break;
+
                     try
                     {
                         EndPoint from = new IPEndPoint(IPAddress.Any, 0);
@@ -693,6 +713,9 @@ namespace Ferry
                 relay.Alive = false;
                 lock (_relays) { _relays.Remove(relay); }
                 try { if (clientSock != null) clientSock.Close(); } catch (Exception) { }
+                // 关掉本流的专用上游。控制连接一断，远端就回收那个 UDP 端口。
+                try { if (relay.UpSock != null) relay.UpSock.Close(); } catch (Exception) { }
+                try { if (relay.UpCtrl != null) relay.UpCtrl.Close(); } catch (Exception) { }
                 UdpAssocClosed();
             }
         }
