@@ -91,7 +91,14 @@ namespace Ferry
 
         /// <summary>整条 UDP 关联的空闲回收时间（没有收到任何客户端包）。</summary>
         const int UdpAssocIdleSec = 90;
-        const int MaxUdpAssoc = 96;
+        /// <summary>
+        /// 同时存在的 UDP 关联上限。
+        ///
+        /// 为什么从 96 提到 512：开热点时，手机上每个应用的 UDP（DNS、QUIC、
+        /// 语音、游戏）全部涌进这一个端口。96 在「只有本机」时够用，
+        /// 加上一整个手机就不够了 —— 实测开热点瞬间就撞满。
+        /// </summary>
+        const int MaxUdpAssoc = 512;
 
         // ── UDP 关联的统计与降噪 ──
         //
@@ -110,6 +117,39 @@ namespace Ferry
             int now = Interlocked.Increment(ref _udpAssocNow);
             lock (_udpStatsLock) { if (now > _udpAssocPeak) _udpAssocPeak = now; }
             UdpStatsTick();
+        }
+
+        /// <summary>
+        /// 淘汰最久没有收发包的 UDP 流，腾出一个名额。
+        /// 返回 false 表示没有可淘汰的（列表空或全在活跃）。
+        /// </summary>
+        bool EvictStalestUdpRelay()
+        {
+            UdpRelay victim = null;
+            DateTime oldest = DateTime.MaxValue;
+            var nowT = DateTime.UtcNow;
+
+            lock (_relays)
+            {
+                foreach (var r in _relays)
+                {
+                    if (!r.Alive) continue;
+                    // 判「最久没动静」同样看收发两侧（和回包分发一致）
+                    var last = r.LastSend > r.LastRecv ? r.LastSend : r.LastRecv;
+                    if (last < oldest) { oldest = last; victim = r; }
+                }
+            }
+
+            if (victim == null) return false;
+
+            // 太新的流不砍（说明大家都还在用，砍谁都伤）
+            if ((nowT - oldest).TotalSeconds < 10) return false;
+
+            // 关掉它的 socket，UdpAssociateCore 的循环会退出并回收名额
+            victim.Alive = false;
+            try { if (victim.Sock != null) victim.Sock.Close(); } catch (Exception) { }
+            _log("UDP 关联已满，淘汰最久未活动的流以接纳新关联");
+            return true;
         }
 
         void UdpAssocClosed()
@@ -429,14 +469,31 @@ namespace Ferry
         /// </summary>
         void StartUdpAssociate(NetworkStream ns, IPEndPoint clientEp)
         {
+            // 名额满了先**淘汰最久没动静的那条**，而不是直接拒绝新关联。
+            //
+            // 为什么改：2026-10-28 开热点实测，日志里连刷
+            //   「UDP 关联数已达 96，拒绝新关联」
+            // 原因是我上一版把空闲回收放宽到 45s/90s（为了不误杀游戏流），
+            // 却把上限留在 96 —— 「流不回收 + 名额少」叠加，
+            // 手机一连热点，上面每个应用的 UDP 全涌进来，瞬间占满，
+            // 之后所有新 UDP 全被拒。表现就是「热点一开，本机就断网」。
+            // 这比原来 5 秒回收还糟：那时候至少名额流转得快。
+            //
+            // 淘汰策略：砍掉最久没有收发的那条（真正在用的流不会被选中），
+            // 让新的关联进来。上限本身仍然保留 —— 每条关联 2 socket + 2 线程，
+            // 远端中继还有 RELAY_HARD_LIMIT = 3000 的硬上限。
             int now = Interlocked.Increment(ref _udpAssoc);
             if (now > MaxUdpAssoc)
             {
-                Interlocked.Decrement(ref _udpAssoc);
-                _log("UDP 关联数已达上限 " + MaxUdpAssoc + "，拒绝新关联 (" + clientEp + ")");
-                ReplySocks5(ns, 0x07);
-                return;
+                if (!EvictStalestUdpRelay())
+                {
+                    Interlocked.Decrement(ref _udpAssoc);
+                    _log("UDP 关联数已达上限 " + MaxUdpAssoc + "，且无法淘汰，拒绝新关联 (" + clientEp + ")");
+                    return;
+                }
+                Interlocked.Decrement(ref _udpAssoc);   // 淘汰的那条自己会减
             }
+
             try
             {
                 UdpAssociateCore(ns, clientEp);
