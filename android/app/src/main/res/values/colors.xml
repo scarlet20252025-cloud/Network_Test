@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 和 Windows 客户端同一套薄荷绿主色，视觉上认得出是同一个产品 -->
+    <color name="ferry_accent">#2FBF87</color>
+    <color name="ferry_accent_dark">#1E9E6C</color>
+    <color name="ferry_bg">#F5F7F6</color>
+    <color name="ferry_card">#FFFFFF</color>
+    <color name="ferry_text">#1F2A26</color>
+    <color name="ferry_text_muted">#7A8C86</color>
+    <color name="ferry_good">#2FBF87</color>
+    <color name="ferry_warn">#E8A33D</color>
+    <color name="ferry_bad">#D9534F</color>
+</resources>

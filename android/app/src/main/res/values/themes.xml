@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Ferry" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/ferry_accent</item>
+        <item name="colorPrimaryDark">@color/ferry_accent_dark</item>
+        <item name="colorAccent">@color/ferry_accent</item>
+        <item name="android:windowBackground">@color/ferry_bg</item>
+        <item name="android:statusBarColor">@color/ferry_accent_dark</item>
+    </style>
+</resources>

@@ -61,3 +61,22 @@ vendor/*.exe
 vendor/*.zip
 
 versions/
+
+# ── Android ──
+# 构建中间产物不进球
+android/**/build/
+android/.gradle/
+android/.idea/
+android/local.properties
+
+# 参考源码：本地只用来查实现，体积大且自带 .git
+android/third-part/hev-socks5-tunnel/
+
+# jniLibs 里的 .so **要**入库（约 580 KB）——
+# 它决定「clone 下来能不能直接出包」。重编要 NDK + 四个子模块，代价太大。
+# 保留：android/app/src/main/jniLibs/**
+
+# 但任何 .so 的调试符号/中间文件都不要
+android/**/*.so.dbg
+android/**/obj/
+

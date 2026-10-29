@@ -1,0 +1,9 @@
+// 渡口 Ferry · Android 版
+//
+// 为什么用 Groovy DSL 而不是 build.gradle.kts：
+//   本机构建靠远端 xt，版本一旦对不上（AGP / Gradle / Kotlin 三方），
+//   Kotlin DSL 的报错信息比 Groovy 晦涩得多，而且它本身要先编译脚本。
+//   这个工程依赖极少（appcompat + material），用 Groovy 更省事。
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}

@@ -1,0 +1,60 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.ferry.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.ferry.app'
+        minSdk 26          // Android 8.0：VpnService + 前台服务语义都稳定
+        targetSdk 34
+        versionCode 1
+        versionName '0.1.0'
+
+        // 只打主流 ABI —— 每多一个 ABI，APK 多一份 .so（约 1MB）
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+    }
+
+    // .so 必须落盘成真实文件，不能留在 APK 里被压缩。
+    // hev-socks5-tunnel 是 JNI 库，System.loadLibrary 在某些设备上
+    // 无法从压缩包里直接加载（Android 6+ 默认 extractNativeLibs=false）。
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false      // 先别开混淆：JNI 方法名会被改，排查困难
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            applicationIdSuffix '.debug'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        viewBinding true
+    }
+
+    // 源码用 UTF-8，中文注释不能依赖系统默认编码
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+}

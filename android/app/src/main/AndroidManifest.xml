@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14 起前台服务必须声明类型，VPN 用 specialUse -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13 起通知要显式申请，否则前台服务通知不显示 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+        usesCleartextTraffic 必须为 true：
+        渡口走明文 SOCKS5（远端 10.13.24.1:1080，局域网内），门户也是 http 的。
+        Android 9 起默认禁止明文流量，不开就是所有连接直接失败。
+    -->
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Ferry"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            VpnService 的三要：
+            1. permission=BIND_VPN_SERVICE
+               少了它系统不认这个 Service，prepare() 永远返回 null 且不报错，
+               表现就是「点了没反应」。
+            2. intent-filter action android.net.VpnService
+            3. foregroundServiceType=specialUse 与 subtype property（Android 14 必须）
+        -->
+        <service
+            android:name=".vpn.FerryVpnService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Device traffic is forwarded to a SOCKS5 proxy on the campus LAN" />
+        </service>
+
+    </application>
+
+</manifest>

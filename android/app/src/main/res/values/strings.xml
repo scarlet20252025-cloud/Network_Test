@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">渡口</string>
+
+    <string name="state_off">未连接</string>
+    <string name="state_connecting">正在连接…</string>
+    <string name="state_on">已借网</string>
+    <string name="state_error">连接失败</string>
+
+    <string name="btn_start">开始借网</string>
+    <string name="btn_stop">停止并恢复直连</string>
+
+    <string name="label_code">激活码</string>
+    <string name="btn_activate">激活</string>
+    <string name="label_log">日志</string>
+
+    <string name="notif_channel_name">借网状态</string>
+    <string name="notif_title">渡口正在借网</string>
+    <string name="notif_text">全部流量经局域网主机转发</string>
+
+    <string name="vpn_permission_hint">需要授权「网络连接请求」才能接管流量</string>
+</resources>
