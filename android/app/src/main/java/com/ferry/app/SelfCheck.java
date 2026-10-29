@@ -67,11 +67,15 @@ public class SelfCheck {
             items.add(checkHev());
             items.add(checkDns());
             items.add(checkHttp());
-            items.add(checkEgress());
+            items.add(checkUplink());
             int okCount = 0;
             for (Item i : items) if (i.ok) okCount++;
             String summary = okCount + "/" + items.size() + " 项通过"
                     + (okCount == items.size() ? " —— 隧道正常" : " —— 隧道没完全通");
+            // 出口 IP 只作参考信息，不计入通过数：这台校园网里 pcs 和手机
+            // 走同一个 NAT 出口，开不开隧道公网 IP 都一样，拿它当判据会误判。
+            Item egress = checkEgressInfo();
+            items.add(new Item("出口 IP（仅供参考）", true, egress.detail));
             cb.onDone(items, summary);
         }, "ferry-selfcheck").start();
     }
@@ -141,12 +145,79 @@ public class SelfCheck {
     }
 
     /**
-     * ⑤ 出口 IP。
+     * ⑤ 隧道是否真的在承载流量：用「请求前后的 hev 流量增量」判定。
      *
-     * 用一个只回显来源 IP 的接口。借网成功时这里是**远端出口**的地址，
-     * 而不是本机所在网络的地址 —— 这是「真的走了隧道」的唯一硬证据。
+     * 这一项前后换过两版判据，两版都被真机打回来了，值得记下来：
+     *
+     * 版本 1「查出口 IP 是不是变成远端出口」——2026-10-29 实测失效：
+     *   这台校园网里 pcs(10.13.24.1) 和手机走同一个 NAT 出口，
+     *   开隧道和关隧道拿到的公网 IP 一模一样（都是 120.235.20.202）。
+     *   判据失效比没有判据更糟，因为它会让人以为隧道没工作。
+     *
+     * 版本 2「读 /proc/net/tcp6 找有没有到远端 1080 的连接」——同样失效：
+     *   Android 10 起普通应用读 /proc/net/tcp{,6} 被 SELinux 挡住，
+     *   读出来是空的。而 netstat 在 adb shell（shell 用户）下却能看到，
+     *   所以这个坑只在应用内暴露，用 adb 验证是看不出来的。
+     *
+     * 版本 3（当前）：读 hev 自己报的统计值（TProxyGetStats），
+     *   发一次请求，看前后字节数有没有涨。涨了就证明这次请求确实
+     *   从 TUN 进了隧道 —— 这是端到端、只依赖自己数据的判据。
      */
-    private static Item checkEgress() {
+    private static Item checkUplink() {
+        long before = tunnelBytes();
+        boolean reqOk = quickHttp("http://www.qq.com");
+        long after = tunnelBytes();
+        long delta = after - before;
+        if (delta > 0) {
+            return new Item("隧道承载", true,
+                    "这次请求让隧道流量增加 " + delta + " 字节");
+        }
+        if (before > 0) {
+            return new Item("隧道承载", true,
+                    "本次没测到增量，但隧道累计已过 " + before + " 字节");
+        }
+        return new Item("隧道承载", false,
+                reqOk ? "隧道统计一直为 0，流量没进隧道" : "请求失败，无法判断");
+    }
+
+    /** 读 hev 的累计字节数（tx 字节 + rx 字节）；取不到返回 0。 */
+    private static long tunnelBytes() {
+        try {
+            long[] st = TProxyService.TProxyGetStats();
+            if (st == null || st.length < 4) return 0;
+            // 四个值的含义（见 hev-jni.c）：[0]=tx 包数 [1]=tx 字节 [2]=rx 包数 [3]=rx 字节
+            return st[1] + st[3];
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /** 一次短超时的 HTTP GET，只关心「请求是否发生了」以及「是否成功」。 */
+    private static boolean quickHttp(String url) {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(6000);
+            c.setReadTimeout(6000);
+            c.setInstanceFollowRedirects(false);
+            int code = c.getResponseCode();
+            return code > 0;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
+    /**
+     * 出口 IP —— **仅供参考**，不计入通过数。
+     *
+     * 为什么降级：2026-10-29 真机实测，这台校园网里 pcs(10.13.24.1) 和手机
+     * 走的是同一个 NAT 出口，开隧道和关隧道拿到的公网 IP 完全一样
+     * （都是 120.235.20.202）。拿它当「隧道是否生效」的判据会误判成「没工作」。
+     * 它仍然有用：能看出远端出口是哪条线（联通/电信/移动）。
+     */
+    private static Item checkEgressInfo() {
         String[] urls = new String[]{
                 "http://members.3322.org/dyndns/getip",
                 "http://ip.3322.net",

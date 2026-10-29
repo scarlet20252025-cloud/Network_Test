@@ -183,14 +183,91 @@ PowerShell 解析器会直接报错。**改成把远端要执行的命令写成 
 
 ---
 
+## M2 真机验证 ← 2026-10-29 13:02 通过 ✅
+
+**目标机**（用户自己的手机，插 USB 后走 adb）：
+
+```
+型号    vivo V1824A (iQOO)
+Android 11 (API 30)   —— minSdk 26 / targetSdk 34 都满足
+ABI     arm64-v8a
+WiFi    10.141.56.25/22（GDPZ-student-5G）
+到 pcs   ping 10.13.24.1 → 6.67 / 14.1 ms
+```
+
+**结果**：
+
+```
+tun0: <POINTOPOINT,UP,LOWER_UP> mtu 1400
+      inet 198.18.0.1/30 scope global tun0
+
+自检 5/5：
+  ✓ TUN 网卡    tun0 = 198.18.0.1
+  ✓ 隧道进程    tx 31157B / rx 37324B
+  ✓ DNS 解析    www.qq.com → 120.233.254.239
+  ✓ HTTP 请求   HTTP 302
+  ✓ 隧道承载    隧道累计已过 68481 字节
+  ✓ 出口 IP（仅供参考）  120.235.20.202
+```
+
+**独立于 App 的证据链**（不靠 App 自己说）：
+
+| 证据 | 来源 |
+|---|---|
+| 手机上多条 `10.141.56.25:xxxxx → 10.13.24.1:1080` 的 ESTABLISHED / TIME_WAIT | `adb shell netstat -an` |
+| 远端 `10.13.24.1:1080 ← 10.141.56.25:xxxxx` 的 ESTABLISHED | `ssh pcs 'netstat -an'` |
+| `socks5 client tcp -> [android.googleapis.com]:443`、`res.rep 5` | 手机内 `files/hev/hev.log` |
+| 路由表里 46 条公网 CIDR 全部指向 tun0（table 1033） | `adb shell ip route show table all` |
+
+`res.rep 5` 是 SOCKS5 的「连接被拒绝」——远端确实**尝试**替手机连
+android.googleapis.com，而渡口出口是大陆联通，连不到 Google，属预期。
+这恰好证明「远端在替手机做事」，比任何间接指标都直接。
+
+### 真机验证踩到的三个坑（都是产品级缺陷，已修）
+
+**① 出口 IP 判据失效**
+原来自检第 ⑤ 步是「看出口 IP 是不是变成远端出口」。实测：这台校园网里
+pcs(10.13.24.1) 和手机走**同一个 NAT 出口**，开隧道和关隧道拿到的公网 IP
+完全一样（都是 `120.235.20.202`）。判据失效比没有判据更糟 ——
+它会让人以为隧道没工作。
+
+**② `/proc/net/tcp6` 判据也失效**
+改成读 `/proc/net/tcp{,6}` 找「到远端 1080 的连接」。在 adb shell 里
+`netstat -an` 明明能看到那些连接，但**应用内读 /proc/net/tcp6 被 SELinux
+挡住**（Android 10 起限制非系统应用），读出来是空的。
+教训：**用 adb shell 能看到的，应用内不一定看得到** —— 这类权限差异
+只能靠应用自己报错暴露。
+
+**③ 最终判据：hev 自己的流量增量**
+读 `TProxyGetStats()`，发一次请求，看前后字节数是否增长。
+端到端、只依赖自己的数据、不受网络拓扑影响。当前实现：
+增量 > 0 直接通过；增量 0 但累计 > 0 也通过（避免「刚好没有新流量」误判）；
+两者都 0 才报失败。
+
+**④ `--ez autostart` 静默不生效**
+`launchMode="singleTask"`，Activity 已在前台时再 `am start --ez autostart true`
+只走 `onNewIntent`，而原来只在 `onCreate` 里处理 → 命令发出去了、
+界面毫无变化。已把处理逻辑抽成 `handleAutoIntent(Intent)`，`onCreate`
+和 `onNewIntent` 都调。
+
+### 装 APK 到 vivo 的一个操作要点
+
+vivo 对 adb 安装会弹「是否允许通过 USB 安装」的确认框，`adb install` 直接
+报 `INSTALL_FAILED_ABORTED: User rejected permissions`。
+**必须在手机上点允许**（或在开发者选项里打开「USB 安装」）。
+`adb uninstall` 不需要确认，所以「卸载 → 重装」并不能绕过。
+
+---
+
 ## 下一步
 
 | 任务 | 说明 |
 |---|---|
-| **M2 真机验证** | 装到手机上，点开始 → 系统 VPN 图标 → 能上网（自检五步全绿）|
-| **M3 联调激活** | 用真实激活码走一遍 `POST /api/activate` |
+| **M3 联调激活** | 用真实激活码走一遍 `POST /api/activate`（当前用假 token 跳过）|
 | **M4 禁网实测** | 校园网禁网时手机连渡口 |
 | **M5 UDP/游戏** | hev 的 `udp: 'udp'` 走远端 UDP 中继，量化延迟 |
+| **真机长期使用** | 手机一直开着 VPN 用一天，看耗电、断线重连、切 WiFi/4G 表现 |
+| **Per-App 分流** | 只让指定 App 走隧道（参考 5G-Proxy-Client 的 `PerAppMode`）|
 
 ---
 

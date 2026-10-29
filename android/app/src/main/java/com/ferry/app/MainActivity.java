@@ -81,14 +81,34 @@ public class MainActivity extends AppCompatActivity {
         // 为什么要留这个：真机/模拟器上没法自动点系统 VPN 授权框之后的「开始」按钮，
         // 而端到端验证必须真的把隧道拉起来。加一个显式意图参数最省事，
         // 也不会被误触发（普通启动不带这个 extra）。
-        if (getIntent() != null && getIntent().getBooleanExtra("autostart", false)) {
+        handleAutoIntent(getIntent());
+    }
+
+    /**
+     * 处理 autostart / selfcheck 两个自动化意图。
+     *
+     * ⚠ 必须同时挂在 onCreate 和 onNewIntent 上。2026-10-29 真机实测踩到：
+     * 因为 launchMode 是 singleTask，Activity 已经在前台时再 `am start --ez autostart true`
+     * 只会走 onNewIntent，onCreate 不再执行 —— 于是「命令发出去了、什么都没发生」，
+     * 而界面上看不出任何区别。这类"静默不生效"最难查。
+     */
+    private void handleAutoIntent(Intent it) {
+        if (it == null) return;
+        if (it.getBooleanExtra("autostart", false)) {
             log("收到 autostart，自动开始借网");
-            txtCode.postDelayed(this::startVpn, 800);
+            btnToggle.postDelayed(this::startVpn, 800);
         }
-        if (getIntent() != null && getIntent().getBooleanExtra("selfcheck", false)) {
+        if (it.getBooleanExtra("selfcheck", false)) {
             log("收到 selfcheck，自动自检");
-            txtCode.postDelayed(this::runSelfCheck, 1200);
+            btnSelfCheck.postDelayed(this::runSelfCheck, 1200);
         }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleAutoIntent(intent);
     }
 
     /** 自检：五步逐层验证隧道，结果写进日志（也回显在状态栏）。 */
