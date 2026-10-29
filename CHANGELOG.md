@@ -1,3 +1,45 @@
+## v0.14.44 — 2026-10-29
+
+> 客户端 1.0.47：把 1.0.46 的健康检查间隔从 30 秒压到 10 秒。
+> 禁网那一刻到 fallback 切走之间的空白期，从最长 30 秒缩到 10 秒。
+
+### 为什么改
+
+1.0.46 把 `ferry-udp-group` 改成 `fallback [DIRECT, ferry-udp]` 之后，
+靠 mihomo 的健康检查发现「直连不通了」再切隧道。间隔 30 秒意味着：
+校园网刚断的那一刻，最长要等 30 秒游戏 UDP 才不再往直连上撞。
+
+从 mihomo 二进制的日志字符串确认了 fallback 的确切语义：
+
+```
+ProxyGroup: %s first failed
+ProxyGroup: %s failed count: %d
+Start New Health Checking {%s}
+```
+
+也就是「按顺序检查，用第一个不失败的；持续做健康检查，失败就换下一个」。
+所以缩短 interval 就是在缩短那段空白期。
+
+### 改了什么
+
+```yaml
+- name: ferry-udp-group
+  type: fallback
+  proxies: [DIRECT, ferry-udp]
+  url: 'http://connect.rom.miui.com/generate_204'
+  interval: 10      # 原 30
+  timeout: 2000     # 原 3000
+```
+
+代价是每分钟多 6 次轻量请求（`generate_204` 无正文，可忽略）。
+
+### 验证
+
+`tools/verify-udp-group.cs` 仍全 PASS。产物 exe 内已确认含
+`interval: 10` / `timeout: 2000` / `DIRECT, ferry-udp`。
+
+---
+
 ## v0.14.43 — 2026-10-29
 
 > 客户端 1.0.46：**修复「最新版打游戏延迟高」** —— UDP 默认改回直连，

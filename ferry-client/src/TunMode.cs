@@ -410,14 +410,26 @@ namespace Ferry
             //   游戏/语音就彻底不通了 —— 而用户开渡口正是为了这个时候能用。
             //   fallback 按 url 测活，正好同时满足两种场景。
             //
+            // fallback 的确切语义（从 mihomo 二进制的日志字符串确认过）：
+            //   按列表顺序检查，用第一个不失败的；持续做健康检查
+            //   （"Start New Health Checking"），失败就换下一个
+            //   （"first failed" / "failed count: %d"）。
+            //   所以 [DIRECT, ferry-udp] = 有网走直连、禁网自动落隧道、
+            //   网络恢复又切回来，不需要额外逻辑。
+            //
             // 测活地址和 clash-egress 用同一个国内 generate_204：
             //   有网时 DIRECT 通、禁网时不通，判据和「能不能直连」一致。
+            //
+            // interval 用 10 秒而不是 30 秒：禁网那一刻，DIRECT 已经不通了，
+            // 但 fallback 要等下一轮健康检查才会切走 —— 这中间的空白期里
+            // 游戏 UDP 还在往直连上撞。10 秒把最坏等待压到 10 秒以内，
+            // 代价是每分钟多 6 次轻量 HEAD 请求（generate_204 无正文，可忽略）。
             sb.AppendLine("  - name: ferry-udp-group");
             sb.AppendLine("    type: fallback");
             sb.AppendLine("    proxies: [DIRECT, ferry-udp]");
             sb.AppendLine("    url: 'http://connect.rom.miui.com/generate_204'");
-            sb.AppendLine("    interval: 30");
-            sb.AppendLine("    timeout: 3000");
+            sb.AppendLine("    interval: 10");
+            sb.AppendLine("    timeout: 2000");
             sb.AppendLine();
             sb.AppendLine("rules:");
             // 规则顺序是设计的一部分，别随手调：
