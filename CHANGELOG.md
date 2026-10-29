@@ -1,7 +1,32 @@
 ## v0.14.42 — 2026-10-29
 
 > 客户端 1.0.45：热点共享源按「已连接的物理网卡」判（不再要求 InternetAccess）；
-> 卡死状态自动自愈；修隧道模式下 UDP 上游指错（一条静默的 bug）。
+> 卡死状态自动自愈；**开热点前先警告「这会顶掉你自己的 WiFi」**；
+> 修隧道模式下 UDP 上游指错（一条静默的 bug）。
+
+### 零、先说要紧的：这个版本加了「不许默默断用户的网」的保护
+
+**真实事故（2026-10-29 凌晨）**：开发时为验证共享源修复，在用户自己的机器上
+直接调了 `StartTetheringAsync()`。结果 **Realtek 8852BE 的 STA 连接被顶掉**——
+他正在用的 WiFi 断了，远控同时失去，只能干等恢复。
+
+原因是单网卡的物理限制：单块无线网卡做 SoftAP 时，STA 和 AP 共用同一套射频前端。
+很多驱动（含 8852BE）接到 SoftAP 请求后**不是拒绝，而是切换射频配置** →
+「AP 起来了、STA 掉了」。
+
+| 场景 | 能否同时 |
+|---|---|
+| 有线网卡上行 + WiFi 做 AP | ✅ |
+| 两块 WiFi（一块 STA、一块 AP） | ✅ |
+| **单块 WiFi 同时 STA + AP** | ❌ 多数驱动做不到，失败方式是「顶掉 STA」 |
+
+所以本版加了保护：`Hotspot.UplinkRisk()` 判定「共享源是无线网卡且它是唯一上行」，
+`OnHotspotToggled()` 在开之前弹确认框，明确写「你现在的 WiFi 会断
+（这台机器可能就此失去远程连接）」，点「否」就不开。
+有线上行或有两块网卡时不打扰。
+
+> 系统设置 UI 为什么安全、直接调 API 为什么危险：UI 会先做能力检查，
+> 不支持就不让你开；而 WinRT API 是强行下命令，驱动靠「踢掉 STA」来满足它。
 
 ### 一、热点：1.0.44 的修法在这个场景下必然选错
 
@@ -178,6 +203,20 @@ _proxy = new ProxyServer(_httpPort, upstreamPort, upstreamHost, _log);
   tools\verify.cmd verify-udp-upstream.cs
   tools\verify.cmd verify-hotspot-picker.cs ferry-client/src/Hotspot.cs
   ```
+- 新增 `tools/verify-uplink-risk.cs` 6 项 ALL PASS（**纯只读**，不启停任何东西）：
+  ```
+  PASS  Hotspot.UplinkRisk exists (public static)
+  --- UplinkRisk() 返回 ---
+      当前只有一块无线网卡在联网（GDPZ-student-5G），它同时也是热点的发射网卡。
+      多数无线网卡无法同时「连着 WiFi」和「发 WiFi」，强行开启的结果是：
+        · 你现在的 WiFi 会断（这台机器可能就此失去远程连接）
+        · 热点也可能起不来（无线网卡 SoftAP 驱动卡死，只能重启电脑恢复）
+  PASS  single wireless uplink -> risk reported
+  ```
+  > 第一版这里有个坑：用 `ReferenceEquals` 判断「这条是不是共享源」——
+  > WinRT 每次枚举都返回新的 COM 包装对象，引用永不相等，
+  > 于是把自己算成「第二条上行」，`UplinkRisk()` 恒返回空（保护形同虚设）。
+  > 改成按 `ProfileName` 比较才对。
 
 ## v0.14.41 — 2026-10-29
 

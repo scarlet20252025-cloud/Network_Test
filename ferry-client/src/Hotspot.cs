@@ -400,6 +400,71 @@ namespace Ferry
         }
 
         /// <summary>
+        /// 开热点会不会把当前上网的那条线路顶掉？返回空字符串 = 没风险。
+        ///
+        /// 为什么必须有这个检查（2026-10-29 真实事故）：
+        ///   我在用户机上直接调 StartTetheringAsync()，结果 **Realtek 8852BE 的
+        ///   STA 连接被顶掉** —— 他正在用的 WiFi 断了，远控同时失去。
+        ///
+        /// 技术原因：单块无线网卡做 SoftAP 时，STA 和 AP 必须共用同一套射频前端。
+        /// 很多驱动（含 8852BE）接到 SoftAP 请求后**不是拒绝，而是切换射频配置**：
+        ///   · 有线网卡上行 + WiFi 做 AP      → 互不干扰，安全
+        ///   · 两块 WiFi（一块 STA、一块 AP） → 安全
+        ///   · 单块 WiFi 同时 STA + AP        → 多数驱动做不到，且失败方式是「顶掉 STA」
+        ///
+        /// 所以「共享源是无线网卡，且它是本机唯一的上行」时，开热点大概率等于
+        /// 把用户自己的网断掉。这种情况必须先告诉他，让他自己决定。
+        /// </summary>
+        public static string UplinkRisk()
+        {
+            try
+            {
+                if (EnsureLoaded() != "") return "";
+                var share = PickShareProfile();
+                if (share == null) return "";
+
+                int shareIana = IanaOf(share);
+                if (shareIana != 71) return "";   // 有线做共享源不会有这个问题
+
+                var shareName = Convert.ToString(
+                    share.GetType().GetProperty("ProfileName").GetValue(share, null));
+
+                // 还有没有别的上行？有线（iana=6 物理）或另一块已连接的无线。
+                //
+                // 注意：**不能**用 ReferenceEquals 判断「这条是不是共享源」。
+                // WinRT 每次 GetConnectionProfiles() 都返回新的 COM 包装对象，
+                // 同一个网络两次枚举出来的引用不相等 —— 第一版就栽在这里，
+                // 结果「自己跟自己比」永远不相等，于是把自己算成了第二条上行，
+                // UplinkRisk() 恒返回空（保护形同虚设）。按 ProfileName 比才可靠。
+                object otherUplink = null;
+                foreach (var p in (IEnumerable)MethodNoArg(_netInfo, "GetConnectionProfiles").Invoke(null, null))
+                {
+                    if (p == null) continue;
+                    var gm = MethodNoArg(p.GetType(), "GetNetworkConnectivityLevel");
+                    if (gm == null) continue;
+                    var lvl = Convert.ToString(gm.Invoke(p, null));
+                    if (lvl == "None") continue;
+                    var desc = AdapterDescOf(p);
+                    if (IsVirtualAdapter(desc)) continue;
+                    var pn = Convert.ToString(p.GetType().GetProperty("ProfileName").GetValue(p, null));
+                    if (string.Equals(pn, shareName, StringComparison.Ordinal)) continue;  // 就是共享源自己
+                    int iana = IanaOf(p);
+                    if (iana == 6) { otherUplink = p; break; }        // 有有线，稳
+                    if (iana == 71 && otherUplink == null) otherUplink = p;
+                }
+                if (otherUplink != null) return "";   // 有第二条上行，单网卡并发问题被绕开了
+
+                return "当前只有一块无线网卡在联网（" + shareName + "），它同时也是热点的发射网卡。\n\n"
+                     + "多数无线网卡无法同时「连着 WiFi」和「发 WiFi」，强行开启的结果是：\n"
+                     + "  · 你现在的 WiFi 会断（这台机器可能就此失去远程连接）\n"
+                     + "  · 热点也可能起不来（无线网卡 SoftAP 驱动卡死，只能重启电脑恢复）\n\n"
+                     + "如果这台机器是你远程在用的，请不要在这里开热点。\n"
+                     + "确实要开就继续 —— 但请确保你人就在机器旁边。";
+            }
+            catch (Exception) { return ""; }
+        }
+
+        /// <summary>
         /// 开热点。返回空字符串表示成功（**以网卡拿到 192.168.137.1 为准**）。
         /// </summary>
         /// <param name="ssid">空 = 不改现有配置</param>

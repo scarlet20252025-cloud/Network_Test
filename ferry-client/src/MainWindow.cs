@@ -1119,6 +1119,30 @@ namespace Ferry
             }
 
             _hsBusy = true;
+
+            // 先问一句「这么做会不会把你自己的网断掉」。
+            //
+            // 为什么（2026-10-29 真实事故）：开发时在用户机上直接调
+            // StartTetheringAsync，Realtek 8852BE 的 STA 连接被顶掉 ——
+            // 他的 WiFi 断了、远控同时失去。软件既然知道单网卡并发有这风险，
+            // 就不能再默默下命令。
+            var risk = Hotspot.UplinkRisk();
+            if (!string.IsNullOrEmpty(risk))
+            {
+                var r = MessageBox.Show(this,
+                    risk + "\r\n\r\n确定要开启热点吗？",
+                    "开启移动热点", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+                if (r != MessageBoxResult.Yes)
+                {
+                    Log("用户取消开启热点（单网卡并发会让本机断网）");
+                    _hsBusy = false;
+                    _swHotspot.SetSilently(false);   // 不触发 Toggled，避免再进这个函数
+                    RefreshUi();
+                    return;
+                }
+                Log("用户确认在单网卡并发风险下开启热点");
+            }
+
             _cfg.HotspotOn = true;
             try { _cfg.Save(_cfgPath); } catch (Exception) { }
             Log("正在开启移动热点…");
