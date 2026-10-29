@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/ferry_bg"
@@ -62,7 +63,10 @@
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 
-    <!-- 激活卡 -->
+    <!-- 激活卡：两种形态切换
+         未激活 → 显示输入框 + 激活按钮
+         已激活 → 隐藏输入框，显示「已激活 + 剩余天数 + 到期日期」
+         （用户要求对齐 PC 端：PC 上就是「剩余 27 天 · 2026-11-25 到期」） -->
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/cardActivate"
         android:layout_width="0dp"
@@ -82,13 +86,16 @@
             android:padding="18dp">
 
             <TextView
+                android:id="@+id/txtActivateTitle"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="@string/label_code"
                 android:textColor="@color/ferry_text"
                 android:textSize="14sp" />
 
+            <!-- 未激活形态 -->
             <LinearLayout
+                android:id="@+id/rowInput"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
@@ -127,6 +134,46 @@
                     android:layout_marginStart="8dp"
                     android:text="@string/btn_activate"
                     app:backgroundTint="@color/ferry_accent" />
+            </LinearLayout>
+
+            <!-- 已激活形态 -->
+            <LinearLayout
+                android:id="@+id/boxActivated"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/txtActivationInfo"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/ferry_good"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    tools:text="已激活 · 剩余 23 小时 · 2026-10-30 到期" />
+
+                <TextView
+                    android:id="@+id/txtActivationSub"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:textColor="@color/ferry_text_muted"
+                    android:textSize="12sp"
+                    tools:text="vivo V1824A · 设备 1/3" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnChangeCode"
+                    style="@style/Widget.MaterialComponents.Button.TextButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="-8dp"
+                    android:layout_marginTop="4dp"
+                    android:minHeight="36dp"
+                    android:text="@string/btn_change_code"
+                    android:textColor="@color/ferry_text_muted"
+                    android:textSize="12sp" />
             </LinearLayout>
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>

@@ -37,7 +37,12 @@ public class MainActivity extends AppCompatActivity {
 
     private TextView txtState, txtDetail, txtLog;
     private EditText txtCode;
-    private MaterialButton btnToggle, btnActivate, btnSelfCheck;
+    private MaterialButton btnToggle, btnActivate, btnSelfCheck, btnChangeCode;
+    /** 激活卡的两种形态：未激活显示输入框，已激活显示摘要。 */
+    private TextView txtActivateTitle, txtActivationInfo, txtActivationSub;
+    private android.view.View rowInput, boxActivated;
+    /** 用户点了「换一个激活码」就强制显示输入框，直到激活成功。 */
+    private boolean forceShowInput = false;
 
     private FerryConfig cfg;
 
@@ -68,11 +73,28 @@ public class MainActivity extends AppCompatActivity {
         btnActivate = findViewById(R.id.btnActivate);
         btnSelfCheck = findViewById(R.id.btnSelfCheck);
 
+        txtActivateTitle = findViewById(R.id.txtActivateTitle);
+        rowInput = findViewById(R.id.rowInput);
+        boxActivated = findViewById(R.id.boxActivated);
+        txtActivationInfo = findViewById(R.id.txtActivationInfo);
+        txtActivationSub = findViewById(R.id.txtActivationSub);
+        btnChangeCode = findViewById(R.id.btnChangeCode);
+
         cfg = FerryConfig.load(this);
 
         btnToggle.setOnClickListener(v -> onToggle());
         btnActivate.setOnClickListener(v -> onActivate());
         btnSelfCheck.setOnClickListener(v -> runSelfCheck());
+
+        // 「换一个激活码」：已激活时把输入框重新露出来。
+        // 没有这个入口，隐藏输入框之后用户就换不了账号了 —— 会变成死路。
+        btnChangeCode.setOnClickListener(v -> {
+            forceShowInput = true;
+            txtCode.setText("");
+            refreshActivationCard();
+            txtCode.requestFocus();
+            log("请输入新的激活码");
+        });
 
         if (cfg.hasToken()) {
             // 先用本地缓存渲染，别等网络 —— 否则联网慢的时候会闪一下「未激活」
@@ -296,6 +318,8 @@ public class MainActivity extends AppCompatActivity {
                     cfg.deviceCount = r.deviceCount;
                     cfg.deviceMax = r.deviceMax;
                     cfg.save(MainActivity.this);
+                    // 激活成功后把输入框收起来（用户要求），除非他再点「换一个」
+                    forceShowInput = false;
                     log("激活成功，" + cfg.leftText());
                     if (r.deviceMax > 0 && r.deviceCount > 0) {
                         log("已绑定 " + r.deviceCount + "/" + r.deviceMax + " 台设备");
@@ -459,11 +483,46 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
+     * 激活卡的两种形态。
+     *
+     * 用户要求：激活成功后应该隐藏输入框。同时也要能退回来 ——
+     * 授权失效、或者用户主动点「换一个激活码」时，输入框必须重新出现，
+     * 否则就是死路。
+     *
+     * 判据用 canConnect() 而不是「有没有 token」：token 还在但已过期时，
+     * 继续显示「已激活」是骗人的，那时候就该让用户看到输入框去续期。
+     */
+    private void refreshActivationCard() {
+        boolean activated = cfg.hasToken() && cfg.canConnect() && !forceShowInput;
+        if (activated) {
+            txtActivateTitle.setText(R.string.label_activated);
+            rowInput.setVisibility(android.view.View.GONE);
+            boxActivated.setVisibility(android.view.View.VISIBLE);
+
+            // 对齐 PC 端那一行：「剩余 27 天 · 2026-11-25 到期」
+            txtActivationInfo.setText("已激活 · " + cfg.licenseSummary());
+
+            StringBuilder sub = new StringBuilder();
+            sub.append(cfg.deviceModel());
+            if (cfg.deviceMax > 0) {
+                sub.append(" · 设备 ").append(Math.max(1, cfg.deviceCount))
+                   .append("/").append(cfg.deviceMax);
+            }
+            txtActivationSub.setText(sub.toString());
+        } else {
+            txtActivateTitle.setText(R.string.label_code);
+            rowInput.setVisibility(android.view.View.VISIBLE);
+            boxActivated.setVisibility(android.view.View.GONE);
+        }
+    }
+
+    /**
      * 状态卡的副标题。这里必须只有「一种说法」——
      * 之前出过「显示未激活，但点开始借网又能用」的矛盾，根因就是
      * 状态文字看 token、借网判定看别的东西。现在两边都读同一个 cfg.licState。
      */
     private void refreshDetail() {
+        refreshActivationCard();
         if (!cfg.hasToken()) {
             txtDetail.setText(cfg.licState == FerryConfig.LIC_OFFLINE
                     ? "连不上门户（还没激活）" : "尚未激活");

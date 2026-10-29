@@ -172,4 +172,32 @@ public class FerryConfig {
         if (hours >= 1) return "剩余 " + hours + " 小时";
         return "剩余 " + Math.max(1, left / 60000L) + " 分钟";
     }
+
+    /**
+     * 到期日期，形如 "2026-11-25 到期"。
+     *
+     * 为什么要有它：只显示「剩余 23 小时」用户没法判断到底是哪天到期，
+     * 也没法拿去和缴费记录对账。Windows 客户端一直显示
+     * 「剩余 27 天 · 2026-11-25 到期」，手机端要对齐。
+     */
+    public String expiryText() {
+        if (!hasToken()) return "";
+        if (expiresAt <= 0) return "永久有效";
+        try {
+            java.text.SimpleDateFormat f =
+                    new java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US);
+            return f.format(new java.util.Date(expiresAt * 1000L)) + " 到期";
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** 授权摘要：PC 端那一行「剩余 N 天 · YYYY-MM-DD 到期」。 */
+    public String licenseSummary() {
+        if (!hasToken()) return "尚未激活";
+        String left = leftText();
+        String exp = expiryText();
+        if (exp.isEmpty() || "永久有效".equals(exp)) return left;
+        return left + " · " + exp;
+    }
 }
