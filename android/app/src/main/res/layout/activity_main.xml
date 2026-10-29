@@ -94,14 +94,31 @@
                 android:layout_marginTop="8dp"
                 android:orientation="horizontal">
 
+                <!--
+                  输入框的三处显式设置都是必要的（2026-10-29 真机 bug）：
+                    · background  —— 主题默认背景在这套配色下等于没有，看不出哪里能点
+                    · textColor    —— 不设就吃主题默认，深色模式下是浅色字，白底上隐身
+                    · textColorHint—— 同上，hint 也会隐身
+                  另外 inputType 用 textCapCharacters：门户那边会 .upper()，
+                  客户端直接大写更直观；不要连字符（门户只收 6–16 位字母数字）。
+                -->
                 <EditText
                     android:id="@+id/txtCode"
                     android:layout_width="0dp"
-                    android:layout_height="wrap_content"
+                    android:layout_height="46dp"
                     android:layout_weight="1"
-                    android:hint="xxxxx-xxxxx-xxxxx-xxxxx"
-                    android:inputType="text"
-                    android:textSize="14sp" />
+                    android:background="@drawable/bg_input"
+                    android:gravity="center_vertical"
+                    android:hint="@string/hint_code"
+                    android:importantForAutofill="no"
+                    android:inputType="textCapCharacters|textNoSuggestions"
+                    android:maxLength="16"
+                    android:paddingStart="12dp"
+                    android:paddingEnd="12dp"
+                    android:singleLine="true"
+                    android:textColor="@color/ferry_text"
+                    android:textColorHint="@color/ferry_text_muted"
+                    android:textSize="15sp" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnActivate"

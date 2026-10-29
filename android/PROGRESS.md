@@ -259,15 +259,73 @@ vivo 对 adb 安装会弹「是否允许通过 USB 安装」的确认框，`adb 
 
 ---
 
+## M3 激活联调 ← 2026-10-29 13:17 通过 ✅
+
+用真实激活码走完整链路（不再塞假 token）：
+
+```
+手机输入 TEST2026 → 点「激活」
+  → POST http://10.13.24.1:8080/api/activate
+  → 界面：激活成功，剩余 1 天
+  → 状态栏：出口 10.13.24.1:1080 · 剩余 1 天
+```
+
+服务端落库核对（`ssh pcs` 直接查 `C:\ferry-portal\portal.db`）：
+
+```
+invites:  id=53 hint=TEST**** used_by_ip='10.141.56.25' used_at=13:17:49 days=1
+clients:  ip=10.141.56.25 token=qr5p23-3ejc7b-br4nwe-pmz6tw enabled=1
+          expires=2026-10-30 13:17
+```
+
+激活后再点「开始借网」，隧道起来，自检 5/5，两级证据：
+
+| 证据 | 结果 |
+|---|---|
+| 手机 `netstat` 到远端 1080 的连接 | 7 条 |
+| 远端 `netstat` 看到来自 `10.141.56.25` | 多条 ESTABLISHED |
+| hev 会话 | `socks5 client tcp -> [voilatile-pa.googleapis.com]:443`、`res.rep 5` |
+
+测试码制作脚本：`C:\tmp\mk-test-code.py`（在 pcs 上跑，直接把
+`handle_admin_newcode` 干的事原样做一遍：生成 code → sha256 → 插 invites）。
+`note=android-m3-test`，日后可以按这个标记清理。
+
+### 界面 bug：激活码输入框看不见（2026-10-29 用户报）
+
+**现象**：激活码输入框看不到，输入之后也不显示已输入的文字。
+
+**根因**：主题是 `Theme.MaterialComponents.DayNight.NoActionBar`，
+但配色只定义了浅色一套（没有 `values-night`）。系统处于深色模式时，
+Material 会把默认文字色切成浅色，而卡片背景是写死的白色 `#FFFFFF`
+—— 浅色字画在白底上，等于隐身。`EditText` 又没显式指定 `textColor`
+（连 `textColorHint` 也没指定），于是完全吃主题默认值。
+
+**改法（两层都改，缺一不可）**：
+
+1. 主题换成 `Theme.MaterialComponents.Light.NoActionBar` 并显式给出
+   `colorOnSurface` / `android:textColorPrimary` / `android:textColorSecondary`。
+   不补 `values-night` 是有意的：渡口是工具类 App，浅色一套就够，
+   两套配色会让以后每个界面改动都要验两遍。
+2. `EditText` 三个样样都写死：`background`（新建 `res/drawable/bg_input.xml`，
+   白底 + 1dp 描边 + 8dp 圆角）、`textColor`、`textColorHint`。
+   这样即使以后有人把主题改回 DayNight，输入框也不会再消失。
+
+顺带修了一个误导：hint 原来是 `xxxxx-xxxxx-xxxxx-xxxxx`（带连字符），
+而门户校验是 `[A-Z0-9]{6,16}`，**没有连字符**。改成「6–16 位字母数字」，
+`maxLength=16`，`inputType=textCapCharacters`（门户那边会 `.upper()`，
+客户端直接大写更直观）。
+
+---
+
 ## 下一步
 
 | 任务 | 说明 |
 |---|---|
-| **M3 联调激活** | 用真实激活码走一遍 `POST /api/activate`（当前用假 token 跳过）|
 | **M4 禁网实测** | 校园网禁网时手机连渡口 |
 | **M5 UDP/游戏** | hev 的 `udp: 'udp'` 走远端 UDP 中继，量化延迟 |
 | **真机长期使用** | 手机一直开着 VPN 用一天，看耗电、断线重连、切 WiFi/4G 表现 |
 | **Per-App 分流** | 只让指定 App 走隧道（参考 5G-Proxy-Client 的 `PerAppMode`）|
+| **同 NAT 互相顶掉** | 服务端按来源 IP 授权，手机和电脑同网时会互相顶 —— 需产品决策 |
 
 ---
 

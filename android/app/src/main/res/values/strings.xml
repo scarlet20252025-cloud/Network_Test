@@ -13,6 +13,9 @@
     <string name="selfcheck_running">正在自检…</string>
 
     <string name="label_code">激活码</string>
+    <!-- 门户校验是 [A-Z0-9]{6,16}，没有连字符。
+         原来这里写的是 "xxxxx-xxxxx-xxxxx-xxxxx"，会让人以为要输带横杠的码。 -->
+    <string name="hint_code">6–16 位字母数字</string>
     <string name="btn_activate">激活</string>
     <string name="label_log">日志</string>
 

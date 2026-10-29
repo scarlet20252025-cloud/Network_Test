@@ -1,10 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Ferry" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+    <!--
+      刻意用 Light 而不是 DayNight（2026-10-29 改）。
+
+      原因：整套配色（ferry_bg #F5F7F6 / ferry_card #FFFFFF / ferry_text #1F2A26）
+      是按浅色设计的，没有 values-night 那一套。用 DayNight 时，系统一旦处于
+      深色模式，Material 会把默认文字色切成浅色，而卡片背景仍是写死的白色
+      —— 结果就是「激活码输入框看不见、输入后也不显示文字」这个真实 bug。
+
+      两条路：补一套 values-night 配色，或者固定浅色。选后者 ——
+      渡口是工具类 App，浅色一套就够，补两套配色会让后续每个界面改动
+      都要验两遍，不划算。
+    -->
+    <style name="Theme.Ferry" parent="Theme.MaterialComponents.Light.NoActionBar">
         <item name="colorPrimary">@color/ferry_accent</item>
         <item name="colorPrimaryDark">@color/ferry_accent_dark</item>
         <item name="colorAccent">@color/ferry_accent</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorSurface">@color/ferry_card</item>
+        <item name="colorOnSurface">@color/ferry_text</item>
         <item name="android:windowBackground">@color/ferry_bg</item>
         <item name="android:statusBarColor">@color/ferry_accent_dark</item>
+        <item name="android:textColorPrimary">@color/ferry_text</item>
+        <item name="android:textColorSecondary">@color/ferry_text_muted</item>
     </style>
 </resources>
+
