@@ -120,6 +120,34 @@ CREATE TABLE IF NOT EXISTS clients (
     expires_at  INTEGER DEFAULT 0
 );
 
+-- 设备表：一个账号（token）可以绑多台设备（2026-10-29 新增）。
+--
+-- 为什么必须单独一张表：clients 的主键是 ip，而同一局域网里的手机和电脑
+-- 走的是同一个 NAT 出口 —— IP 一样。用 ip 当身份，「手机激活后电脑被顶掉」
+-- 是必然的，不是 bug。设备身份必须换成客户端自己报的稳定 ID。
+--
+-- device_id 用 Android 的 Settings.Secure.ANDROID_ID：它在**重装 App 之后
+-- 不变**，这正是「同一台手机重装后能自动恢复授权」的前提。
+--
+-- 安全边界：光凭 device_id 就发 token 是有风险的（ID 可伪造），所以
+-- /api/device/restore 还要求来源 IP 与该设备上次登记的 IP 在同一 /24，
+-- 并且该设备必须已经被某个有效 token 登记过。
+CREATE TABLE IF NOT EXISTS devices (
+    device_id   TEXT PRIMARY KEY,
+    token       TEXT NOT NULL,
+    platform    TEXT DEFAULT '',
+    model       TEXT DEFAULT '',
+    app_version TEXT DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    last_seen   INTEGER DEFAULT 0,
+    -- 上次登录的来源 IP。恢复授权时用它做一次「同网段」校验：
+    -- 光凭 device_id 就发 token 太松（ID 可伪造），加上「和上次在同一个 /24」
+    -- 这一条，攻击者还得先在同一栋楼里才行。
+    last_ip     TEXT DEFAULT '',
+    enabled     INTEGER DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_devices_token ON devices(token);
+
 CREATE TABLE IF NOT EXISTS sessions (
     sid_hash    TEXT PRIMARY KEY,
     ip          TEXT NOT NULL,
@@ -296,6 +324,13 @@ def fmt_left(ts):
 # 可选档位（天）。0 = 永久。
 LICENSE_TIERS = (1, 2, 3, 7, 30)
 
+# 一个账号（token）最多绑几台设备。
+#
+# 为什么要有上限：token 是可以随手抄给别人用的，不设上限等于「一个码全网通」。
+# 3 台覆盖「手机 + 平板 + 电脑」的常见组合，再多就要求找管理员，
+# 这样既方便正常用户，又不至于一个码被几十个人共用。
+MAX_DEVICES_PER_TOKEN = 3
+
 
 def tier_text(days):
     if days is None:
@@ -346,6 +381,95 @@ def new_invite_code():
     alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
     raw = secrets.token_bytes(8)
     return ''.join(alphabet[b % len(alphabet)] for b in raw)
+
+
+# ─────────────────────────── 设备维度授权 ───────────────────────────
+#
+# 2026-10-29 起，授权从「按 IP」改成「按设备」。
+#
+# 为什么必须改：clients 的主键是 ip，而同一局域网里手机和电脑走同一个 NAT
+# 出口 —— IP 一样。结果就是「手机激活了，电脑那边的授权被顶掉」，
+# 用户会以为是 bug（其实是设计错了）。
+#
+# 现在：token 是账号，device_id 是设备。一个 token 绑多台设备，
+# 每台设备用自己的 ANDROID_ID（重装不变）作身份。
+
+DEVICE_ID_RE = re.compile(r'^[A-Za-z0-9_.:-]{8,64}$')
+
+
+def device_ok_id(device_id):
+    """设备 ID 的格式校验。宽松一些 —— 只挡明显不对的输入。"""
+    return bool(device_id) and bool(DEVICE_ID_RE.match(device_id))
+
+
+def device_count(db, token):
+    """这个账号当前绑了几台（启用中的）设备。"""
+    row = db.q1('SELECT COUNT(*) AS n FROM devices WHERE token = ? AND enabled = 1',
+                (token,))
+    return int(row['n']) if row else 0
+
+
+def device_bind(db, device_id, token, ip='', platform='', model='', app_version=''):
+    """把设备绑到账号上，顺便刷新心跳。
+
+    返回 (ok, error, is_new)。
+
+    已经绑过的设备直接更新（幂等），所以重装 App、重连、换网络都不会报错。
+    只有「新设备且该账号已满」才拒绝。
+    """
+    if not device_ok_id(device_id):
+        return False, '设备标识无效', False
+
+    row = db.q1('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+    if row:
+        # 已存在：更新心跳与元信息。注意 token 可能变（用户换了另一个码激活），
+        # 这时要按新 token 重新算一次配额，否则能绕过上限。
+        if row['token'] != token:
+            if device_count(db, token) >= MAX_DEVICES_PER_TOKEN:
+                return False, ('这个授权已绑定 %d 台设备（上限 %d 台）。'
+                               '要加新设备请先在其它设备上退出，或找管理员。'
+                               % (MAX_DEVICES_PER_TOKEN, MAX_DEVICES_PER_TOKEN)), False
+        db.x('UPDATE devices SET token = ?, platform = ?, model = ?, app_version = ?, '
+             'last_seen = ?, last_ip = ?, enabled = 1 WHERE device_id = ?',
+             (token, platform, model, app_version, now(), ip, device_id))
+        return True, '', False
+
+    if device_count(db, token) >= MAX_DEVICES_PER_TOKEN:
+        return False, ('这个授权已绑定 %d 台设备（上限 %d 台）。'
+                       '要加新设备请先在其它设备上退出，或找管理员。'
+                       % (MAX_DEVICES_PER_TOKEN, MAX_DEVICES_PER_TOKEN)), False
+
+    db.x('INSERT INTO devices (device_id, token, platform, model, app_version, '
+         'created_at, last_seen, last_ip, enabled) VALUES (?,?,?,?,?,?,?,?,1)',
+         (device_id, token, platform, model, app_version, now(), now(), ip))
+    return True, '', True
+
+
+def device_touch(db, device_id, token, ip=''):
+    """只刷新心跳，不新建。设备不存在时返回 False（调用方据此提示重新激活）。"""
+    row = db.q1('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+    if not row:
+        return False
+    db.x('UPDATE devices SET last_seen = ?, last_ip = ?, token = ? WHERE device_id = ?',
+         (now(), ip, token, device_id))
+    return True
+
+
+def same_subnet_24(ip_a, ip_b):
+    """两个 IPv4 是否在同一个 /24。用于恢复授权时的宽松校验。"""
+    a = (ip_a or '').split('.')
+    b = (ip_b or '').split('.')
+    if len(a) != 4 or len(b) != 4:
+        return False
+    return a[:3] == b[:3]
+
+
+def devices_of(db, token):
+    """列出账号下的设备（管理面板用）。"""
+    return db.q('SELECT device_id, platform, model, app_version, created_at, '
+                'last_seen, last_ip, enabled FROM devices WHERE token = ? '
+                'ORDER BY last_seen DESC', (token,))
+
 
 
 # 会话签名密钥：每次启动随机生成。重启后旧会话失效，这是可接受的安全行为。
@@ -5724,6 +5848,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_api_config(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
             elif path == '/api/license':
                 self.handle_api_license(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
+            elif path == '/api/device/restore':
+                # 重装后凭 ANDROID_ID 自动恢复授权（GET，只读 + 心跳）
+                self.handle_api_device_restore(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
             elif path == '/version.json':
                 self.handle_version()
             elif path == '/download-latest':
@@ -6410,10 +6537,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         'expired': bool(_lic.get('expired'))})
 
     def handle_api_license(self, qs):
-        """查询当前授权状态与剩余时长（客户端每次启动 / 每小时调一次）。
+        """查询当前授权状态与剩余时长（客户端每次启动 / 定期调一次）。
 
-        鉴权用 (ip, token) 组合 —— 只认本机 IP 的那种写法挡不住「同一局域网
-        里别人拿到你的 token」，所以 token 也必须对上。
+        2026-10-29 起改成**按设备**鉴权：
+          · 账号身份 = token
+          · 设备身份 = device_id（客户端上报的 ANDROID_ID，重装不变）
+          · ip 只在没有 device_id 时做兜底（兼容还没升级的老客户端）
+
+        为什么不再用 (ip, token)：同一局域网里手机和电脑走同一个 NAT 出口，
+        IP 完全一样。用 IP 当身份，等于「两台设备共用一个授权位」，
+        谁后激活谁把对方顶掉。
 
         到期处理：这里不改库，只如实报告 enabled=0/expired=1。
         真正的落库在 activate 续期时做 —— 让「到期」是个可逆的软状态，
@@ -6421,15 +6554,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """
         ip = (qs.get('ip') or [''])[0].strip()
         token = (qs.get('token') or [''])[0].strip()
+        device_id = (qs.get('device_id') or [''])[0].strip()
+        platform = (qs.get('platform') or [''])[0].strip()[:16]
+        model = (qs.get('model') or [''])[0].strip()[:48]
+        app_version = (qs.get('app_version') or [''])[0].strip()[:24]
 
-        if not ip or not token:
-            self.send_json({'ok': False, 'error': '缺少 ip 或 token'}, 400)
+        if not token:
+            self.send_json({'ok': False, 'error': '缺少 token'}, 400)
             return
 
-        cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
+        # 先按 token 找账号（设备维度）；找不到再退回 ip（老客户端）
+        cli = self.db.q1('SELECT * FROM clients WHERE token = ?', (token,))
+        if cli is None and ip:
+            cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
         if not cli or not hmac.compare_digest(str(cli['token']), token):
             self.send_json({'ok': False, 'error': '授权信息无效'}, 401)
             return
+
+        # 设备登记 / 心跳。设备超限时明确拒绝，不要静默放行 ——
+        # 否则用户会以为自己在用，实际下一台设备把旧的顶掉了。
+        devices_n = 0
+        if device_id:
+            ok, err, _is_new = device_bind(
+                self.db, device_id, token, ip=ip,
+                platform=platform, model=model, app_version=app_version)
+            if not ok:
+                self.send_json({'ok': False, 'error': err, 'device_limit': True}, 409)
+                return
+            devices_n = device_count(self.db, token)
+        else:
+            devices_n = device_count(self.db, token)
 
         st = license_state_of(cli)
 
@@ -6444,7 +6598,67 @@ class Handler(http.server.BaseHTTPRequestHandler):
             'remoteHost': CFG['public_host'] or '10.13.24.1',
             'sshPort': CFG['ssh_port'],
             'httpPort': CFG['port'] + 1,
+            # 设备维度的附加信息：客户端据此显示「第 2/3 台设备」这类提示
+            'deviceCount': devices_n,
+            'deviceMax': MAX_DEVICES_PER_TOKEN,
         })
+
+    def handle_api_device_restore(self, qs):
+        """重装/新装后凭设备标识自动恢复授权（GET，纯查询 + 心跳）。
+
+        场景：用户手机重装 App，本地 token 没了。如果还让他重新找管理员要
+        一次性密钥，体验很差 —— 而这台设备其实早就登记过。
+
+        安全边界（三条都要满足）：
+          1. device_id 必须是已登记的、enabled 的设备
+          2. 它绑的 token 必须仍然有效（账号存在且未过期/未停用）
+          3. 来源 IP 必须与这台设备上次登记时在同一个 /24
+             —— 光凭 device_id 太松（ID 可伪造），加上「还得在同一网段」
+             这一条，攻击成本就从「知道一个 ID」变成「先进同一个局域网」
+        """
+        ip = self.client_ip()
+        device_id = (qs.get('device_id') or [''])[0].strip()
+        if not device_ok_id(device_id):
+            self.send_json({'ok': False, 'error': '设备标识无效'}, 400)
+            return
+
+        dev = self.db.q1('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+        if not dev or not dev['enabled']:
+            self.send_json({'ok': False, 'error': '这台设备没有登记记录'}, 404)
+            return
+
+        last_ip = (dev['last_ip'] or '').strip()
+        if last_ip and not same_subnet_24(last_ip, ip):
+            self.db.log('device_restore_deny', ip, 'device=%s last_ip=%s' % (device_id[:12], last_ip))
+            self.send_json({'ok': False,
+                            'error': '这台设备上次在别的网络里使用，需要重新激活'}, 403)
+            return
+
+        cli = self.db.q1('SELECT * FROM clients WHERE token = ?', (dev['token'],))
+        if not cli:
+            self.send_json({'ok': False, 'error': '授权已不存在，请重新激活'}, 404)
+            return
+        st = license_state_of(cli)
+        if st['expired'] or not st['enabled']:
+            self.send_json({'ok': False, 'error': '授权已过期或已停用，请重新激活'}, 403)
+            return
+
+        device_touch(self.db, device_id, dev['token'], ip=ip)
+        self.db.log('device_restore', ip, 'device=%s' % device_id[:12])
+
+        self.send_json({
+            'ok': True,
+            'token': dev['token'],
+            'expiresAt': st['expiresAt'],
+            'daysLeft': st['daysLeft'],
+            'hoursLeft': st['hoursLeft'],
+            'remoteHost': CFG['public_host'] or '10.13.24.1',
+            'sshPort': CFG['ssh_port'],
+            'httpPort': CFG['port'] + 1,
+            'deviceCount': device_count(self.db, dev['token']),
+            'deviceMax': MAX_DEVICES_PER_TOKEN,
+        })
+
 
     def handle_version(self):
         """更新推送用的版本清单。客户端助手启动时拉一次，5 秒超时静默失败。"""
@@ -6524,11 +6738,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         exp = expiry_of(days)
         days_left = days_left_of(exp)
 
-        # 通过：绑定 IP，建号或复活
+        # 通过：建号或复活（按 token 找账号，不再用 ip 当身份）
+        #
+        # 2026-10-29 改动：原来这里用 `WHERE ip = ?` 找账号，导致同局域网的
+        # 手机和电脑共用一个授权位、互相顶掉。现在：
+        #   · 账号 = token（clients 表里的那一行）
+        #   · 设备 = device_id（devices 表，一台设备一行）
+        # 一个 token 下可以有多台设备，共用同一个到期时间。
         existing = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
         if existing:
             token = existing['token']
-            # 续期：把 expires_at 往后推（重新激活 = 续一个月）
+            # 续期：把 expires_at 往后推（重新激活 = 续一次）
             self.db.x('UPDATE clients SET enabled = 1, last_seen = ?, expires_at = ? WHERE ip = ?',
                       (now(), exp, ip))
         else:
@@ -6538,10 +6758,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'VALUES (?,?,1,?,?,?,?)',
                 (ip, token, now(), now(), inv['id'], exp))
 
+        # 登记设备。device_id 由客户端上报（Android 的 ANDROID_ID，重装不变）。
+        # 没上报就跳过 —— 兼容还没升级的老客户端，它们继续按 ip 用。
+        device_id = str(body.get('device_id') or '').strip()
+        device_msg = ''
+        if device_id:
+            ok, derr, is_new = device_bind(
+                self.db, device_id, token, ip=ip,
+                platform=str(body.get('platform') or '').strip()[:16],
+                model=str(body.get('model') or '').strip()[:48],
+                app_version=str(body.get('app_version') or '').strip()[:24])
+            if not ok:
+                # 设备超限：不发放 token，但密钥已经核销过了 —— 这有点尴尬。
+                # 处理办法是明确告诉用户「码已用掉，但设备满了」，
+                # 让他找管理员加设备，而不是让他以为激活失败可以再试一次
+                # （再试会撞上「密钥已被使用」）。
+                self.send_json({'ok': False, 'error': derr, 'device_limit': True,
+                                'code_consumed': True}, 409)
+                return
+            device_msg = '新设备已登记' if is_new else ''
+
         self.db.x('UPDATE invites SET used_by_ip = ?, used_at = ? WHERE id = ?',
                   (ip, now(), inv['id']))
         rate_ok(ip, 'user')
-        self.db.log('activate_ok', ip, f'invite={inv["id"]}')
+        self.db.log('activate_ok', ip,
+                    'invite=%s device=%s' % (inv['id'], device_id[:12] if device_id else '-'))
 
         self.send_json({
             'ok': True,
@@ -6553,6 +6794,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             'expiresAt': exp,
             'daysLeft': days_left,
             'portalUrl': 'http://' + (CFG['public_host'] or '10.13.24.1') + ':' + str(CFG['port']),
+            'deviceCount': device_count(self.db, token),
+            'deviceMax': MAX_DEVICES_PER_TOKEN,
+            'deviceMessage': device_msg,
         })
 
     def handle_proxy_mjs(self):
