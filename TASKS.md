@@ -4,17 +4,58 @@
 > 或者会话一续，待办就没了 —— 已经因此丢过好几次。所以待办**以这个文件为准**，
 > 每次动手前后都更新它。`todo_write` 只当当前这一轮的临时视图用。
 
-最后更新：2026-10-29 20:15
+最后更新：2026-10-29 20:45
 
 ---
 
 ## 正在做
 
-- [ ] **1.0.47 待用户安装验证**：UDP 延迟修复已提交并打好包
-  （`dist/Ferry-Setup-1.0.47.exe`），需要用户装上后打一局 CS2 看实际延迟
-  - 1.0.46 → 1.0.47 只改了一处：健康检查 30s → 10s，缩短禁网切换的空白期
-  - 2026-10-29 17:10 用户确认：「先验证1.0.46，手机我不小心带出门了，我回宿舍再继续弄手机」
-  - 下一步等用户回报 CS2 实测 ping
+- [ ] **CS2 延迟实测（等用户打一局报 ping）**：1.0.47 已装上并上传门户
+  - 2026-10-29 20:41 已确认本机装的是 **1.0.47.0**（注册表 DisplayVersion=1.0.47）
+  - 门户 `/version.json` 已报 `1.0.47`，`dist/` 里两个文件都传了
+    （安装包 17728206 B + 客户端本体 194048 B/1.0.47.0）
+  - 自动更新链路已用 `渡口助手.exe /update` 自检验证通过
+  - **下一步：用户打一局 CS2，回报游戏内 ping**
+
+## 已解决（2026-10-29 20:41）
+
+- [x] **1.0.47 装不上（「无法创建目录 %TEMP%\is-XXXX.tmp，错误 5」）**
+  - **根因：安装包放在中文路径下运行**。`E:\肥鱼不乐园\borrow-net\dist\` 含中文，
+    而 Inno 的 SetupLdr 在「从非 %TEMP% 路径启动」时，要先把自己复制到 %TEMP%
+    再带 `/SL5` 重跑 —— 这一步在中文源路径下失败，报错却指向 `%TEMP%\is-*.tmp`，
+    **报错信息指向了错误的位置**，导致一开始误判成权限/杀软问题。
+  - **证据**：对照 10-26 那次成功安装的日志
+    （`%TEMP%\ferry-inno.log`）：
+    ```
+    成功(10-26): Original Setup EXE: %TEMP%\Ferry-Setup-0.9.14.exe
+                 Created temporary directory: %TEMP%\is-X53JK277XJ.tmp  ✅
+    失败(今天):  直接从 E:\肥鱼不乐园\...\dist\ 运行 → 日志一行都没生成
+    成功(复现):  复制到 %TEMP% 再运行
+                 Created temporary directory: %TEMP%\is-2YJ5BEU1NT.tmp  ✅
+                 Installation process succeeded.
+    ```
+  - **排除的假设**（都实测过，别再重查）：%TEMP% ACL 正常、可建目录可复制可执行、
+    磁盘 9.8G 充足、无 Zone.Identifier、Smart App Control 关闭、无 AppLocker、
+    火绒（HipsDaemon 在跑但**不是它拦的**——手动从 Temp 执行 exe 完全正常）。
+  - **结论**：历史安装包都是从门户下载到 `%TEMP%` 再运行的，所以一直没暴露；
+    从仓库目录直接双击才会中招。**自动更新不受影响**（它本来就下载到本地再执行）。
+  - 复现/安装脚本：`install-1.0.47.cmd`（先 `copy` 到 `%TEMP%` 再装）
+
+- [x] **网卡省电休眠**：`IpsEn` 1 → 0（Realtek 8852BE，注册表
+  `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-...}\0007`），已生效。
+  脚本 `tools/fix-nic-powersave.ps1`（带 `-WhatIf` / `-Revert`）。
+  - ⚠ **但它不是卡顿的根因**：改完复测，连续 p50 反而到 75ms、120ms 间隔 52ms，
+    两组都抖。先前「省电模式是根因」的结论**被自己的数据推翻**。
+  - 仍在查的方向：WiFi 信道干扰（SSID `GDPZ-student-5G`，信道 40）或上游拥塞。
+
+## 已确认的排查事实（免得重查）
+
+- **本机 adb 在 `C:/tmp/ptools/platform-tools/adb.exe`**（8.2 MB，2026-10-29）。
+  `C:\Windows\System32\adb.exe` 是老版本 1.0.26（2010 年），daemon 起不来，别用。
+  这个路径写在 `tools/test-android-phone.sh` 第 24 行的 `PT_ADB` 默认值里。
+- **装了什么安全软件**：火绒安全软件 6.0.12.3（`D:\Huorong\Sysdiag\bin`，
+  HipsDaemon + HipsTray 在跑）。Windows Defender 服务是 Stopped。
+  另有 McAfee 注册在 WSC 里但没进程。
 
 ## 已上线（2026-10-29 20:06 部署到 pcs，服务 FerryPortal 运行正常）
 
