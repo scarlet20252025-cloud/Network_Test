@@ -412,37 +412,45 @@ def device_count(db, token):
 def device_bind(db, device_id, token, ip='', platform='', model='', app_version=''):
     """把设备绑到账号上，顺便刷新心跳。
 
-    返回 (ok, error, is_new)。
+    返回 (ok, error, is_new, reason)。reason 给调用方区分拒绝原因：
+      · 'limit'    —— 新设备，但该账号的启用名额已满
+      · 'disabled' —— 这台设备被管理员停用了
 
     已经绑过的设备直接更新（幂等），所以重装 App、重连、换网络都不会报错。
-    只有「新设备且该账号已满」才拒绝。
+    只有「新设备且该账号已满」和「本设备被停用」才拒绝。
     """
     if not device_ok_id(device_id):
-        return False, '设备标识无效', False
+        return False, '设备标识无效', False, 'invalid'
 
     row = db.q1('SELECT * FROM devices WHERE device_id = ?', (device_id,))
     if row:
+        # 被停用的设备不能靠「重新激活」自己复活。
+        # 2026-10-29 加这一条之前，下面的 UPDATE 里写着 `enabled = 1`，
+        # 于是管理面板的「踢下线」等于没用 —— App 下次启动（/api/status 也走
+        # 这条路）就把它写回了启用。要恢复只能由管理员在面板上点「恢复」。
+        if not row['enabled']:
+            return False, '这台设备已被管理员停用，请联系管理员', False, 'disabled'
         # 已存在：更新心跳与元信息。注意 token 可能变（用户换了另一个码激活），
         # 这时要按新 token 重新算一次配额，否则能绕过上限。
         if row['token'] != token:
             if device_count(db, token) >= MAX_DEVICES_PER_TOKEN:
                 return False, ('这个授权已绑定 %d 台设备（上限 %d 台）。'
                                '要加新设备请先在其它设备上退出，或找管理员。'
-                               % (MAX_DEVICES_PER_TOKEN, MAX_DEVICES_PER_TOKEN)), False
+                               % (MAX_DEVICES_PER_TOKEN, MAX_DEVICES_PER_TOKEN)), False, 'limit'
         db.x('UPDATE devices SET token = ?, platform = ?, model = ?, app_version = ?, '
-             'last_seen = ?, last_ip = ?, enabled = 1 WHERE device_id = ?',
+             'last_seen = ?, last_ip = ? WHERE device_id = ?',
              (token, platform, model, app_version, now(), ip, device_id))
-        return True, '', False
+        return True, '', False, ''
 
     if device_count(db, token) >= MAX_DEVICES_PER_TOKEN:
         return False, ('这个授权已绑定 %d 台设备（上限 %d 台）。'
                        '要加新设备请先在其它设备上退出，或找管理员。'
-                       % (MAX_DEVICES_PER_TOKEN, MAX_DEVICES_PER_TOKEN)), False
+                       % (MAX_DEVICES_PER_TOKEN, MAX_DEVICES_PER_TOKEN)), False, 'limit'
 
     db.x('INSERT INTO devices (device_id, token, platform, model, app_version, '
          'created_at, last_seen, last_ip, enabled) VALUES (?,?,?,?,?,?,?,?,1)',
          (device_id, token, platform, model, app_version, now(), now(), ip))
-    return True, '', True
+    return True, '', True, ''
 
 
 def device_touch(db, device_id, token, ip=''):
@@ -4695,9 +4703,16 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf='',
 
     # ══════════ 概览 ══════════
     if section == 'overview':
+        # csrf_in 必须注入。概览页的 JS（限速卡的「应用」按钮、
+        # 保存备注用的 csrfToken()）都是靠
+        # document.querySelector('input[name="csrf"]') 取 token 的，
+        # 而概览页此前一个隐藏域都没有 —— 取到空串 → 服务端统一 CSRF 校验
+        # 回 403 → 前端 .catch() 把错误吞掉，表现就是「点了没反应」。
+        # 2026-10-29 实测：空 csrf POST /api/admin/net 得 403，
+        # 换成页面里的 token 得 200。
         return admin_shell('overview', '概览',
             '实时流量、出口载荷与多维统计',
-            msgbox + ADMIN_UI_HTML)
+            msgbox + csrf_in + ADMIN_UI_HTML)
 
     # ══════════ 密钥 ══════════
     if section == 'keys':
@@ -4762,6 +4777,47 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf='',
     # ══════════ 设备 ══════════
     if section == 'users':
         cli = db.q('SELECT * FROM clients ORDER BY created_at DESC')
+
+        # 设备清单（2026-10-29 授权改成「按设备」后新增）。
+        #
+        # 为什么必须单独列出来：clients 表的主键是 ip，同一局域网里手机和电脑
+        # 走同一个 NAT 出口时 IP 一样 —— 只看 clients 根本看不出「这个账号
+        # 绑了几台设备、分别是哪台」。而这恰恰是设备授权上线后管理员最需要
+        # 知道的事（谁占了 3 个名额？要不要踢掉一台？）。
+        dev_rows = db.q('SELECT d.*, c.ip AS account_ip, c.expires_at AS acc_exp '
+                        'FROM devices d LEFT JOIN clients c ON c.token = d.token '
+                        'ORDER BY d.last_seen DESC')
+        dev_html = ''
+        for r in dev_rows:
+            # 用 last_seen 判断在线：5 分钟内有心跳算在线
+            online = (int(r['last_seen'] or 0) > 0) and (now() - int(r['last_seen']) <= 300)
+            dot = '<span class="dot on"></span><span class="stx">在线</span>' if online \
+                  else '<span class="dot off"></span><span class="stx">离线</span>'
+            name = (r['model'] or '未知机型')
+            plat = (r['platform'] or '-')
+            ver = (r['app_version'] or '-')
+            did = html.escape(r['device_id'] or '')
+            # 优先用设备自己上报的 last_ip：clients.ip 是「这台机器当前的出口 IP」，
+            # 设备换了网络（宿舍→教室）之后就不代表它了，而 last_ip 是它自己报的。
+            seen_ip = r['last_ip'] or r['account_ip'] or '—'
+            dev_html += f"""<tr>
+  <td class="st">{dot}</td>
+  <td>{html.escape(name)}</td>
+  <td class="muted">{html.escape(plat)}</td>
+  <td class="muted">{html.escape(ver)}</td>
+  <td class="mono muted">{html.escape(seen_ip)}</td>
+  <td class="mono muted" title="{did}">{html.escape((r['device_id'] or '')[:12])}…</td>
+  <td class="muted">{fmt_ts(r['last_seen'])}</td>
+  <td class="muted">{fmt_ts(r['acc_exp'])}</td>
+  <td>{'<span class="ok">启用</span>' if r['enabled'] else '<span class="bad">已停用</span>'}</td>
+  <td class="nowrap">
+    <form method="post" action="/admin/device" style="display:inline">{csrf_in}<input type="hidden" name="device_id" value="{did}"><input type="hidden" name="op" value="toggle"><button class="sm ghost" type="submit">{'踢下线' if r['enabled'] else '恢复'}</button></form>
+    <form method="post" action="/admin/device" style="display:inline;margin-left:4px" onsubmit="return confirm('删除这台设备？名额会被释放；它下次启动需要重新激活，同一账号下的其它设备不受影响。')">{csrf_in}<input type="hidden" name="device_id" value="{did}"><input type="hidden" name="op" value="forget"><button class="sm ghost danger" type="submit">删除</button></form>
+  </td>
+</tr>"""
+        if not dev_html:
+            dev_html = '<tr><td colspan="10" class="muted">还没有设备登记（老客户端不上报设备标识）</td></tr>'
+
         cli_rows = ''.join(f"""<tr data-ip="{html.escape(r['ip'])}" data-rank="{1000000 - i}">
   <td class="st"><span class="dot off"></span><span class="stx">离线</span></td>
   <td class="mono ipcell off" data-ip="{html.escape(r['ip'])}" title="点击查看详情">{html.escape(r['ip'])}</td>
@@ -4787,10 +4843,32 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf='',
 </tr>""" for i, r in enumerate(cli))
         body = msgbox + f"""
 <div class="card">
-  <h2 style="margin-top:0">已登录的机器</h2>
+  <h2 style="margin-top:0">已登记的设备</h2>
+  <div class="hint" style="margin:-4px 0 10px">
+    一个激活码（账号）最多绑 <b>{MAX_DEVICES_PER_TOKEN}</b> 台设备（只数「启用」的）。
+    「踢下线」把这一台标记为停用：它下次启动会被拒绝，且不能自己恢复，
+    要由管理员点「恢复」；「删除」则连记录一起移除。两者都会释放名额，
+    也都不影响同一账号下的其它设备。
+  </div>
+  <div class="listwrap" style="max-height:420px">
+  <table id="deviceTable">
+    <thead><tr>
+      <th>状态</th><th>机型</th><th>平台</th><th>版本</th>
+      <th>最近 IP</th><th>设备标识</th><th>最后活动</th><th>账号到期</th>
+      <th>授权</th><th>操作</th>
+    </tr></thead>
+    <tbody>{dev_html}</tbody>
+  </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">已登录的机器（按 IP）</h2>
   <div class="hint" style="margin:-4px 0 10px">
     在线置顶，离线靠下。速率来自客户端每 5 秒一次的心跳；
-    老版本客户端不上报心跳，速率列显示「—」，但在线状态仍准确。
+    老版本客户端不上报心跳，速率列显示「—」，但在线状态仍准确。<br>
+    注意：同一局域网里手机和电脑可能共用一个出口 IP，这里按 IP 聚合；
+    要看「具体是哪台设备」请用上面的设备表。
   </div>
   <div class="listwrap" style="max-height:640px">
   <table id="userTable">
@@ -5964,6 +6042,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_admin_toggle(form)
             elif path == '/admin/setnote':
                 self.handle_admin_setnote(form)
+            elif path == '/admin/device':
+                # 设备管理的两个动作（2026-10-29 设备授权上线后新增）：
+                #   toggle —— 停用/恢复某台设备（踢下线）
+                #   forget —— 从表里删掉一台设备（腾出名额）
+                self.handle_admin_device(form)
             elif path == '/api/admin/net':
                 self.handle_api_admin_net(form)
             elif path == '/api/admin/feedback':
@@ -6575,11 +6658,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 否则用户会以为自己在用，实际下一台设备把旧的顶掉了。
         devices_n = 0
         if device_id:
-            ok, err, _is_new = device_bind(
+            ok, err, _is_new, reason = device_bind(
                 self.db, device_id, token, ip=ip,
                 platform=platform, model=model, app_version=app_version)
             if not ok:
-                self.send_json({'ok': False, 'error': err, 'device_limit': True}, 409)
+                # 两种拒绝必须分开：设备满了 vs 这台被管理员停用。
+                # 以前一律带 device_limit=True，客户端就会提示「设备数已达上限」——
+                # 而用户看到的实际是「一个设备都没超却用不了」，完全没法自助。
+                self.send_json({'ok': False, 'error': err,
+                                'device_limit': reason == 'limit',
+                                'device_disabled': reason == 'disabled'}, 409)
                 return
             devices_n = device_count(self.db, token)
         else:
@@ -6623,8 +6711,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         dev = self.db.q1('SELECT * FROM devices WHERE device_id = ?', (device_id,))
-        if not dev or not dev['enabled']:
+        if not dev:
             self.send_json({'ok': False, 'error': '这台设备没有登记记录'}, 404)
+            return
+        if not dev['enabled']:
+            # 「被停用」和「没登记过」要分开说。混成一句「没有登记记录」，
+            # 用户会以为是恢复功能坏了，反复重装 App —— 实际是管理员停的。
+            self.send_json({'ok': False, 'error': '这台设备已被管理员停用，请联系管理员',
+                            'device_disabled': True}, 403)
             return
 
         last_ip = (dev['last_ip'] or '').strip()
@@ -6763,18 +6857,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         device_id = str(body.get('device_id') or '').strip()
         device_msg = ''
         if device_id:
-            ok, derr, is_new = device_bind(
+            ok, derr, is_new, areason = device_bind(
                 self.db, device_id, token, ip=ip,
                 platform=str(body.get('platform') or '').strip()[:16],
                 model=str(body.get('model') or '').strip()[:48],
                 app_version=str(body.get('app_version') or '').strip()[:24])
             if not ok:
-                # 设备超限：不发放 token，但密钥已经核销过了 —— 这有点尴尬。
-                # 处理办法是明确告诉用户「码已用掉，但设备满了」，
-                # 让他找管理员加设备，而不是让他以为激活失败可以再试一次
-                # （再试会撞上「密钥已被使用」）。
-                self.send_json({'ok': False, 'error': derr, 'device_limit': True,
-                                'code_consumed': True}, 409)
+                # 不发放 token。密钥的核销（UPDATE invites）在下面才执行，
+                # 所以这里失败并没有吃掉用户的码 —— 60 秒内用同一个码重试仍然有效
+                # （RETRY_WINDOW_SEC，见上面）。原来的 code_consumed=True 与代码
+                # 实际行为相反，会把用户误导去要新密钥，这里改正。
+                # 「设备满了」和「这台被停用」也要分开报，原因同 /api/status。
+                self.send_json({'ok': False, 'error': derr,
+                                'device_limit': areason == 'limit',
+                                'device_disabled': areason == 'disabled',
+                                'code_consumed': False}, 409)
                 return
             device_msg = '新设备已登记' if is_new else ''
 
@@ -7404,6 +7501,71 @@ class Handler(http.server.BaseHTTPRequestHandler):
             'counts': counts,
             'list': items,
         })
+
+    def handle_admin_device(self, form):
+        """设备管理：停用/恢复（toggle）或删除（forget）。
+
+        为什么需要：2026-10-29 授权改成「按设备」后，一个激活码最多绑
+        MAX_DEVICES_PER_TOKEN 台。用户在别的机器上用满了名额、或者手机丢了，
+        管理员必须能把某台踢下线/腾名额 —— 否则只能改库，运维成本太高。
+
+        两个动作的区别（**两个都会释放名额** —— device_count 只统计 enabled=1 的行）：
+          · toggle 置 enabled=0：记录还在，面板上一眼能看出「这台被停过」，
+            点「恢复」就能放回来。适合「临时不让它用」。
+          · forget 直接删行：记录消失，该设备下次启动会被当成一台全新设备重新登记。
+            适合「换机了 / 这台我不要了」。
+
+        被停用的设备不会自己复活：device_bind 见到 enabled=0 直接拒绝，
+        所以「踢下线」是真的踢得掉（App 下次启动会拿到「已被管理员停用」）。
+        要放回来只能由管理员在这里点「恢复」。
+
+        安全：只按 device_id 操作，不碰 token —— 踢一台不会影响同账号的其它设备。
+        """
+        if not self._require_admin():
+            return
+
+        device_id = (form.get('device_id') or '').strip()
+        op = (form.get('op') or 'toggle').strip()
+
+        if op not in ('toggle', 'forget'):
+            # 白名单。以前是「不是 forget 就按 toggle 处理」，手滑传个别的值
+            # 会静默把设备停掉 —— 这种默认值不能猜。
+            self.send_html(admin_page(
+                self.db, err='未知的设备操作',
+                csrf=csrf_set('admin|' + self.client_ip())), 400)
+            return
+
+        if not device_id:
+            self.send_html(admin_page(
+                self.db, err='缺少设备标识',
+                csrf=csrf_set('admin|' + self.client_ip())), 400)
+            return
+
+        dev = self.db.q1('SELECT * FROM devices WHERE device_id = ?', (device_id,))
+        if not dev:
+            self.send_html(admin_page(
+                self.db, err='这台设备不存在（可能已被删除）',
+                csrf=csrf_set('admin|' + self.client_ip())), 404)
+            return
+
+        label = (dev['model'] or dev['device_id'][:12])
+        if op == 'forget':
+            self.db.x('DELETE FROM devices WHERE device_id = ?', (device_id,))
+            self.db.log('device_forget', self.client_ip(),
+                        'device=%s model=%s' % (device_id[:12], label))
+            msgtext = f'已删除设备 {label}，名额已释放'
+        else:
+            newval = 0 if dev['enabled'] else 1
+            self.db.x('UPDATE devices SET enabled = ? WHERE device_id = ?',
+                      (newval, device_id))
+            self.db.log('device_toggle', self.client_ip(),
+                        'device=%s enabled=%d' % (device_id[:12], newval))
+            msgtext = (f'{label} 已{"停用" if newval == 0 else "恢复"}')
+
+        self.send_html(admin_page(
+            self.db, msg=msgtext,
+            csrf=csrf_set('admin|' + self.client_ip()),
+            section='users'))
 
     def handle_admin_setnote(self, form):
         """改某台机器的备注。

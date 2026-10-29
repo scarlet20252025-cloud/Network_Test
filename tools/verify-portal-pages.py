@@ -66,12 +66,15 @@ check('场景区 3 张卡', '这些时候最有用' in home
 check('功能网格 6 张卡', home.count('class="fcard"') == 6,
       '(%d)' % home.count('class="fcard"'))
 check('三步', home.count('class="step2"') == 3)
-check('FAQ 9 条', home.count('<details>') == 9,
+check('FAQ 10 条', home.count('<details>') == 10,   # 2026-10 加了一条，脚本一直没跟上
       '(%d)' % home.count('<details>'))
 check('CTA 前往下载', '前往下载' in home and '/download-page' in home)
 check('导航三项', home.count('class="nv') == 3)
 check('正在借网数字', re.search(r'<b>\d+</b><span>台正在借网</span>', home) is not None)
-check('下载内容已搬走', '历史版本' not in home and 'SmartScreen' not in home)
+# 只看可见内容：页面 <style> 里的注释解释了下载页为什么那样排版，里面出现
+# "SmartScreen" 并不代表内容又搬回首页了（按原文断言会永远假红）。
+_home_vis = re.sub(r'/\*.*?\*/', '', home, flags=re.S)
+check('下载内容已搬走', '历史版本' not in _home_vis and 'SmartScreen' not in _home_vis)
 check('无外部资源（零 CDN）',
       'http://' not in re.sub(r'https?://(?:127\.|10\.13)', '', home).replace('http://', '', 0)
       or True)   # 只做提示，下面单独查
@@ -152,7 +155,12 @@ print()
 print('=== 8. 改状态 ===')
 # csrf 必须从 /admin 页面抓（api 路径没有表单），并显式传进去 ——
 # post() 的自动抓取只对 /feedback 这种「GET 同一个路径有表单」的场景有效。
-csrf2 = re.search(r'name="csrf" value="([^"]+)"', get('/admin')).group(1)
+#
+# 注意：**不能**从概览页 /admin 抓 —— 它的 csrf 只在 JS 里用
+# `document.querySelector('input[name="csrf"]')` 找，页面本身没有那个隐藏域，
+# 所以正则拿到 None（2026-10-29 实测；这也是这个脚本第 8 节一直报
+# AttributeError 的原因）。改用 /admin/keys，那里有真实表单。
+csrf2 = re.search(r'name="csrf" value="([^"]+)"', get('/admin/keys')).group(1)
 fid = item.get('id')
 r4 = post('/api/admin/feedback', {'id': fid, 'status': 2, 'csrf': csrf2},
           headers={'X-Requested-With': 'fetch'})
@@ -173,14 +181,17 @@ except urllib.error.HTTPError as e:
     check('未登录被拒', e.code == 403, 'HTTP %d' % e.code)
 
 print()
-print('=== 10. 管理面板页面有反馈卡片 ===')
-admin2 = get('/admin')
-check('反馈卡片', '意见反馈' in admin2 and 'fbBody' in admin2)
-check('同源折叠（按钮 + 子行类）',
-      'fb-fold' in admin2 and 'fb-more' in admin2)
-check('筛选按钮 5 个', admin2.count('class="sm ghost fb-filter"') == 5,
-      '(%d)' % admin2.count('class="sm ghost fb-filter"'))
-check('反馈 JS', 'function loadFeedback' in admin2 and 'function bindFeedback' in admin2)
+print('=== 10. 反馈页 /admin/feedback（2026-10 从概览页拆成独立页）===')
+# 这一节原来按「概览页里的一张卡」断言（/admin + fbBody）。页面拆出去、
+# 容器改名成 fbCards 之后它就一直红着 —— 是脚本没跟上，不是页面坏了。
+admin2 = get('/admin')      # 第 11 节还要用
+fbd = get('/admin/feedback')
+_fbtn = len(re.findall(r'class="sm ghost fb-filter[^"]*" data-st=', fbd))
+check('反馈页标题', '意见反馈' in fbd)
+check('反馈容器 fbCards', 'id="fbCards"' in fbd)
+check('同源折叠（按钮 + 子行类）', 'fb-fold' in fbd and 'fb-more' in fbd)
+check('筛选按钮 5 个', _fbtn == 5, '(%d)' % _fbtn)
+check('反馈 JS', 'function loadFeedback' in fbd and 'function bindFeedback' in fbd)
 
 print()
 print('=== 11. 旧路由仍可用 ===')

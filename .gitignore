@@ -28,6 +28,8 @@ portal/out.log
 portal/err.log
 portal/*.db
 portal/*.db-*
+# 门户库的本地备份（部署服务端时自动生成，别入库）
+portal/backup/
 .ferry/
 portal/ck*.txt
 __pycache__/
