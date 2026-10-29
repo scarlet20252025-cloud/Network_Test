@@ -4,19 +4,56 @@
 > 或者会话一续，待办就没了 —— 已经因此丢过好几次。所以待办**以这个文件为准**，
 > 每次动手前后都更新它。`todo_write` 只当当前这一轮的临时视图用。
 
-最后更新：2026-10-30 01:35
+最后更新：2026-10-30 02:15
 
 ---
 
 ## 正在做
 
-- [ ] **CS2 延迟实测（用户正在打，等报 ping）**：1.0.47 已装上并上传门户
-  - 2026-10-29 20:41 已确认本机装的是 **1.0.47.0**（注册表 DisplayVersion=1.0.47）
-  - 门户 `/version.json` 已报 `1.0.47`，`dist/` 里两个文件都传了
-    （安装包 17728206 B + 客户端本体 194048 B/1.0.47.0）
-  - 自动更新链路已用 `渡口助手.exe /update` 自检验证通过
-  - 21:00 确认 `cs2` 正在运行（PID 6124），用户在场实测中
-  - **注意：游戏在跑时测网络延迟，数据会被游戏流量污染，别当基线用**
+- [ ] **Android「通道通但上不了网」—— 根因已定位，等装机验证**
+  - **根因：`remotePort = 1099`，而 pcs 上只有 1080 在监听**
+    （`netstat` 确认 1099 无任何进程监听）
+  - 证据：`hev.log` 里 `io timeout` 出现 **16982 次**，形态是无限循环：
+    ```
+    io timeout
+    socks5 client connect
+    socks5 session connect
+    socks5 client tcp -> [xxx]:443
+    ```
+    hev 不知道上游连不上，只会一直重连，每次都等满 `connect-timeout: 8000`。
+  - 已做：
+    1. 手机 `shared_prefs/ferry.xml` 的 `remotePort` 已改回 **1080**
+    2. 手机 `files/hev/tunnel.yaml` 的 `port` 手工改成 **1080**（App 只在点「开始借网」时重写它）
+    3. 客户端加了 `probeUpstream()`：启动隧道前先 TCP 探测上游，
+       连不上就**明确报错并停止**，不建 TUN（1.0.51 已编译进 APK）
+  - **卡在哪**：vivo 拒绝 adb 安装
+    （`INSTALL_FAILED_ABORTED: User rejected permissions`），
+    即使屏幕已唤醒、`verifier_verify_adb_installs=0` 也一样。
+    **需要用户在手机上手动允许**：
+    设置 → 系统管理 → 开发者选项 → **USB 安装**（打开）
+    或直接手动安装 `dist/ferry-debug.apk`
+
+## 已修（2026-10-30 凌晨）
+
+- [x] **Wi-Fi Direct 虚拟网卡抢射频**（Windows 端，已修）
+  - 热点开发时启用、关热点后没清理的
+    `Microsoft Wi-Fi Direct Virtual Adapter #2`（`本地连接* 2`）一直在 Up 状态，
+    和物理网卡共用射频（MAC 只差首字节），持续做 Wi-Fi Direct 探测
+  - 禁用后 64Hz p50 **61.1ms → 4.6ms**，max 76.4 → 15.3ms，慢包 50% → 0%
+  - 1.0.51 里 `Hotspot.Stop()` 会自动禁用它，避免复发
+- [x] **热点功能上锁**（1.0.51）
+  - `HasWiredUplink()`：必须 Ethernet + 非虚拟网卡 + 有 IPv4 和默认网关
+  - 三处调用：`Start()` 硬闸 / `OnHotspotToggled()` 弹框 / `RefreshUi()` 置灰
+  - `(hsOn || wired)` 保证热点已开时还能关
+- [x] **中继 UDP 建关联刷盘拖垮转发**（服务端，已部署）
+  - 每建一条关联就 `print(flush=True)`，单线程 asyncio 停摆
+  - 改成每 30 秒汇总一行，日志增长降 65%
+- [x] **中继 UDP 目标的 DNS 同步解析**（服务端，已部署）
+  - `sendto(payload, (host, port))` 传域名时 asyncio 同步调 `getaddrinfo`
+  - 实测：冷域名 **38.90ms** vs 传 IP **0.38ms**
+  - 中继单线程 → 38ms 全局停摆 → 所有关联排队
+  - 修法：DNS 缓存（TTL 300s）+ 线程池异步解析 + 未命中时丢该包
+  - 这解释用户描述的「延迟从 10ms 爬到 50-70ms 再降下来」
 
 ## 手机侧（2026-10-29 21:00）
 
