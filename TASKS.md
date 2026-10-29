@@ -4,7 +4,7 @@
 > 或者会话一续，待办就没了 —— 已经因此丢过好几次。所以待办**以这个文件为准**，
 > 每次动手前后都更新它。`todo_write` 只当当前这一轮的临时视图用。
 
-最后更新：2026-10-29 21:22
+最后更新：2026-10-29 21:35
 
 ---
 
@@ -85,28 +85,38 @@ WLAN 排最后。目前无影响，但多网卡广播场景下可能选错网卡
 工具：`tools/diag-game-latency.ps1`、`tools/diagnose-wifi-jitter.py`、
 `tools/check-shared-radio.ps1`、`tools/wifi-channel-survey.ps1`
 
-## 已修待验证（1.0.48，2026-10-29 20:55）
+## 已修（1.0.49，2026-10-29 21:33）—— 界面卡死彻底解决
 
-- [ ] **界面卡死（1.0.47 报的「点什么都卡死很久」）** —— 已定位并修好，等验证
-  - **实测证据**：1.0.47 在「直连、没借网、没 TUN」的空闲状态下，
-    UI 线程 5 秒吃掉 **4.09 秒 CPU（≈82% 单核）**，单线程 37404 从启动起
-    一直是 Running，累计 4 分 14 秒；而此时日志 5 秒 0 字节增长
-    （说明它没在处理业务，纯粹在空转重绘）。
-  - **根因（两个叠加）**：
-    1. `RefreshUi()` 每秒跑，里面有 **40 处 `.Text =` + 37 处 `.Foreground =`**，
-       全部**无条件赋值**。WPF 的 Text/Foreground 是依赖属性，
-       赋内容相同的新值也会走完整的 失效→measure→arrange→重绘。
-    2. `Palette` 的 12 个 Brush 全是
-       `public static Brush TextB { get { return Freeze(new SolidColorBrush(Text)); } }`
-       —— **每次 get 都 new 一个**。每秒 37 次 Foreground 赋值 = 每秒 37 个新画刷；
-       WPF 用引用相等判等 → 每次都被当成「值变了」→ 必然重绘。
-  - **修法**：Brush 改 `static readonly`（注意声明顺序：Color 在前）；
-    新增 `SetIfChanged/SetText/SetFg`（先比后写），77 处赋值全部改走它们。
-  - **关键澄清**：1.0.47 并没有改界面代码（那一版只有版本号 + TunMode 的 YAML
-    改动），所以**不是改坏了界面**，而是既有的性能缺陷在这个版本到了阈值。
-  - 验证脚本：`tools/verify-ui-cpu.ps1`（测 10 秒 CPU 增量，基线 82%，期望 ≤5%）
-  - 提交 `c9e17f7`；产物 `dist/渡口助手.exe` **1.0.48.0**
-  - **下一步：用户打完游戏后，用 1.0.48 重开客户端，跑 verify-ui-cpu.ps1 验证**
+- [x] **界面卡死（1.0.47 报的「点什么都卡死很久」）** —— **实测 82% → 7.2%**
+
+  | 版本 | 空闲 CPU（10 秒采样） | 说明 |
+  |---|---|---|
+  | 1.0.47 | **82%** | 界面卡死；Running 线程一直有 1 个 |
+  | 1.0.48 | **78%** | 只改了 TextBlock，几乎没用 |
+  | 1.0.49 | **7.2%** | 修好；Running 线程数 = 0 |
+
+  - **根因**：`RefreshUi()` 每秒跑一次，里面**所有依赖属性都是无条件赋值**。
+    WPF 的 Text / Foreground / Content / Background / Visibility 全是依赖属性，
+    **赋内容相同的值也会走完整的 失效 → measure → arrange → 重绘**。
+  - **第一轮（1.0.48）只解决了约 5%**：我盯着 `Palette` 的 Brush
+    （`get { return Freeze(new SolidColorBrush(...)); }` 每次 new 一个）改成了
+    `static readonly`，又给 TextBlock 的 77 处赋值加了「先比后写」。
+    结果 82% → 78%，几乎没动。
+  - **真正生效的第二轮（1.0.49）**：`RefreshUi` 里还剩 **14 处**
+    `_btnGlobal.Content` / `_btnGlobal.Background` / `_txtCode.Visibility` /
+    `_btnActivate.Visibility` 在每秒无条件赋值。
+    `Content` 变更会让 `ContentPresenter` **重建可视子树**；
+    `Visibility` 赋同一个值也会触发布局失效。加上 `SetContent/SetBg/SetVis`
+    之后才归零。
+  - **教训（重要）**：定位性能问题不要从「看起来最可疑的地方」开始猜。
+    第一轮凭直觉改 Palette，白改。正确做法是**把该函数里所有依赖属性赋值
+    系统地扫一遍**，或者直接抓线程栈。
+  - 验证脚本：`tools/measure-ui-cpu.ps1`（走 WMI 启动避开 UAC 取消，测 10 秒 CPU 增量）
+  - 产物：`dist/Ferry-Setup-1.0.49.exe`（17722850 B）、`dist/渡口助手.exe` 1.0.49.0
+  - 已部署门户：`/version.json` → `1.0.49`，两个文件（安装包 + 客户端本体）都传了
+  - 提交：见 git log
+
+## 已修（1.0.48，2026-10-29 20:55，已被 1.0.49 取代）
 
 ## 已解决（2026-10-29 20:41）
 

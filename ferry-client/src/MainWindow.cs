@@ -1439,6 +1439,36 @@ namespace Ferry
             SetIfChanged(tb, System.Windows.Controls.TextBlock.ForegroundProperty, val);
         }
 
+        /// <summary>
+        /// 按钮的 Content / Background 同样要「值变了才写」。
+        ///
+        /// 第一轮只处理了 TextBlock，实测 CPU 从 82% 只降到 78% ——
+        /// 因为 RefreshUi 每秒还在重设 _btnGlobal.Content、_btnGlobal.Background，
+        /// 以及 _txtCode.Visibility / _btnActivate.Visibility。
+        /// ContentPresenter 会为不同 Content 重建可视树；
+        /// Visibility 即使赋同一个值，WPF 也会走一遍布局失效。
+        /// </summary>
+        static void SetContent(System.Windows.Controls.ContentControl c, object val)
+        {
+            if (c == null) return;
+            if (Equals(c.Content, val)) return;
+            c.Content = val;
+        }
+
+        static void SetBg(System.Windows.Controls.Control c, System.Windows.Media.Brush val)
+        {
+            if (c == null) return;
+            if (Equals(c.Background, val)) return;
+            c.Background = val;
+        }
+
+        static void SetVis(System.Windows.UIElement el, System.Windows.Visibility val)
+        {
+            if (el == null) return;
+            if (el.Visibility == val) return;
+            el.Visibility = val;
+        }
+
         void RefreshUi()
         {
             bool proxyOn = FerryCore.ProxyEnabled();
@@ -1488,8 +1518,8 @@ namespace Ferry
             {
                 SetText(_lblActTitle, "已激活");
                 SetFg(_lblActTitle, Palette.GoodB);
-                _txtCode.Visibility = Visibility.Collapsed;
-                _btnActivate.Visibility = Visibility.Collapsed;
+                SetVis(_txtCode, Visibility.Collapsed);
+                SetVis(_btnActivate, Visibility.Collapsed);
                 if (_lic.Expired) { SetText(_lblActHint, "授权已到期 —— 请向管理员续期"); SetFg(_lblActHint, Palette.BadB); }
                 else if (_lic.Suspended) { SetText(_lblActHint, "账号已停用 —— 请联系管理员"); SetFg(_lblActHint, Palette.BadB); }
                 else if (_lic.ExpiresAt > 0)
@@ -1505,8 +1535,8 @@ namespace Ferry
             {
                 SetText(_lblActTitle, "输入密钥激活");
                 SetFg(_lblActTitle, Palette.TextB);
-                _txtCode.Visibility = Visibility.Visible;
-                _btnActivate.Visibility = Visibility.Visible;
+                SetVis(_txtCode, Visibility.Visible);
+                SetVis(_btnActivate, Visibility.Visible);
                 SetText(_lblActHint, "管理员给你的 8 位字母数字，一个密钥只能用一次。");
                 SetFg(_lblActHint, Palette.MutedB);
                 SetText(_lblAcct, "未激活");
@@ -1611,16 +1641,16 @@ namespace Ferry
                 // 真的在跑 —— 这是唯一能说「已开启」的情况
                 SetText(_rowTun, "全局模式    已开启（UDP / 游戏都走渡口）");
                 SetFg(_rowTun, Palette.GoodB);
-                _btnGlobal.Content = "关闭全局模式";
-                _btnGlobal.Background = Palette.IdleB;
+                SetContent(_btnGlobal, "关闭全局模式");
+                SetBg(_btnGlobal, Palette.IdleB);
             }
             else if (wantTun && !isAdmin)
             {
                 // 想要，但没权限 —— 这时才该说「待授权」
                 SetText(_rowTun, "全局模式    已勾选 · 需管理员授权");
                 SetFg(_rowTun, Palette.WarnB);
-                _btnGlobal.Content = "去授权";
-                _btnGlobal.Background = Palette.AccentB;
+                SetContent(_btnGlobal, "去授权");
+                SetBg(_btnGlobal, Palette.AccentB);
             }
             else if (wantTun && runtimeUp && !tunUp)
             {
@@ -1644,8 +1674,8 @@ namespace Ferry
                     SetText(_rowTun, "全局模式    正在启用…");
                     SetFg(_rowTun, Palette.MutedB);
                 }
-                _btnGlobal.Content = "关闭全局模式";
-                _btnGlobal.Background = Palette.IdleB;
+                SetContent(_btnGlobal, "关闭全局模式");
+                SetBg(_btnGlobal, Palette.IdleB);
             }
             else if (wantTun)
             {
@@ -1653,16 +1683,16 @@ namespace Ferry
                 // 是「已就绪，借网时自动生效」。
                 SetText(_rowTun, "全局模式    已开启 · 下次借网时生效");
                 SetFg(_rowTun, Palette.GoodB);
-                _btnGlobal.Content = "关闭全局模式";
-                _btnGlobal.Background = Palette.IdleB;
+                SetContent(_btnGlobal, "关闭全局模式");
+                SetBg(_btnGlobal, Palette.IdleB);
             }
             else
             {
                 // 用户明确没勾 —— 这才是真的「未开启」
                 SetText(_rowTun, "全局模式    未开启");
                 SetFg(_rowTun, Palette.MutedB);
-                _btnGlobal.Content = "开启全局模式";
-                _btnGlobal.Background = Palette.AccentB;
+                SetContent(_btnGlobal, "开启全局模式");
+                SetBg(_btnGlobal, Palette.AccentB);
             }
 
             // ══════════ 移动热点状态 ══════════
