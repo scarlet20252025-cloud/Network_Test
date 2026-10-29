@@ -187,12 +187,109 @@ PowerShell 解析器会直接报错。**改成把远端要执行的命令写成 
 
 | 任务 | 说明 |
 |---|---|
-| **M2 真机验证** | 装到手机上，点开始 → 系统 VPN 图标 → 能上网 |
+| **M2 真机验证** | 装到手机上，点开始 → 系统 VPN 图标 → 能上网（自检五步全绿）|
 | **M3 联调激活** | 用真实激活码走一遍 `POST /api/activate` |
 | **M4 禁网实测** | 校园网禁网时手机连渡口 |
 | **M5 UDP/游戏** | hev 的 `udp: 'udp'` 走远端 UDP 中继，量化延迟 |
 
-真机验证需要一台 Android 手机（或模拟器）。**注意**：
-- 模拟器上 hev 需要 x86_64 的 .so，当前只编了 arm 两个 ABI，
-  要在模拟器上测就得加 `x86_64`（改 `build-native-on-xt.ps1` 的 `$Abis`）
-- 真机走 `adb install -r dist\ferry-debug.apk`
+---
+
+## 模拟器验证：此路在 xt 上走不通（2026-10-29 实测）
+
+想用模拟器替代真机做运行时验证，结论是**这台机器跑不起来**。
+过程与证据都留着，免得下一个人重走。
+
+### 硬件与加速
+
+```
+CPU                             Intel Xeon E3-1275 V2  (Ivy Bridge, 2012)
+VirtualizationFirmwareEnabled   True
+SecondLevelAddressTranslation   True
+Hyper-V / HypervisorPlatform    均 Disabled
+```
+
+这个组合正是 AEHD 需要的（AEHD 要求 Hyper-V 关闭）。AEHD 2.2 装好之后：
+
+```
+emulator -accel-check
+→ AEHD (version 2.2) is installed and usable.
+```
+
+**加速层是好的，崩的不是它。**
+
+### 崩溃特征（穷举 6 种组合，全部同样失败）
+
+参数维度：`-gpu` = swiftshader_indirect / guest / angle_indirect / host / off / 默认；
+`-accel` = aehd（默认）/ off。
+
+统一特征：
+
+```
+emulator 父进程          ：活着（有时也崩，exit 0xC0000005 ACCESS_VIOLATION）
+:5554 / :5555            ：在监听
+qemu-system-x86_64 子进程：不存在
+adb                      ：永远 offline（或根本看不到设备）
+日志                     ：停在 "INFO | Userspace boot properties: ..." 的属性列表末尾
+```
+
+也就是：**qemu 子进程一启动就死**。`-feature -Vulkan` 救不了。
+
+唯一"活下来"的是 `-gpu off` —— 但那是假活：父进程在、端口在听、
+`adb` 是 offline，emulator 自身 CPU=0s、内存 9MB，没有 qemu 子进程。
+`-gpu off` 等于不给 SurfaceFlinger 任何渲染器，guest 起不来。
+**所以判据必须是「adb 变 device 且 sys.boot_completed=1」，不能是「进程还活着」。**
+
+### 排查过的岔路（都不是原因）
+
+- **「same AVD 已在运行」**：新建 AVD `ferry2` 也报同样的 FATAL，
+  说明这个判定是**全局**的，不在 AVD 目录里。已删的锁文件：
+  `.android/avd/<name>.avd/hardware-qemu.ini.lock`、`multiinstance.lock`、
+  `.android/debug.keystore.lock` —— 删了没用。
+- **端口残留**：清空所有 emulator / qemu 进程后，5554/5555 **仍在 LISTEN**，
+  说明被别的进程占着。存疑但不阻塞（emulator 会另选端口）。
+- **计划任务**：第一版没给 `-Principal`，默认「只使用交互方式」，
+  SSH 非交互会话下不执行；改 `-LogonType S4U` 后能执行。
+  这一条是真坑，与崩溃无关。
+
+### 结论与备选路径
+
+**假设**：emulator 37.2.12 的 x86_64 二进制需要 Ivy Bridge 没有的指令集
+（很可能是 AVX2），qemu 一执行到翻译代码就非法指令 → 0xC0000005。
+支持证据：所有加速/图形组合崩在**同一个点**，而且崩点是 qemu 刚开始
+真正跑客户机代码的位置 —— 与「配置错误」的表现不符。
+
+三条出路，按推荐度：
+
+| 路径 | 说明 |
+|---|---|
+| **真机**（推荐）| 你在用的手机就是目标设备，校园网也是真实环境。装 APK 后点「自检」即可 |
+| 降级 emulator 到 31.x | 31.x 年代的二进制对老 CPU 更宽容。要重新下、重建 AVD，不保证有效 |
+| 打开 Hyper-V/WHPX | 用 WHPX 替代 AEHD，但要**重启 xt**（远程构建机，需要你同意）|
+
+### 真机怎么测（不用命令行也行）
+
+1. 手机连上和电脑同一个网（能访问 `10.13.24.1`）
+2. 装上 `dist/ferry-debug.apk`（debug 包，可直接装）
+3. 打开 → 填激活码 → 点「激活」→ 点「开始借网」→ 系统弹 VPN 授权点确定
+4. 连上后点「自检」，把五项结果截图发我
+   （证据链：tun 网卡 198.18.0.1 → hev 在跑 → DNS 能解析 → HTTP 通 → 出口 IP 是远端）
+5. 有问题就用 `adb logcat -s FerryUi:V FerryVpn:V` 抓一段
+
+`dist/ferry-debug.apk` 的签名已用 `apksigner verify` 确认有效
+（v2 scheme，Android Debug 证书）→ 系统接受安装。
+
+### 静态对账（不需要真机就能验的部分，已通过）
+
+| 检查 | 结果 |
+|---|---|
+| APK 签名 | `Verifies`，v2 scheme，CN=Android Debug |
+| 三个 ABI 的 .so 都在包内 | arm64-v8a 355144 / armeabi-v7a 243408 / x86_64 355920 |
+| dex 里有 `Lhev/htproxy/TProxyService;` | 是 |
+| dex 里四个 native 方法 | `TProxyStartService` / `TProxyStopService` / `TProxyIsRunning` / `TProxyGetStats` 全部命中 |
+| 三个 .so 都有 `JNI_OnLoad` + 四个方法名 + 类名 | 6/6 命中（每个 ABI）|
+| 签名与 `hev-jni.c` 的 `native_methods[]` 一致 | `(Ljava/lang/String;I)Z` / `()Z` / `()Z` / `()[J` |
+| YAML 与路由 | `tools/verify-android.ps1` 全绿（22 + 36 项）|
+
+也就是说：**Java 与 native 的契约是对上的**，剩下的风险集中在运行时行为
+（路由是否真的生效、hev 能不能连上远端、UDP 通不通）—— 这些只能真机验。
+
