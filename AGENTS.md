@@ -46,6 +46,50 @@
 | `docs/分流架构.md` | **分流的三层结构、判定表、六次演进史** | 动 `Proxy.cs` 分流 / `TunMode.cs` 规则之前 |
 | `docs/` | 原理与踩坑（**先读**） | 每次踩新坑 |
 
+## 二之二、Android 版（2026-10-29 起）
+
+**热点功能已暂停推进**（`ferry-client/src/Hotspot.cs` 原样保留，没删；
+见 `docs/热点与游戏延迟-20261029.md`）。原因：手机自己就是终端，
+在 Android 上根本不需要热点 —— 这也反过来解释了 Windows 端热点为什么
+越修越别扭（单网卡 STA+AP 并发本来就不成立，见下面那条硬规则）。
+
+| 路径 | 是什么 |
+|---|---|
+| `android/DESIGN.md` | 选型与原理（读这个先） |
+| `android/PROGRESS.md` | **进度 + 踩过的坑 + 模拟器为什么跑不起来** |
+| `android/app/src/main/java/com/ferry/app/` | Java 源码（MainActivity / FerryConfig / FerryApi / SelfCheck） |
+| `android/app/src/main/java/com/ferry/app/vpn/` | VpnService / TunConfig（路由表）/ HevConfig（生成 YAML） |
+| `android/app/src/main/java/hev/htproxy/TProxyService.java` | JNI 绑定，**包名类名不能改** |
+| `android/app/src/main/jniLibs/<abi>/` | 三个 ABI 的 `libhev-socks5-tunnel.so`（入库，约 950 KB） |
+| `android/third-part/hev-socks5-tunnel/` | 上游参考源码，**不参与构建** |
+
+构建（本机 E 盘只剩 19G，全在 xt 的 D 盘做）：
+
+```powershell
+# 出 APK → dist\ferry-debug.apk
+powershell -ExecutionPolicy Bypass -File tools\build-apk-remote.ps1
+# 只重编 native（改了 hev 才需要）
+powershell -ExecutionPolicy Bypass -File tools\build-native-remote.ps1
+# 不需要真机的离线校验（YAML + 路由表）
+powershell -ExecutionPolicy Bypass -File tools\verify-android.ps1
+# 静态对账 APK（签名 / ABI / dex 与 .so 的 JNI 契约）
+# 在 xt 上跑 tools\verify-apk-static.ps1、tools\emulator-jni-check.ps1
+```
+
+技术栈三条硬约束（改之前先想清楚）：
+
+1. **不用 Kotlin/Compose**，用 Java + AppCompat。远端构建依赖越少越稳，
+   而手机端界面很简单（状态卡 + 开关 + 日志）。
+2. **TUN→SOCKS5 用 `heiher/hev-socks5-tunnel`**，别自己写 tun2socks ——
+   那需要完整的用户态 TCP/IP 栈（握手、拥塞控制、重传、分片重组、UDP 会话），
+   几千行且极难做对。
+3. **路由只能「列入」，不能「排除」**。`VpnService.addRoute` 是「把这些网段
+   导进隧道」，加得越具体优先级越高。想要「局域网直连」就得**不写**
+   `0.0.0.0/0`，改成显式列出所有公网单播 CIDR（`TunConfig.PUBLIC_V4`，46 条）。
+   第一版写成 `0.0.0.0/0` + `addRoute("10.0.0.0",8)` 想「排除局域网」，
+   结果正好相反，访问打印机/摄像头全超时。
+
+
 ## 三、本地怎么跑
 
 ```powershell
