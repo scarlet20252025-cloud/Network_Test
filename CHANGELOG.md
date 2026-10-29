@@ -1,3 +1,69 @@
+## v0.14.45 — 2026-10-29
+
+> 门户：管理面板新增「已登记的设备」，每台设备可踢下线 / 删除。
+> 顺带修了三个真 bug —— 其中一个是「踢下线」根本踢不掉。
+
+### 为什么改
+
+10-29 白天把授权从「按 IP」改成「按设备」之后，管理面板里还是一张按 IP
+排的机器表。同一个 NAT 出口下手机和电脑是同一行，管理员看不出
+「这个账号绑了几台设备、谁占了 3 个名额、该踢哪一台」—— 而名额满了以后
+用户只会看到一句「设备数已达上限」，自己也没法解决。
+
+补齐这块的时候，顺带挖出三个 bug：
+
+1. **「踢下线」是假的**。`device_bind` 对已存在的设备无条件写 `enabled = 1`，
+   所以停用一台设备后，App 下次启动查一次 `/api/license` 就把它写回启用。
+   面板上点了「停用」，实际一会儿又自己活了。
+2. **拒绝原因全报成「设备上限」**。`/api/license`、`/api/activate` 一律带
+   `device_limit=True`；`/api/device/restore` 对「没登记过」和「被停用」
+   都返回 404「这台设备没有登记记录」—— 用户会以为恢复功能坏了，反复重装 App。
+3. **概览页少了 csrf 隐藏域**。限速卡的「应用」按钮和保存备注都靠
+   `querySelector('input[name="csrf"]')` 取 token，概览页一个隐藏域都没有，
+   取到空串 → 服务端 403 → 前端 `.catch()` 吞掉 → 用户看到的就是
+   「点了没反应」。实测：空 csrf POST `/api/admin/net` 得 403，带 token 得 200。
+   **这个问题在概览页一直存在，不是今天引入的。**
+
+### 改了什么
+
+- `/admin/users` 顶部新增「已登记的设备」表：状态 / 机型 / 平台 / 版本 /
+  最近 IP / 设备标识 / 最后活动 / 账号到期 / 授权 / 操作。
+  每行两个动作：
+  - **踢下线**（`enabled=0`）—— 记录保留，面板上点「恢复」能放回来；
+  - **删除**（真删行）—— 腾名额，该设备下次启动会被当成全新设备重新登记。
+  两者都释放名额（`device_count` 只统计 `enabled=1`），也都不影响同账号的其它设备。
+  下面原来的「按 IP」表保留，两表并存，各自写清自己回答什么问题。
+- `device_bind` 见到 `enabled=0` 直接拒绝；返回 `(ok, err, is_new, reason)`，
+  `reason` 区分 `limit` / `disabled` / `invalid`，供接口分别返回
+  `device_limit` / `device_disabled`。
+- `/api/device/restore` 把「没登记过」（404）和「被停用」（403 +
+  `device_disabled`）分成两种说法。
+- `/api/activate` 的 `code_consumed` 改成 `false`：密钥核销的 `UPDATE invites`
+  在 `device_bind` 之后才执行，所以设备被拒时**并没有**吃掉用户的码
+  （60 秒重试窗口内同一个码还能用）。原来报 `true` 与代码实际行为相反。
+- `/admin/device` 的 `op` 走白名单，非法值 400，不再「不是 forget 就按 toggle 处理」
+  （手滑传错值会静默把设备停掉）。
+- 概览页补上 `csrf_in`。
+
+### 验证
+
+```
+tools/verify-portal-device.py   35 项全过（新增；第 4 节就是那个复活 bug 的回归）
+tools/verify-portal-pages.py    42 项全过（顺手修了 4 项早已假红的断言）
+tools/check-admin-page.mjs      12 项全过（新增）
+```
+
+`check-admin-page.mjs` 是补 AGENTS.md 第五节第 12 条长期缺的一环：门户网页
+之前只有 HTML 结构断言，没有真渲染检查。它用 headless Edge + CDP 打开
+`/admin/users`，断言设备表真的渲染出行、两个按钮都在，同时收集
+未捕获异常 / `console.error` / 4xx·5xx 请求，最后截一张图。
+结构断言全过、页面照样是死的 —— 这种坑以前在反馈面板上真实发生过。
+
+已部署 pcs（`portal-server.py.bak-20261029-200644` 为回滚点），
+`FerryPortal` 计划任务运行正常，线上 `/admin/users` 设备表正常渲染，
+线上 `devices` 表确认无测试数据残留（只有那台 vivo V1824A）。
+
+
 ## v0.14.44 — 2026-10-29
 
 > 客户端 1.0.47：把 1.0.46 的健康检查间隔从 30 秒压到 10 秒。
