@@ -190,7 +190,12 @@ public class MainActivity extends AppCompatActivity {
     private void runSelfCheck() {
         btnSelfCheck.setEnabled(false);
         log(getString(R.string.selfcheck_running));
-        SelfCheck.run((items, summary) -> runOnUiThread(() -> {
+        // 传 0：Android 侧没有本地代理端口（hev 直接连远端 SOCKS5），
+        // 且 App 自己被 addDisallowedApplication 排除在 VPN 路由外，
+        // 所以本进程的 HTTP 请求注定走物理网卡。
+        // 若物理网卡没网（校园网禁网时段），这一项必然失败 —— 是假阴性。
+        // SelfCheck 会据此把这项标成「仅供参考」，不计入失败。
+        SelfCheck.run(0, (items, summary) -> runOnUiThread(() -> {
             btnSelfCheck.setEnabled(true);
             for (SelfCheck.Item i : items) log("  " + i);
             log("自检结果：" + summary);

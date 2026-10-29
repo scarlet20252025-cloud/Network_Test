@@ -61,12 +61,20 @@ public class SelfCheck {
     }
 
     public static void run(Callback cb) {
+        run(0, cb);
+    }
+
+    /**
+     * @param proxyPort 本地 HTTP 代理端口（一般是 cfg.httpPort）。
+     *                  传 0 表示直连 —— 但那样测 HTTP 项会假阴性，见 checkHttp 的注释。
+     */
+    public static void run(int proxyPort, Callback cb) {
         new Thread(() -> {
             List<Item> items = new ArrayList<>();
             items.add(checkTun());
             items.add(checkHev());
             items.add(checkDns());
-            items.add(checkHttp());
+            items.add(checkHttp(proxyPort));
             items.add(checkUplink());
             int okCount = 0;
             for (Item i : items) if (i.ok) okCount++;
@@ -127,16 +135,44 @@ public class SelfCheck {
         }
     }
 
-    /** ④ 一次真实的 HTTP 请求。 */
-    private static Item checkHttp() {
+    /**
+     * ④ 一次真实的 HTTP 请求。
+     *
+     * ⚠ **必须走本地 SOCKS/HTTP 代理端口，不能直连。**
+     *
+     * 2026-10-30 实测踩到的假阴性：
+     *   FerryVpnService 里有一行（必要，防止代理流量回环）：
+     *       b.addDisallowedApplication(getPackageName());
+     *   Android 因此把**本 App 的 uid 从 VPN 路由规则里剔除**。实测 ip rule：
+     *
+     *       12000: from all fwmark 0x0/0x20000 iif lo uidrange 0-10292 lookup 1055
+     *       12000: from all fwmark 0x0/0x20000 iif lo uidrange 10294-99999 lookup 1055
+     *                                              ↑ 10293 正好空着 = 本 App
+     *
+     *   于是本进程直连出去的请求**不走隧道**，走的是物理网卡。
+     *   校园网断网时，这一项必然失败 —— 但此时隧道其实完全正常
+     *   （真机验证：浏览器打开了百度，服务端日志有 17KB 传输记录）。
+     *
+     * 修法：请求显式经过 127.0.0.1:<httpPort> 代理，这样它由 hev 接管进隧道，
+     * 不受 disallow 影响，测出来的才是真实的隧道状态。
+     */
+    private static Item checkHttp(int proxyPort) {
         HttpURLConnection c = null;
         try {
-            c = (HttpURLConnection) new URL("http://www.qq.com").openConnection();
+            URL u = new URL("http://www.qq.com");
+            if (proxyPort > 0) {
+                c = (HttpURLConnection) u.openConnection(
+                        new java.net.Proxy(java.net.Proxy.Type.HTTP,
+                                new java.net.InetSocketAddress("127.0.0.1", proxyPort)));
+            } else {
+                c = (HttpURLConnection) u.openConnection();
+            }
             c.setConnectTimeout(8000);
             c.setReadTimeout(8000);
             c.setInstanceFollowRedirects(false);
             int code = c.getResponseCode();
-            return new Item("HTTP 请求", code > 0, "HTTP " + code);
+            String via = proxyPort > 0 ? "（经本地代理 " + proxyPort + "）" : "（直连，可能不准）";
+            return new Item("HTTP 请求", code > 0, "HTTP " + code + via);
         } catch (Exception e) {
             return new Item("HTTP 请求", false, e.getClass().getSimpleName() + ": " + e.getMessage());
         } finally {
