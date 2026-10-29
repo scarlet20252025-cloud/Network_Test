@@ -27,18 +27,32 @@ namespace Ferry
         public static readonly Color Bad     = Color.FromRgb(231, 76, 60);
         public static readonly Color Idle    = Color.FromRgb(149, 165, 166);
 
-        public static Brush BgB      { get { return Freeze(new SolidColorBrush(Bg)); } }
-        public static Brush CardB    { get { return Freeze(new SolidColorBrush(Card)); } }
-        public static Brush Card2B   { get { return Freeze(new SolidColorBrush(Card2)); } }
-        public static Brush LineB    { get { return Freeze(new SolidColorBrush(Line)); } }
-        public static Brush Line2B   { get { return Freeze(new SolidColorBrush(Line2)); } }
-        public static Brush TextB    { get { return Freeze(new SolidColorBrush(Text)); } }
-        public static Brush MutedB   { get { return Freeze(new SolidColorBrush(Muted)); } }
-        public static Brush AccentB  { get { return Freeze(new SolidColorBrush(Accent)); } }
-        public static Brush GoodB    { get { return Freeze(new SolidColorBrush(Good)); } }
-        public static Brush WarnB    { get { return Freeze(new SolidColorBrush(Warn)); } }
-        public static Brush BadB     { get { return Freeze(new SolidColorBrush(Bad)); } }
-        public static Brush IdleB    { get { return Freeze(new SolidColorBrush(Idle)); } }
+        // ⚠ 这些 Brush **必须只创建一次然后复用**，不能写成
+        //     public static Brush TextB { get { return Freeze(new SolidColorBrush(Text)); } }
+        //
+        // 为什么：RefreshUi() 每秒跑一次，里面会给二十来个控件的 Foreground 赋值。
+        // 原来的 get 每次 new 一个新的 SolidColorBrush ——
+        //   · WPF 的 Foreground 是依赖属性，赋一个**不同的对象**（哪怕颜色一样）
+        //     就会判定值变了 → 触发属性失效 → 重新 measure/arrange/重绘整块区域；
+        //   · 每秒二十几个新画刷，5 分钟一万多个，全是垃圾。
+        // 结果就是：界面在「直连」这种完全空闲的状态下 CPU 稳定 80%+，
+        // 点什么都半天没反应（UI 线程被重排占满）。实测 1.0.47 在直连状态下
+        // 5 秒消耗 4.09 秒 CPU。
+        //
+        // 改成静态只读字段后，同一个 Brush 实例反复赋给同一个属性 ——
+        // WPF 用引用相等判等，值没变就完全不产生工作。
+        public static readonly Brush BgB     = Freeze(new SolidColorBrush(Bg));
+        public static readonly Brush CardB   = Freeze(new SolidColorBrush(Card));
+        public static readonly Brush Card2B  = Freeze(new SolidColorBrush(Card2));
+        public static readonly Brush LineB   = Freeze(new SolidColorBrush(Line));
+        public static readonly Brush Line2B  = Freeze(new SolidColorBrush(Line2));
+        public static readonly Brush TextB   = Freeze(new SolidColorBrush(Text));
+        public static readonly Brush MutedB  = Freeze(new SolidColorBrush(Muted));
+        public static readonly Brush AccentB = Freeze(new SolidColorBrush(Accent));
+        public static readonly Brush GoodB   = Freeze(new SolidColorBrush(Good));
+        public static readonly Brush WarnB   = Freeze(new SolidColorBrush(Warn));
+        public static readonly Brush BadB    = Freeze(new SolidColorBrush(Bad));
+        public static readonly Brush IdleB   = Freeze(new SolidColorBrush(Idle));
 
         static Brush Freeze(SolidColorBrush b) { b.Freeze(); return b; }
 

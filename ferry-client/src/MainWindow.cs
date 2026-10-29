@@ -1404,6 +1404,41 @@ namespace Ferry
 
         // ══════════════════════ 界面刷新 ══════════════════════
 
+        /// <summary>
+        /// 只在值真的变了才写控件属性。
+        ///
+        /// 为什么需要它：RefreshUi() 每秒跑一次，里面有 40 处 `.Text =` 和
+        /// 37 处 `.Foreground =`。WPF 的 Text / Foreground 都是依赖属性，
+        /// **赋一个和新值相等的内容也会走完整的属性失效 → measure → arrange → 重绘**。
+        /// 而界面上绝大多数内容每秒都是不变的（比如一直是「直连」那张卡）。
+        ///
+        /// 实测 1.0.47 在「直连、什么都没做」的状态下 5 秒吃掉 4.09 秒 CPU，
+        /// 点界面上任何东西都要等很久 —— 就是这套每秒 77 次的重排把 UI 线程占满了。
+        ///
+        /// 用 SetValue 而不是直接赋值，是因为 TextBlock.Text 和
+        /// Control.Foreground 分属不同依赖属性；按名字传更省事，
+        /// 拿不到就不写（不抛异常），保证不会因为界面改版把这里变成新坑。
+        /// </summary>
+        static void SetIfChanged(System.Windows.Controls.TextBlock tb,
+            System.Windows.DependencyProperty prop, object val)
+        {
+            if (tb == null) return;
+            var cur = tb.GetValue(prop);
+            if (Equals(cur, val)) return;
+            tb.SetValue(prop, val);
+        }
+
+        static void SetText(System.Windows.Controls.TextBlock tb, string val)
+        {
+            SetIfChanged(tb, System.Windows.Controls.TextBlock.TextProperty, val ?? "");
+        }
+
+        static void SetFg(System.Windows.Controls.TextBlock tb,
+            System.Windows.Media.Brush val)
+        {
+            SetIfChanged(tb, System.Windows.Controls.TextBlock.ForegroundProperty, val);
+        }
+
         void RefreshUi()
         {
             bool proxyOn = FerryCore.ProxyEnabled();
@@ -1451,110 +1486,110 @@ namespace Ferry
             // 激活区
             if (_cfg.Activated)
             {
-                _lblActTitle.Text = "已激活";
-                _lblActTitle.Foreground = Palette.GoodB;
+                SetText(_lblActTitle, "已激活");
+                SetFg(_lblActTitle, Palette.GoodB);
                 _txtCode.Visibility = Visibility.Collapsed;
                 _btnActivate.Visibility = Visibility.Collapsed;
-                if (_lic.Expired) { _lblActHint.Text = "授权已到期 —— 请向管理员续期"; _lblActHint.Foreground = Palette.BadB; }
-                else if (_lic.Suspended) { _lblActHint.Text = "账号已停用 —— 请联系管理员"; _lblActHint.Foreground = Palette.BadB; }
+                if (_lic.Expired) { SetText(_lblActHint, "授权已到期 —— 请向管理员续期"); SetFg(_lblActHint, Palette.BadB); }
+                else if (_lic.Suspended) { SetText(_lblActHint, "账号已停用 —— 请联系管理员"); SetFg(_lblActHint, Palette.BadB); }
                 else if (_lic.ExpiresAt > 0)
                 {
-                    _lblActHint.Text = "账号 " + _cfg.AccountIp + " · " + LeftText() + " · " +
-                        FromUnix(_lic.ExpiresAt).ToString("yyyy-MM-dd") + " 到期";
-                    _lblActHint.Foreground = _lic.DaysLeft <= 3 ? Palette.BadB : Palette.TextB;
+                    SetText(_lblActHint, "账号 " + _cfg.AccountIp + " · " + LeftText() + " · " +
+                        FromUnix(_lic.ExpiresAt).ToString("yyyy-MM-dd") + " 到期");
+                    SetFg(_lblActHint, _lic.DaysLeft <= 3 ? Palette.BadB : Palette.TextB);
                 }
-                else { _lblActHint.Text = "账号 " + _cfg.AccountIp + " · 永久授权"; _lblActHint.Foreground = Palette.TextB; }
-                _lblAcct.Text = "账号 " + _cfg.AccountIp;
+                else { SetText(_lblActHint, "账号 " + _cfg.AccountIp + " · 永久授权"); SetFg(_lblActHint, Palette.TextB); }
+                SetText(_lblAcct, "账号 " + _cfg.AccountIp);
             }
             else
             {
-                _lblActTitle.Text = "输入密钥激活";
-                _lblActTitle.Foreground = Palette.TextB;
+                SetText(_lblActTitle, "输入密钥激活");
+                SetFg(_lblActTitle, Palette.TextB);
                 _txtCode.Visibility = Visibility.Visible;
                 _btnActivate.Visibility = Visibility.Visible;
-                _lblActHint.Text = "管理员给你的 8 位字母数字，一个密钥只能用一次。";
-                _lblActHint.Foreground = Palette.MutedB;
-                _lblAcct.Text = "未激活";
+                SetText(_lblActHint, "管理员给你的 8 位字母数字，一个密钥只能用一次。");
+                SetFg(_lblActHint, Palette.MutedB);
+                SetText(_lblAcct, "未激活");
             }
 
             // 配额行
-            if (!_cfg.Activated) { _lblQuota.Text = "输入密钥后开始计时"; _lblQuota.Foreground = Palette.MutedB; }
-            else if (_lic.Expired) { _lblQuota.Text = "授权已到期，请向管理员续期"; _lblQuota.Foreground = Palette.BadB; }
-            else if (_lic.Suspended) { _lblQuota.Text = "账号已停用，请联系管理员"; _lblQuota.Foreground = Palette.BadB; }
+            if (!_cfg.Activated) { SetText(_lblQuota, "输入密钥后开始计时"); SetFg(_lblQuota, Palette.MutedB); }
+            else if (_lic.Expired) { SetText(_lblQuota, "授权已到期，请向管理员续期"); SetFg(_lblQuota, Palette.BadB); }
+            else if (_lic.Suspended) { SetText(_lblQuota, "账号已停用，请联系管理员"); SetFg(_lblQuota, Palette.BadB); }
             else if (_lic.ExpiresAt > 0)
             {
-                _lblQuota.Text = LeftText() + " · " + FromUnix(_lic.ExpiresAt).ToString("yyyy-MM-dd") + " 到期";
-                _lblQuota.Foreground = _lic.DaysLeft <= 3 ? Palette.BadB : Palette.MutedB;
+                SetText(_lblQuota, LeftText() + " · " + FromUnix(_lic.ExpiresAt).ToString("yyyy-MM-dd") + " 到期");
+                SetFg(_lblQuota, _lic.DaysLeft <= 3 ? Palette.BadB : Palette.MutedB);
             }
-            else { _lblQuota.Text = "永久授权"; _lblQuota.Foreground = Palette.MutedB; }
+            else { SetText(_lblQuota, "永久授权"); SetFg(_lblQuota, Palette.MutedB); }
 
             // 大状态
             if (!_cfg.Activated)
             {
-                _lblBig.Text = "未激活";
-                _lblBig.Foreground = Palette.BadB;
-                _lblDesc.Text = "在下面的框里输入管理员给的密钥，即可开通借网。";
-                _lblDesc.Foreground = Palette.MutedB;
+                SetText(_lblBig, "未激活");
+                SetFg(_lblBig, Palette.BadB);
+                SetText(_lblDesc, "在下面的框里输入管理员给的密钥，即可开通借网。");
+                SetFg(_lblDesc, Palette.MutedB);
             }
             else if (borrowing)
             {
-                _lblBig.Text = "正在走渡口";
-                _lblBig.Foreground = Palette.GoodB;
+                SetText(_lblBig, "正在走渡口");
+                SetFg(_lblBig, Palette.GoodB);
                 if (_nodeMode)
                 {
                     // 只说「端口在哪儿」，不说「把它加进 Clash」——
                     // 这台机器可能不是本人的，界面上不该出现任何「怎么用它翻墙」的字眼。
                     // 需要细节的人去设置里点 🐱（那里有完整说明）。
-                    _lblDesc.Text = "本地端口 " + (rt != null ? rt.SocksPort : _cfg.SocksPort) +
+                    SetText(_lblDesc, "本地端口 " + (rt != null ? rt.SocksPort : _cfg.SocksPort) +
                         " / " + (rt != null ? rt.HttpPort : _cfg.HttpPort) +
                         " · 系统代理未接管" +
-                        (_exitVia.Length > 0 ? "\n出口 " + _exitVia : "");
+                        (_exitVia.Length > 0 ? "\n出口 " + _exitVia : ""));
                 }
                 else
                 {
-                    _lblDesc.Text = _exitVia.Length > 0
-                        ? "流量经远端主机中转 · 出口 " + _exitVia : "流量经远端主机中转";
+                    SetText(_lblDesc, _exitVia.Length > 0
+                        ? "流量经远端主机中转 · 出口 " + _exitVia : "流量经远端主机中转");
                 }
-                _lblDesc.Foreground = Palette.MutedB;
+                SetFg(_lblDesc, Palette.MutedB);
 
                 if (_cfg.UseTun && !(rt != null && rt.TunRunning))
                 {
                     var terr = rt != null ? rt.TunError : "";
                     var why = rt != null ? rt.TunSkipReason : "";
                     var reason = terr.Length > 0 ? terr : why;
-                    _lblDesc.Text = "已借网，但全局接管（TUN）未启用 —— 只有认代理的程序生效。" +
-                        (reason.Length > 0 ? "\n原因：" + reason : "");
-                    _lblDesc.Foreground = Palette.BadB;
+                    SetText(_lblDesc, "已借网，但全局接管（TUN）未启用 —— 只有认代理的程序生效。" +
+                        (reason.Length > 0 ? "\n原因：" + reason : ""));
+                    SetFg(_lblDesc, Palette.BadB);
                 }
             }
             else if (proxyOn && proxySrv == borrowServer)
             {
-                _lblBig.Text = "借网异常";
-                _lblBig.Foreground = Palette.BadB;
-                _lblDesc.Text = "系统代理指向渡口，但本地代理端口没响应。点「停止并恢复直连」再重新开始。";
-                _lblDesc.Foreground = Palette.MutedB;
+                SetText(_lblBig, "借网异常");
+                SetFg(_lblBig, Palette.BadB);
+                SetText(_lblDesc, "系统代理指向渡口，但本地代理端口没响应。点「停止并恢复直连」再重新开始。");
+                SetFg(_lblDesc, Palette.MutedB);
             }
             else if (!_hasNet)
             {
-                _lblBig.Text = "无网络";
-                _lblBig.Foreground = Palette.BadB;
-                _lblDesc.Text = "本机暂时连不上外网 —— 点「开始借网」借用出口主机。";
-                _lblDesc.Foreground = Palette.MutedB;
+                SetText(_lblBig, "无网络");
+                SetFg(_lblBig, Palette.BadB);
+                SetText(_lblDesc, "本机暂时连不上外网 —— 点「开始借网」借用出口主机。");
+                SetFg(_lblDesc, Palette.MutedB);
             }
             else
             {
-                _lblBig.Text = "直连";
-                _lblBig.Foreground = Palette.TextB;
-                _lblDesc.Text = "正在用本机网络。需要时点「开始借网」借用出口主机。";
-                _lblDesc.Foreground = Palette.MutedB;
+                SetText(_lblBig, "直连");
+                SetFg(_lblBig, Palette.TextB);
+                SetText(_lblDesc, "正在用本机网络。需要时点「开始借网」借用出口主机。");
+                SetFg(_lblDesc, Palette.MutedB);
             }
 
             // 明细行
-            _rowBridge.Text = "本地代理    " + (bridgeUp ? "运行中（端口 " + httpPort + "）" : "未运行");
-            _rowBridge.Foreground = bridgeUp ? Palette.TextB : Palette.MutedB;
+            SetText(_rowBridge, "本地代理    " + (bridgeUp ? "运行中（端口 " + httpPort + "）" : "未运行"));
+            SetFg(_rowBridge, bridgeUp ? Palette.TextB : Palette.MutedB);
 
-            _rowProxy.Text = "系统代理    " + (proxyOn ? "开  " + (proxySrv.Length > 0 ? proxySrv : "（未设置）") : "关");
-            _rowProxy.Foreground = borrowing ? Palette.GoodB : Palette.TextB;
+            SetText(_rowProxy, "系统代理    " + (proxyOn ? "开  " + (proxySrv.Length > 0 ? proxySrv : "（未设置）") : "关"));
+            SetFg(_rowProxy, borrowing ? Palette.GoodB : Palette.TextB);
 
             // ══════════ 全局模式状态 ══════════
             //
@@ -1574,16 +1609,16 @@ namespace Ferry
             if (tunUp)
             {
                 // 真的在跑 —— 这是唯一能说「已开启」的情况
-                _rowTun.Text = "全局模式    已开启（UDP / 游戏都走渡口）";
-                _rowTun.Foreground = Palette.GoodB;
+                SetText(_rowTun, "全局模式    已开启（UDP / 游戏都走渡口）");
+                SetFg(_rowTun, Palette.GoodB);
                 _btnGlobal.Content = "关闭全局模式";
                 _btnGlobal.Background = Palette.IdleB;
             }
             else if (wantTun && !isAdmin)
             {
                 // 想要，但没权限 —— 这时才该说「待授权」
-                _rowTun.Text = "全局模式    已勾选 · 需管理员授权";
-                _rowTun.Foreground = Palette.WarnB;
+                SetText(_rowTun, "全局模式    已勾选 · 需管理员授权");
+                SetFg(_rowTun, Palette.WarnB);
                 _btnGlobal.Content = "去授权";
                 _btnGlobal.Background = Palette.AccentB;
             }
@@ -1596,18 +1631,18 @@ namespace Ferry
                 var why = rt != null ? rt.TunSkipReason : "";
                 if (!string.IsNullOrEmpty(terr))
                 {
-                    _rowTun.Text = "全局模式    启用失败：" + terr;
-                    _rowTun.Foreground = Palette.BadB;
+                    SetText(_rowTun, "全局模式    启用失败：" + terr);
+                    SetFg(_rowTun, Palette.BadB);
                 }
                 else if (skipped)
                 {
-                    _rowTun.Text = "全局模式    未启用：" + why;
-                    _rowTun.Foreground = Palette.WarnB;
+                    SetText(_rowTun, "全局模式    未启用：" + why);
+                    SetFg(_rowTun, Palette.WarnB);
                 }
                 else
                 {
-                    _rowTun.Text = "全局模式    正在启用…";
-                    _rowTun.Foreground = Palette.MutedB;
+                    SetText(_rowTun, "全局模式    正在启用…");
+                    SetFg(_rowTun, Palette.MutedB);
                 }
                 _btnGlobal.Content = "关闭全局模式";
                 _btnGlobal.Background = Palette.IdleB;
@@ -1616,16 +1651,16 @@ namespace Ferry
             {
                 // 有权限、已勾选，但**还没借网** —— 这不是「待授权」，
                 // 是「已就绪，借网时自动生效」。
-                _rowTun.Text = "全局模式    已开启 · 下次借网时生效";
-                _rowTun.Foreground = Palette.GoodB;
+                SetText(_rowTun, "全局模式    已开启 · 下次借网时生效");
+                SetFg(_rowTun, Palette.GoodB);
                 _btnGlobal.Content = "关闭全局模式";
                 _btnGlobal.Background = Palette.IdleB;
             }
             else
             {
                 // 用户明确没勾 —— 这才是真的「未开启」
-                _rowTun.Text = "全局模式    未开启";
-                _rowTun.Foreground = Palette.MutedB;
+                SetText(_rowTun, "全局模式    未开启");
+                SetFg(_rowTun, Palette.MutedB);
                 _btnGlobal.Content = "开启全局模式";
                 _btnGlobal.Background = Palette.AccentB;
             }
@@ -1648,30 +1683,30 @@ namespace Ferry
                 if (hsOn && hsNic)
                 {
                     var ssid = Hotspot.CurrentSsid();
-                    _rowHotspot.Text = "移动热点    已开启" +
-                        (string.IsNullOrEmpty(ssid) ? "" : "（" + ssid + "）");
-                    _rowHotspot.Foreground = Palette.GoodB;
+                    SetText(_rowHotspot, "移动热点    已开启" +
+                        (string.IsNullOrEmpty(ssid) ? "" : "（" + ssid + "）"));
+                    SetFg(_rowHotspot, Palette.GoodB);
                 }
                 else if (hsOn && !hsNic)
                 {
                     // API 说开着，但网卡没拿到地址 —— 手机连得上也上不了网。
-                    _rowHotspot.Text = "移动热点    已开启但网卡未就绪（重启电脑可恢复）";
-                    _rowHotspot.Foreground = Palette.WarnB;
+                    SetText(_rowHotspot, "移动热点    已开启但网卡未就绪（重启电脑可恢复）");
+                    SetFg(_rowHotspot, Palette.WarnB);
                 }
                 else if (_cfg.HotspotOn)
                 {
-                    _rowHotspot.Text = "移动热点    正在开启…";
-                    _rowHotspot.Foreground = Palette.MutedB;
+                    SetText(_rowHotspot, "移动热点    正在开启…");
+                    SetFg(_rowHotspot, Palette.MutedB);
                 }
                 else if (hsState.Length == 0)
                 {
-                    _rowHotspot.Text = "移动热点    本机不支持";
-                    _rowHotspot.Foreground = Palette.MutedB;
+                    SetText(_rowHotspot, "移动热点    本机不支持");
+                    SetFg(_rowHotspot, Palette.MutedB);
                 }
                 else
                 {
-                    _rowHotspot.Text = "移动热点    未开启";
-                    _rowHotspot.Foreground = Palette.MutedB;
+                    SetText(_rowHotspot, "移动热点    未开启");
+                    SetFg(_rowHotspot, Palette.MutedB);
                 }
                 _swHotspot.IsEnabled = !_busy && !_hsBusy;
             }
