@@ -10,10 +10,24 @@
 
 ## 正在做
 
-- [ ] **1.0.46 待用户安装验证**：UDP 延迟修复已提交并打好包
-  （`dist/Ferry-Setup-1.0.46.exe`），需要用户装上后打一局 CS2 看实际延迟
+- [ ] **1.0.47 待用户安装验证**：UDP 延迟修复已提交并打好包
+  （`dist/Ferry-Setup-1.0.47.exe`），需要用户装上后打一局 CS2 看实际延迟
+  - 1.0.46 → 1.0.47 只改了一处：健康检查 30s → 10s，缩短禁网切换的空白期
   - 2026-10-29 17:10 用户确认：「先验证1.0.46，手机我不小心带出门了，我回宿舍再继续弄手机」
   - 下一步等用户回报 CS2 实测 ping
+
+## 已确认的技术细节（免得下次重查）
+
+- **mihomo 的 `fallback` 语义**（从二进制日志字符串反推，已确认）：
+  `ProxyGroup: %s first failed` / `failed count: %d` / `Start New Health Checking`
+  → 按顺序检查，用第一个不失败的；持续健康检查，失败就换下一个。
+  所以 `[DIRECT, ferry-udp]` = 有网直连 / 禁网落隧道 / 恢复后切回来，
+  不需要自己写逻辑，只需把 interval 调小以缩短发现断网的延迟。
+- **hev-socks5-tunnel 没有任何 UDP 分流能力**：全部配置项里没有
+  route/exclude/bypass。`udp: 'udp'` 是全有或全无。
+- **客户端 manifest 是 `asInvoker`**，不强制管理员。`useTun=true` 时会自己
+  `runas` 重启一次（见 `Elevator.cs`），所以 `Start-Process -Verb RunAs` 起它会
+  静默失败（UAC 根本不弹），得直接启动。
 
 ## 手机不在身边（2026-10-29 17:10 起）
 
