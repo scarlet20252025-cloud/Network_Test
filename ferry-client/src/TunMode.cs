@@ -384,9 +384,40 @@ namespace Ferry
             sb.AppendLine("  - name: ferry");
             sb.AppendLine("    type: select");
             sb.AppendLine("    proxies: [ferry-tcp]");
-            sb.AppendLine("  - name: ferry-udp-group");
+            sb.AppendLine("  - name: ferry-udp-manual");
             sb.AppendLine("    type: select");
-            sb.AppendLine("    proxies: [ferry-udp]");
+            // 手动档：默认 DIRECT，用户可以切到 ferry-udp。
+            //
+            // ⚠ DIRECT 必须留在**第一位**（= 默认选中）。2026-10-29 修。
+            //
+            // 历史：0.9.30 这里是 [DIRECT, ferry-udp]，默认直连。
+            // 1.0.26 修「ferry-udp 指向了远端 TCP 端口」时，顺手把 DIRECT 拿掉了，
+            // 改成 [ferry-udp] —— 理由是「UDP 修好了就该走 UDP」。
+            //
+            // 这个改动造成了一个反直觉的后果：UDP 从「静默失败」变成「真的绕远端」，
+            // 于是所有 UDP 流量（游戏、语音、QUIC）的路径从
+            //   本机 → 目标
+            // 变成
+            //   本机 → pcs(10.13.24.1) → 目标 → pcs → 本机
+            // 往返多绕一趟内网 + 一趟大陆出口。用户反馈「最新版打游戏延迟高、
+            // 0.9.30 完全没问题」，根因就在这里 —— 不是 0.9.30 做对了什么，
+            // 而是它的 UDP 压根没走隧道。
+            sb.AppendLine("    proxies: [DIRECT, ferry-udp]");
+            // 自动档：先试直连，直连不通（校园网禁网时段）才落到隧道。
+            //
+            // 为什么用 fallback 而不是直接给 DIRECT：
+            //   禁网时段 UDP 直连必然失败，那时如果还硬走 DIRECT，
+            //   游戏/语音就彻底不通了 —— 而用户开渡口正是为了这个时候能用。
+            //   fallback 按 url 测活，正好同时满足两种场景。
+            //
+            // 测活地址和 clash-egress 用同一个国内 generate_204：
+            //   有网时 DIRECT 通、禁网时不通，判据和「能不能直连」一致。
+            sb.AppendLine("  - name: ferry-udp-group");
+            sb.AppendLine("    type: fallback");
+            sb.AppendLine("    proxies: [DIRECT, ferry-udp]");
+            sb.AppendLine("    url: 'http://connect.rom.miui.com/generate_204'");
+            sb.AppendLine("    interval: 30");
+            sb.AppendLine("    timeout: 3000");
             sb.AppendLine();
             sb.AppendLine("rules:");
             // 规则顺序是设计的一部分，别随手调：

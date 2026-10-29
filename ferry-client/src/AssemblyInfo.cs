@@ -6,5 +6,5 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyProduct("Ferry")]
 [assembly: AssemblyCopyright("")]
 [assembly: ComVisible(false)]
-[assembly: AssemblyVersion("1.0.45.0")]
-[assembly: AssemblyFileVersion("1.0.45.0")]
+[assembly: AssemblyVersion("1.0.46.0")]
+[assembly: AssemblyFileVersion("1.0.46.0")]

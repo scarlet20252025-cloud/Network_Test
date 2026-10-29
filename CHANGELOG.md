@@ -1,3 +1,101 @@
+## v0.14.43 — 2026-10-29
+
+> 客户端 1.0.46：**修复「最新版打游戏延迟高」** —— UDP 默认改回直连，
+> 直连不通才自动切隧道。根因是 1.0.26 修 UDP 时顺手删掉了 DIRECT 选项。
+
+### 用户反馈的现象
+
+「有人反馈最新版本客户端打游戏延迟很高，但是 0.9.30 版本的延迟就完全没问题。」
+
+### 根因：1.0.26 修对了一件事，同时改坏了另一件
+
+对比两版实际生效的 TUN 配置：
+
+| | 0.9.30（延迟正常） | 1.0.26 之后（延迟高） |
+|---|---|---|
+| `ferry-udp` 指向 | `10.13.24.1:1080` | `127.0.0.1:<本地SOCKS>` |
+| `ferry-udp-group` | `[DIRECT, ferry-udp]` | `[ferry-udp]` |
+
+1.0.26 的诊断是对的：`ferry-udp` 指向的是远端 **TCP** 端口，不收 UDP，
+所以 UDP 一直在静默失败。改成指向本地 SOCKS 之后 UDP 真的通了。
+
+但那次改动**顺手把 DIRECT 从 `ferry-udp-group` 里删了**，理由是「UDP 修好了
+就该走 UDP」。后果是所有 UDP 流量被迫绕远：
+
+```
+0.9.30：  本机 ────────────────→ 游戏服务器
+1.0.26+：本机 → pcs → 游戏服务器 → pcs → 本机
+```
+
+游戏和语音每个 UDP 包都要多一趟内网往返。用户感受到的「延迟高」就是这条路。
+
+**教训**：修一个「某功能没生效」的 bug 时，要看清它之前为什么没生效 ——
+0.9.30 让 UDP 默认直连不是疏忽，是当时链路本来就只有这一条可靠路径。
+
+### 改法：fallback 自动降级，而不是二选一
+
+单纯把 DIRECT 加回去会退回另一个问题：校园网真禁网时 UDP 直连不通，
+游戏/语音就彻底废了——而借网正是渡口存在的意义。
+
+所以改成按测活自动选：
+
+```yaml
+- name: ferry-udp-group
+  type: fallback
+  proxies: [DIRECT, ferry-udp]
+  url: 'http://connect.rom.miui.com/generate_204'
+  interval: 30
+  timeout: 3000
+```
+
+- 能直连公网 → 走 DIRECT（打游戏回到 0.9.30 的延迟水平）
+- 禁网（`generate_204` 不通）→ 自动落到 `ferry-udp`，借网照常可用
+
+另外留了一个 `ferry-udp-manual`（`[DIRECT, ferry-udp]` 的 select 组）给需要
+手动指定线路的场景。
+
+`mihomo/mihomo-keeper.ps1` 三处同步改（On / Resume / Switch）：不再强制
+`PUT ferry-udp`，交给 fallback 自己判断。
+
+### 顺带修的一个老坑
+
+`mihomo-keeper.ps1` 在这次改动前是**无 BOM 的 UTF-8**，PS 5.1 按 ANSI 解码，
+中文注释破坏语法（解析出 29 个语法错误）。这正是 AGENTS.md 铁律第 3 条。
+已补 BOM 并验证语法 OK。
+
+### 验证
+
+新增 `tools/verify-udp-group.cs`，用反射调 `TunMode.BuildConfig` 拿真实生成的
+YAML 断言，防止这个 bug 再回来：
+
+```
+PASS  组类型是 fallback（直连不通能自动降级）
+PASS  proxies: [DIRECT, ferry-udp]
+PASS  DIRECT 排在第一位（= 默认走直连）
+PASS  有测活地址（禁网时才知道该切隧道）
+PASS  没有「只列 ferry-udp」的写法（那是 1.0.26 的 bug）
+ALL PASS
+```
+
+产物 exe 内已确认含 `ferry-udp-manual` / `DIRECT, ferry-udp` / `generate_204`
+三个特征字符串（.NET 字符串是 UTF-16LE，用二进制 grep 要按 utf-16 查）。
+
+### 量化工具
+
+新增 `tools/measure-udp-latency.cs`：对同一目标分别走「直连」和「远端 SOCKS5
+中继」发 UDP，比较 p50/p95。实测（223.5.5.5:53，20 样本）：
+
+```
+直连    p50 = 74.8ms
+走隧道  p50 = 74.7ms
+多 0.0ms
+```
+
+说明**隧道本身不贵**，贵的是「本来能直连的流量被绕了一圈」。
+用法：`tools\verify.cmd measure-udp-latency.cs [目标IP] [端口] [样本数]`
+
+---
+
 ## v0.14.42 — 2026-10-29
 
 > 客户端 1.0.45：热点共享源按「已连接的物理网卡」判（不再要求 InternetAccess）；

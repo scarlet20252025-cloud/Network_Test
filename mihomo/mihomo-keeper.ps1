@@ -353,9 +353,10 @@ function Restore-Selection {
   if (@('DIRECT', 'ferry-auto', 'ferry-ssh', 'ferry-wg') -notcontains $want) { return }
   if ($want -eq 'DIRECT') { return }   # 默认就是这个，不用 PUT
   $null = Invoke-Api '/proxies/ferry' 'PUT' (@{ name = $want } | ConvertTo-Json -Compress)
-  # UDP 组跟着一起恢复，否则重启后 TCP 在借网、UDP 在直连，用户会觉得时好时坏
-  $null = Invoke-Api '/proxies/ferry-udp-group' 'PUT' (@{ name = 'ferry-udp' } | ConvertTo-Json -Compress)
-  Write-KLog "已恢复上次选择: $want（UDP 也切到 ferry-udp）"
+  # UDP 组不用切：它是 fallback 组，自己按测活结果选 DIRECT 或 ferry-udp。
+  # 2026-10-29 改。原来这里强制 PUT ferry-udp，导致「一借网所有 UDP 都绕远端」——
+  # 游戏延迟因此从直连水平涨到「绕 pcs 一圈」的水平（用户反馈的那个回归）。
+  Write-KLog "已恢复上次选择: $want（UDP 交给 fallback 自动判断）"
 }
 
 function Save-Selection {
@@ -634,12 +635,15 @@ switch ($Action) {
   'On' {
     $r = Invoke-Api '/proxies/ferry' 'PUT' (@{ name = 'ferry-auto' } | ConvertTo-Json -Compress)
     if ($null -ne $r -or (Test-PortOpen $MixedPort)) {
-      # UDP 是独立的组，必须一起切 —— 否则用户以为开了借网，
-      # 结果游戏/QUIC 还在走直连，而且没有任何报错提示。
-      $null = Invoke-Api '/proxies/ferry-udp-group' 'PUT' (@{ name = 'ferry-udp' } | ConvertTo-Json -Compress)
+      # UDP 组是 fallback（[DIRECT, ferry-udp] 按测活自动选），这里**不要**强制切。
+      #
+      # 2026-10-29 改。原来这里强制 PUT ferry-udp，理由是「UDP 修好了就该走 UDP」，
+      # 结果游戏/语音的每个 UDP 包都要绕「本机 → pcs → 目标 → pcs → 本机」，
+      # 延迟明显高于直连。而校园网能直连时（大多数情况）根本没必要绕。
+      # 现在交给 fallback：直连通就用直连，禁网时段自动落到 ferry-udp。
       Save-Selection 'ferry-auto'
       $a = Invoke-Api '/proxies/ferry-auto'
-      $u = if (Test-UdpRelay) { 'ferry-udp' } else { '不可用（relay 没起）' }
+      $u = if (Test-UdpRelay) { '按需（直连优先，禁网时走 ferry-udp）' } else { '不可用（relay 没起，禁网时 UDP 会不通）' }
       Ok "已借网 → TCP: ferry-auto → $($a.now)"
       Ok "         UDP: $u"
     } else { Bad '切换失败（端点没起来？先 Start）'; exit 1 }
@@ -658,11 +662,9 @@ switch ($Action) {
       Bad "只能选: $($allowed -join ' / ')"; exit 1
     }
     $null = Invoke-Api '/proxies/ferry' 'PUT' (@{ name = $Target } | ConvertTo-Json -Compress)
-    # 选具体某条 TCP 线路时，UDP 跟着一起开（用户意图是「借网」），
-    # 因为 ferry-udp 是唯一能承载 UDP 的，没有别的选择。
-    if ($Target -ne 'DIRECT') {
-      $null = Invoke-Api '/proxies/ferry-udp-group' 'PUT' (@{ name = 'ferry-udp' } | ConvertTo-Json -Compress)
-    } else {
+    # UDP 组是 fallback，自己按测活选，这里只在「明确直连」时把它压回 DIRECT。
+    # 2026-10-29 改：原来选具体线路会强制 UDP 走 ferry-udp，把游戏也绕远。
+    if ($Target -eq 'DIRECT') {
       $null = Invoke-Api '/proxies/ferry-udp-group' 'PUT' (@{ name = 'DIRECT' } | ConvertTo-Json -Compress)
     }
     Save-Selection $Target
