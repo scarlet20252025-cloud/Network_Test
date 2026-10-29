@@ -64,6 +64,86 @@ UDP_IDLE_TIMEOUT = 60.0
 GCRA_TOLERANCE = 0.05   # 允许 50ms 突发，避免 TCP 窗口塌陷
 
 
+# ═══════════════════════════════════════════════════════════════════
+# UDP 目标的 DNS 解析缓存 —— 修「延迟缓慢爬升再骤降」
+# ═══════════════════════════════════════════════════════════════════
+#
+# **问题（2026-10-30 实测）**：
+#   UDP 转发走的是 `_target_transport.sendto(payload, (host, port))`，而
+#   `host` 来自 SOCKS5 请求头的 ATYP=3（域名）。asyncio 的
+#   `DatagramTransport.sendto()` 在地址不是 IP 字面量时会**同步**调用
+#   `socket.getaddrinfo()` —— 实测冷域名 38.90ms，传 IP 只要 0.38ms。
+#
+#   中继是**单线程 asyncio**：这 38ms 里整个事件循环停摆，所有其它关联的
+#   包全部排队。而 mihomo 给每个 UDP 目标各建一条 ASSOCIATE，域名各不相同，
+#   每个包都是冷解析。
+#
+#   表现（用户实测）：延迟从 10ms 稳定爬升到 50-70ms，然后突然降回 10ms，
+#   循环往复 —— 正是「解析任务堆积 → 队列变长 → 缓存命中/队列清空」的形态。
+#
+# **修法**：
+#   1. 本地维护 host→IP 缓存（带 TTL），命中就不再进 getaddrinfo；
+#   2. 未命中时把解析丢到线程池（`run_in_executor`），**不阻塞事件循环**；
+#   3. 解析完成前该包先丢弃（UDP 本来就允许丢包，比卡住所有人好），
+#      但同时把解析请求合并 —— 同一个域名的后续包不会重复触发解析。
+#
+#   这不是「优化」，是修一个有明确测量支撑的阻塞缺陷。
+#
+# 缓存 TTL 取值依据：UDP 目标多是游戏/语音/QUIC，DNS 记录变化不频繁。
+# 300 秒足够覆盖一局游戏，又不会让解析结果过时太久。
+DNS_CACHE_TTL = 300.0
+
+# host -> (ip, 过期时间戳)
+_dns_cache = {}
+# host -> True，表示解析正在进行（去重，避免同一个域名并发解析几十次）
+_dns_pending = set()
+_dns_executor = None
+
+
+def _dns_executor_global():
+    """懒加载线程池。放独立函数里，避免模块级创建线程（fork/重载时更安全）。"""
+    global _dns_executor
+    if _dns_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _dns_executor = ThreadPoolExecutor(max_workers=8,
+                                           thread_name_prefix='ferry-dns')
+    return _dns_executor
+
+
+def _dns_cache_get(host):
+    """缓存命中返回 IP，否则 None。"""
+    e = _dns_cache.get(host)
+    if e is None:
+        return None
+    ip, exp = e
+    if exp < time.monotonic():
+        _dns_cache.pop(host, None)
+        return None
+    return ip
+
+
+def _dns_cache_put(host, ip):
+    if len(_dns_cache) > 4096:          # 简单上限，防止无限增长
+        # 清掉已过期的
+        now = time.monotonic()
+        for k in [k for k, v in _dns_cache.items() if v[1] < now]:
+            _dns_cache.pop(k, None)
+        if len(_dns_cache) > 4096:
+            _dns_cache.clear()
+    _dns_cache[host] = (ip, time.monotonic() + DNS_CACHE_TTL)
+
+
+def _resolve_sync(host, port):
+    """在线程池里跑的阻塞解析。"""
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+        if infos:
+            return infos[0][4][0]
+    except Exception:
+        pass
+    return None
+
+
 class RateLimiter:
     """对某个源 IP 的带宽限制。rate_bps<=0 表示不限速。
 
@@ -659,10 +739,54 @@ class UdpRelay:
             return
         self.stats['up'] += len(payload)
         self.stats['pkts'] += 1
+        # 目标可能是域名（ATYP=3）。**绝对不能**直接 sendto(host, port) ——
+        # asyncio 会在事件循环里同步 getaddrinfo，实测 38.90ms 全停摆。
+        # 见文件上方 DNS 缓存那段的注释。
+        self._send_to_target(host, port, payload)
+
+    def _send_to_target(self, host, port, payload):
+        """
+        发往目标。域名先查缓存；未命中就异步解析 + 丢这一包。
+
+        为什么丢包而不是排队：UDP 本来允许丢包，游戏/QUIC 都有重传。
+        排队会让**所有关联**一起等，丢一个包只影响这一个流 —— 后者代价小得多。
+        解析完成后同一个域名的后续包立刻走缓存，只丢第一次。
+        """
+        # 是不是 IP 字面量？是就直接发（最常见，零开销）
         try:
-            self._target_transport.sendto(payload, (host, port))
-        except Exception as e:
-            log('UDP 发往 %s:%d 失败: %s' % (host, port, e))
+            socket.inet_aton(host)
+            try:
+                self._target_transport.sendto(payload, (host, port))
+            except Exception as e:
+                log('UDP 发往 %s:%d 失败: %s' % (host, port, e))
+            return
+        except OSError:
+            pass
+
+        ip = _dns_cache_get(host)
+        if ip is not None:
+            try:
+                self._target_transport.sendto(payload, (ip, port))
+            except Exception as e:
+                log('UDP 发往 %s:%d 失败: %s' % (ip, port, e))
+            return
+
+        # 域名且未缓存：触发一次异步解析，这一包丢弃
+        if host not in _dns_pending:
+            _dns_pending.add(host)
+
+            def _done(fut, h=host):
+                _dns_pending.discard(h)
+                try:
+                    got = fut.result()
+                except Exception:
+                    got = None
+                if got:
+                    _dns_cache_put(h, got)
+
+            loop = asyncio.get_event_loop()
+            fut = loop.run_in_executor(_dns_executor_global(), _resolve_sync, host, port)
+            fut.add_done_callback(_done)
 
     # ── 目标 → 客户端 ──
     def _on_target_datagram(self, data, addr):

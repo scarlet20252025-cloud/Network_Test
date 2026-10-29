@@ -129,7 +129,32 @@ public class FerryVpnService extends VpnService {
     private void doStart() throws Exception {
         FerryConfig cfg = FerryConfig.load(this);
 
-        // ① 建 TUN
+        // ① 先确认远端 SOCKS5 真的能连上。
+        //
+        // **为什么必须先查（2026-10-30 实测）**：
+        // 端口配错（remotePort=1099，而服务端只监听 1080）时，
+        // TUN 建得起来、路由也全对、hev 也启动成功 —— 界面上「通道都通了」，
+        // 但每个连接都是 io timeout，用户感觉「能连上但上不了网」。
+        // hev.log 里刷的是一模一样的四行无限循环：
+        //     io timeout
+        //     socks5 client connect
+        //     socks5 session connect
+        //     socks5 client tcp -> [xxx]:443
+        // 因为 hev 不知道上游连不上，只会一直接下去。
+        //
+        // 在这里先做一次 TCP 连通性探测，连不上就**明确报错并停止**，
+        // 不建 TUN —— 比让用户面对「通道都通却上不了网」好得多。
+        {
+            String probeErr = probeUpstream(cfg.remoteHost, cfg.remotePort, 4000);
+            if (probeErr != null) {
+                publish(STATE_ERROR, probeErr);
+                running = false;
+                stopSelf();
+                return;
+            }
+        }
+
+        // ② 建 TUN
         Builder b = new Builder()
                 .setSession("Ferry")
                 .setMtu(TunConfig.MTU)
@@ -214,6 +239,44 @@ public class FerryVpnService extends VpnService {
         closeTun();
         stopForegroundCompat();
         publish(STATE_OFF, reason);
+    }
+
+    /**
+     * 探测远端 SOCKS5 端口能不能连上。
+     *
+     * @return null = 通；否则返回给用户看的错误文案
+     *
+     * 只做 TCP 三次握手，不发 SOCKS5 协商 —— 我们要判断的是「端口有没有人听」，
+     * 不是「服务正不正常」。端口不通时立刻返回，不必等满超时。
+     *
+     * 必须在**后台线程**调用（doStart 已经在 worker 线程里，没问题）。
+     */
+    private String probeUpstream(String host, int port, int timeoutMs) {
+        java.net.Socket s = null;
+        try {
+            s = new java.net.Socket();
+            s.connect(new java.net.InetSocketAddress(host, port), timeoutMs);
+            return null;
+        } catch (java.net.SocketTimeoutException e) {
+            return "连不上出口主机 " + host + ":" + port + "（超时）。\n\n"
+                    + "可能原因：\n"
+                    + "  · 端口填错了（服务端实际监听的是 1080）\n"
+                    + "  · 不在校园网 / 出口主机没开\n"
+                    + "  · 校园网把该端口封了";
+        } catch (java.net.ConnectException e) {
+            return "连不上出口主机 " + host + ":" + port + "（连接被拒绝）。\n\n"
+                    + "端口上没有服务在监听 —— 检查「设置」里的端口，"
+                    + "服务端默认是 1080。";
+        } catch (Exception e) {
+            return "连不上出口主机 " + host + ":" + port + "：" + e.getMessage();
+        } finally {
+            if (s != null) {
+                try {
+                    s.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
     }
 
     private void closeTun() {
