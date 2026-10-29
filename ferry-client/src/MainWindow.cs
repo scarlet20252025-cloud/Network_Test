@@ -1120,6 +1120,24 @@ namespace Ferry
 
             _hsBusy = true;
 
+            // 硬闸（第一道）：没有有线上行就根本不许开。
+            //
+            // 这是 2026-10-30 的新规则，比下面的「风险确认框」更硬 ——
+            // 那个还允许用户点「是」强行开，这里不给这个选项。
+            // 因为实测下来，单块无线网卡做 SoftAP 不是「有风险」，
+            // 而是**一定会把 STA 顶掉**（用户当时的远控就此失联）。
+            var locked = Hotspot.LockedReason();
+            if (!string.IsNullOrEmpty(locked))
+            {
+                Log("热点已锁定：" + locked.Replace("\r\n", " "));
+                _hsBusy = false;
+                _swHotspot.SetSilently(false);
+                RefreshUi();
+                MessageBox.Show(this, locked, "移动热点不可用",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
             // 先问一句「这么做会不会把你自己的网断掉」。
             //
             // 为什么（2026-10-29 真实事故）：开发时在用户机上直接调
@@ -1738,7 +1756,22 @@ namespace Ferry
                     SetText(_rowHotspot, "移动热点    未开启");
                     SetFg(_rowHotspot, Palette.MutedB);
                 }
-                _swHotspot.IsEnabled = !_busy && !_hsBusy;
+
+                // 硬闸：没有有线上行时直接锁住开关，不给点。
+                //
+                // 2026-10-30 需求：只有检测到以太网连接才允许用热点。
+                // 理由见 Hotspot.LockedReason() 的注释 —— 单块无线网卡
+                // 同时做 STA + SoftAP 会把用户正在用的 WiFi 顶掉。
+                //
+                // 只在「热点没开」时锁。已经开着的话（比如网线刚被拔）
+                // 不能让开关动不了 —— 那样用户就没法关掉它了。
+                bool wired = Hotspot.HasWiredUplink();
+                if (!hsOn && !wired)
+                {
+                    SetText(_rowHotspot, "移动热点    需有线连接（当前只有 WiFi）");
+                    SetFg(_rowHotspot, Palette.MutedB);
+                }
+                _swHotspot.IsEnabled = !_busy && !_hsBusy && (hsOn || wired);
             }
 
             _btnOn.IsEnabled = !_busy && !borrowing;

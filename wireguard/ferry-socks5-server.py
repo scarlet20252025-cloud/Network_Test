@@ -447,6 +447,32 @@ def log(msg):
     print('[%s] %s' % (time.strftime('%H:%M:%S'), msg), flush=True)
 
 
+# ── UDP 关联建立的日志降噪 ──
+#
+# 为什么：mihomo 给每个 UDP 目标各建一条 ASSOCIATE，单机每秒能建十几条。
+# 原来每条都 log()，而 log() 是 print(flush=True) —— 强制刷盘。
+# 中继是单线程 asyncio，刷盘期间整个事件循环停摆，所有 UDP 转发都要等，
+# 表现为「几百毫秒的周期性大跳」，日志文件几分钟涨到 62 MB。
+#
+# 改成每 30 秒最多一行，并且只在「关联数创新高」时报告峰值。
+_ASSOC_LOG_INTERVAL = 30.0
+_assoc_log_state = {'next': 0.0, 'opened': 0, 'peak': 0}
+
+
+def _log_assoc_open(peer_ip, port, cur):
+    st = _assoc_log_state
+    st['opened'] += 1
+    if cur > st['peak']:
+        st['peak'] = cur
+    now = time.monotonic()
+    if now < st['next']:
+        return
+    st['next'] = now + _ASSOC_LOG_INTERVAL
+    log('UDP 关联 %d 条（峰值 %d），本周期新建 %d 条（最近一条 %s:%d）'
+        % (cur, st['peak'], st['opened'], peer_ip, port))
+    st['opened'] = 0
+
+
 # 回环永远放行。
 #
 # 为什么：本机连自己的端口时源 IP 是 127.0.0.1，而 --allow 默认只有私网段
@@ -756,8 +782,16 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
                              on_close=lambda r: _relays.discard(r))
             port = await relay.start()
             _relays.add(relay)
-            log('%s UDP ASSOCIATE → 中继端口 %d（当前关联 %d）'
-                % (peer_ip, port, len(_relays)))
+            # ⚠ 这里**不能**每建一条关联就写日志。
+            #
+            # 2026-10-30 实测：mihomo 给每个 UDP 目标各建一条 ASSOCIATE，
+            # 单机 1 秒能建 16 条、常驻 138 条；这个 log() 是
+            # print(..., flush=True) —— 每条都强制刷盘，而中继是单线程 asyncio，
+            # 刷盘期间**整个事件循环停摆**，所有 UDP 包的转发都得等。
+            # 表现就是「平时还行，偶尔几百毫秒大跳」，日志文件几分钟涨到 62 MB。
+            #
+            # 改成「每 30 秒汇总一行」，只在关联数创新高时提一句峰值。
+            _log_assoc_open(peer_ip, port, len(_relays))
 
             # 返回 BND.ADDR / BND.PORT。这里用 0.0.0.0 让客户端自己
             # 决定连哪个地址 —— 客户端可能是通过 WG、也可能是直连来的，

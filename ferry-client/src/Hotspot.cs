@@ -465,6 +465,69 @@ namespace Ferry
         }
 
         /// <summary>
+        /// 当前有没有**物理有线网卡**在联网。
+        ///
+        /// 2026-10-30 需求：热点功能只在「检测到以太网连接」时才允许使用，
+        /// 否则直接锁住。
+        ///
+        /// 为什么用这个当唯一门槛：单块无线网卡同时做 STA + SoftAP，
+        /// 这块 Realtek 8852BE 的处理方式是「踢掉 STA」——用户正在用的 WiFi
+        /// 会断（2026-10-29 真实事故，远控同时失去）。既然驱动没有能力检查，
+        /// 就由我们在软件层禁止这种用法。有线做上行 + WiFi 做 AP 是两个独立
+        /// 硬件，没有这个冲突。
+        ///
+        /// 判定细节（都踩过）：
+        ///   · 必须**排除虚拟网卡**：Radmin VPN / etgame / WAN Miniport 都会
+        ///     报 iana=6（以太网）且 Up，被当成有线就会放行一个危险操作。
+        ///     复用 IsVirtualAdapter 的排除表。
+        ///   · 必须**真的连着**：只看 Status == Up 不够，USB 网卡拔了线有时
+        ///     还是 Up。还要看它有没有默认网关 —— 拿不到网关说明没通。
+        /// </summary>
+        public static bool HasWiredUplink()
+        {
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.NetworkInterfaceType != NetworkInterfaceType.Ethernet) continue;
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (IsVirtualAdapter(ni.Description) || IsVirtualAdapter(ni.Name)) continue;
+
+                    var ip = ni.GetIPProperties();
+                    if (ip == null) continue;
+                    // 要有 IPv4 地址 + 默认网关，才算「真的在联网」
+                    bool hasV4 = false;
+                    foreach (var ua in ip.UnicastAddresses)
+                        if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                        { hasV4 = true; break; }
+                    if (!hasV4) continue;
+                    if (ip.GatewayAddresses == null || ip.GatewayAddresses.Count == 0) continue;
+
+                    return true;
+                }
+            }
+            catch (Exception) { }
+            return false;
+        }
+
+        /// <summary>
+        /// 热点锁定的原因文案。空 = 允许使用。
+        ///
+        /// 和 UplinkRisk() 的区别：UplinkRisk 是「有风险但可以确认后继续」，
+        /// 这里是**硬锁**，不给「继续」的选项。
+        /// </summary>
+        public static string LockedReason()
+        {
+            if (HasWiredUplink()) return "";
+            return "移动热点已锁定：当前没有检测到有线（以太网）连接。\n\n"
+                 + "原因：这台笔记本只有一块无线网卡，它既是你的上网通道、"
+                 + "又是热点的发射网卡。单块无线网卡无法同时做这两件事 —— "
+                 + "强行开启会让你的 WiFi 直接断开。\n\n"
+                 + "请先插上网线（有线做上行），再回来开启热点。";
+        }
+
+
+        /// <summary>
         /// 开热点。返回空字符串表示成功（**以网卡拿到 192.168.137.1 为准**）。
         /// </summary>
         /// <param name="ssid">空 = 不改现有配置</param>
@@ -474,6 +537,11 @@ namespace Ferry
         {
             var err = EnsureLoaded();
             if (err != "") return err;
+
+            // 硬闸：没有有线上行就不许开（见 LockedReason 的注释）。
+            // 放在最前面 —— 连 ICS 都不该去碰，避免把状态机搞乱。
+            var locked = LockedReason();
+            if (locked != "") return locked;
 
             if (!string.IsNullOrEmpty(pass) && pass.Length < 8)
                 return "热点密码至少 8 位";
@@ -654,12 +722,82 @@ namespace Ferry
                 var mgr = Manager();
                 if (mgr == null) return "";
                 StopAndWait(mgr, waitMs);
+                CleanupWifiDirectAdapters();
                 return "";
             }
             catch (Exception e)
             {
                 return "关闭热点异常：" + Innermost(e).Message;
             }
+        }
+
+        /// <summary>
+        /// 关掉热点后，把「Microsoft Wi-Fi Direct Virtual Adapter」禁掉。
+        ///
+        /// **为什么必须做（2026-10-29 血的教训）**：
+        /// 单块无线网卡做 SoftAP 时，Windows 会派生一块
+        /// `Microsoft Wi-Fi Direct Virtual Adapter`，它和物理网卡**共用同一套
+        /// 射频前端**（MAC 只差首字节的本地位）。热点关掉后这块虚拟适配器
+        /// **不会被自动清理**，一直是 Up 状态、持续做 Wi-Fi Direct 探测/广播。
+        ///
+        /// 实测后果：用户的 CS2 从 4ms 变成 61-78ms 的稳定锯齿，抖动 32ms，
+        /// 而且**不借网、直连、渡口完全退出时一样慢**。折腾了一整夜，
+        /// 换驱动、改省电、改 ASPM、改漫游全部无效，最后发现是这块虚拟网卡。
+        /// 禁用它之后 p50 从 61ms 回到 4.6ms。
+        ///
+        /// 判定「该不该禁」：描述含 wi-fi direct 且 状态不是 Disabled 的都要处理。
+        /// 用 PnP 层禁用（和「设备管理器里右键禁用」等价），断电重启后仍有效。
+        ///
+        /// 失败不报错 —— 这是「清理」动作，禁不掉也不该让「关闭热点」显示失败。
+        /// </summary>
+        public static void CleanupWifiDirectAdapters()
+        {
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    var desc = (ni.Description ?? "").ToLowerInvariant();
+                    var name = (ni.Name ?? "").ToLowerInvariant();
+                    if (desc.IndexOf("wi-fi direct", StringComparison.Ordinal) < 0 &&
+                        desc.IndexOf("wifi direct", StringComparison.Ordinal) < 0 &&
+                        name.IndexOf("wi-fi direct", StringComparison.Ordinal) < 0)
+                        continue;
+                    if (ni.OperationalStatus == OperationalStatus.Down &&
+                        ni.NetworkInterfaceType == NetworkInterfaceType.Unknown)
+                        continue;   // 已经不可用，跳过
+
+                    // 优先按「名字里带 * 号的那块」（本地连接* N）精确禁；
+                    // 名字不可靠时退回按描述匹配全部。
+                    RunNetsh("interface set interface \"" + ni.Name + "\" admin=disable");
+                }
+            }
+            catch (Exception) { }
+
+            // netsh 对某些驱动无效（它只改管理状态），补一刀 PnP 层禁用。
+            try
+            {
+                RunNetsh("interface set interface name=\"本地连接* 2\" admin=disable");
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>跑一条 netsh 命令，吞掉所有错误（清理动作不该失败）。</summary>
+        static void RunNetsh(string args)
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("netsh", args);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    try { p.WaitForExit(4000); } catch (Exception) { }
+                    try { if (!p.HasExited) p.Kill(); } catch (Exception) { }
+                }
+            }
+            catch (Exception) { }
         }
 
         static void StopAndWait(object mgr, int waitMs)

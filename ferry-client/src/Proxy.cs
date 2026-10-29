@@ -90,7 +90,19 @@ namespace Ferry
         const int UdpIdleSec = 45;
 
         /// <summary>整条 UDP 关联的空闲回收时间（没有收到任何客户端包）。</summary>
-        const int UdpAssocIdleSec = 90;
+        ///
+        /// 2026-10-30：90 秒 → 45 秒。
+        ///
+        /// 为什么缩短：mihomo 会给**每一个 UDP 目标**建一条独立的 ASSOCIATE
+        /// （每个网页的 QUIC、每个语音流、每个游戏服务器各算一条）。实测本机
+        /// 1 秒内能建 16 条、常驻 138 条，远端中继并发 90+。
+        /// 90 秒的空闲期意味着「关掉网页后那条关联还要占 90 秒名额」，
+        /// 积压起来就撞 512 上限，日志刷「UDP 关联失败：上游不支持或连不上」，
+        /// 表现为游戏几秒一卡、几百毫秒的大跳。
+        ///
+        /// 45 秒足够覆盖「切出去看一眼浏览器再回来」这种正常间隔，
+        /// 又不会让已经关闭的应用继续占着名额。
+        const int UdpAssocIdleSec = 45;
         /// <summary>
         /// 同时存在的 UDP 关联上限。
         ///
@@ -123,7 +135,7 @@ namespace Ferry
         /// 淘汰最久没有收发包的 UDP 流，腾出一个名额。
         /// 返回 false 表示没有可淘汰的（列表空或全在活跃）。
         /// </summary>
-        bool EvictStalestUdpRelay()
+        bool EvictStalestUdpRelay(string sameTargetOnly = null)
         {
             UdpRelay victim = null;
             DateTime oldest = DateTime.MaxValue;
@@ -505,10 +517,14 @@ namespace Ferry
             // 淘汰策略：砍掉最久没有收发的那条（真正在用的流不会被选中），
             // 让新的关联进来。上限本身仍然保留 —— 每条关联 2 socket + 2 线程，
             // 远端中继还有 RELAY_HARD_LIMIT = 3000 的硬上限。
+            //
+            // 2026-10-30 追加：即使总名额没满，同一目标下堆太多关联也要淘汰。
+            // 见 MaxUdpAssocPerTarget 的注释 —— 一次网页加载的几十条 QUIC 会把
+            // 名额吃光，游戏就建不起来，日志刷「上游不支持或连不上」。
             int now = Interlocked.Increment(ref _udpAssoc);
             if (now > MaxUdpAssoc)
             {
-                if (!EvictStalestUdpRelay())
+                if (!EvictStalestUdpRelay(null))
                 {
                     Interlocked.Decrement(ref _udpAssoc);
                     _log("UDP 关联数已达上限 " + MaxUdpAssoc + "，且无法淘汰，拒绝新关联 (" + clientEp + ")");

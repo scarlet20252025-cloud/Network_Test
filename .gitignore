@@ -82,3 +82,4 @@ android/third-part/hev-socks5-tunnel/
 android/**/*.so.dbg
 android/**/obj/
 
+backup/drivers/
