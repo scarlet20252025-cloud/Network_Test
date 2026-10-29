@@ -95,9 +95,50 @@ powershell -ExecutionPolicy Bypass -File tools\build-native-remote.ps1
 | Gradle 8.7 | `D:\gradle\gradle-8.7` |
 | hev 源码 | `D:\hev-src`（含 4 个子模块）|
 
+### M1.5 三个 ABI + 自检（2026-10-29 11:00 后）
+
+```
+ndk-build exit = 0
+OK   arm64-v8a    346.8 KB      ← 真机主力
+OK   armeabi-v7a  237.7 KB      ← 老真机
+OK   x86_64       347.6 KB      ← 模拟器
+APK = 5.99 MB（含三个 ABI）
+```
+
+`app/build.gradle` 里 debug 打三个 ABI、release 只打两个 arm（省约 400 KB）。
+
+**新增 `SelfCheck.java`**：把「隧道到底通没通」拆成五步逐层验证 ——
+① tun 网卡有 198.18.0.1 ② hev native 在跑 ③ DNS 能解析 ④ HTTP 能通
+⑤ 出口 IP 是远端。第 ⑤ 步最要紧：前四步全过也可能「其实没走隧道」，
+只有出口 IP 变了才证明真的在借网。结果同时写 logcat（`FerryUi`）
+和 `files/selfcheck.txt`。
+
+界面多了「自检」按钮；另外留了两个自动化入口（普通启动不受影响）：
+`am start ... --ez autostart true --ez selfcheck true`。
+
+### ⚠ 路由表写错过一次（已修，值得单独记）
+
+第一版按「`addRoute("0.0.0.0",0)` + `addRoute("10.0.0.0",8)` 排除局域网」写 ——
+**完全相反**。`addRoute` 的语义是「把这些网段导进隧道」，加得越具体优先级越高，
+等于把局域网也塞进隧道，然后被 hev 送到远端绕一圈：
+访问打印机 / 摄像头 / 路由器后台全部超时。而 VpnService **没有**「排除」API。
+
+参考项目给了两条正路：
+
+| 项目 | 做法 |
+|---|---|
+| `tokyoxpa3/5G-Proxy-Client`（采用）| 不加 `0.0.0.0/0`，显式列出「所有公网单播」的 46 条 CIDR；私网天然不在表内 → 系统走 wlan0 直连 |
+| `esrrhs/pingtunnel-client` | 照加 `0.0.0.0/0`，局域网绕过下沉到用户态规则引擎 |
+
+我们用 hev 直连远端 SOCKS5，没有那层规则引擎，所以走前者。
+表放在 `TunConfig.PUBLIC_V4`，正确性由 `tools/verify-android-routes.py` 校验
+（覆盖、无重叠、五个私网段必须完全不在表内）。
+
 ---
 
 ## 踩到的坑（都修了，别再犯）
+
+### 0. 路由语义搞反（见上，最重要的一条）
 
 ### 1. 远端构建脚本无 BOM → 中文注释破坏语法
 

@@ -13,7 +13,9 @@ android {
         versionCode 1
         versionName '0.1.0'
 
-        // 只打主流 ABI —— 每多一个 ABI，APK 多一份 .so（约 1MB）
+        // 真机只需要两个 arm ABI —— 每多一个 ABI，APK 多一份 .so。
+        // x86_64 只在 debug 包里加（见下面的 buildTypes.debug），
+        // 那个是给模拟器验证用的，正式包里不需要，省约 400 KB。
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a'
         }
@@ -35,19 +37,27 @@ android {
         }
         debug {
             applicationIdSuffix '.debug'
+            // 模拟器上跑需要 x86_64 的 .so；真机的 debug 装包也会多带一份，
+            // 无所谓（debug 包不上架）。
+            ndk {
+                abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+            }
         }
     }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+        // 源码是 UTF-8，中文注释不能靠系统默认编码（Windows 上是 GBK）。
+        // 不加这行，javac 会按平台的 ANSI 解码源文件 —— 中文注释变乱码，
+        // 而且报错位置指向无关的行，和 .ps1 无 BOM 那个坑是同一类。
+        encoding 'UTF-8'
     }
 
     buildFeatures {
         viewBinding true
     }
 
-    // 源码用 UTF-8，中文注释不能依赖系统默认编码
     lint {
         abortOnError false
     }

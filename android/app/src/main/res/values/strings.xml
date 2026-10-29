@@ -9,6 +9,8 @@
 
     <string name="btn_start">开始借网</string>
     <string name="btn_stop">停止并恢复直连</string>
+    <string name="btn_selfcheck">自检（连不上时点这个）</string>
+    <string name="selfcheck_running">正在自检…</string>
 
     <string name="label_code">激活码</string>
     <string name="btn_activate">激活</string>

@@ -135,17 +135,20 @@ public class FerryVpnService extends VpnService {
                 .setMtu(TunConfig.MTU)
                 .addAddress(TunConfig.TUN_ADDRESS_V4, TunConfig.TUN_PREFIX_V4)
                 // 把 mapdns 的虚拟 DNS 配成系统 DNS —— 这样 App 发的 DNS 查询
-                // 会被 TUN 抓到（198.18.0.2 属于 fake-ip 池，会进隧道）
-                .addDnsServer(TunConfig.DNS_ADDRESS)
-                // 0.0.0.0/0 = 全部流量进隧道。局域网段靠下面的路由排除。
-                .addRoute("0.0.0.0", 0);
+                // 会落到 198.18.0.2，属于会进隧道的段，由 hev 在本地应答成 fake-ip。
+                .addDnsServer(TunConfig.DNS_ADDRESS);
 
-        // 排除局域网：不加这条，访问 10.x/192.168.x 的打印机、摄像头、
-        // 远端主机自己，都会被塞进隧道绕一圈。
-        for (String cidr : TunConfig.BYPASS_CIDRS) {
-            String[] parts = cidr.split("/");
-            b.addRoute(parts[0], Integer.parseInt(parts[1]));
+        // ② 只把「公网单播」导进隧道（**不是** 0.0.0.0/0）
+        //
+        // 原来的写法是 addRoute("0.0.0.0",0) 再 addRoute("10.0.0.0",8)，
+        // 想「排除局域网」—— 完全相反：addRoute 是「导进隧道」，
+        // 越具体优先级越高，等于把局域网也塞进隧道，然后被送到远端绕一圈，
+        // 访问打印机/摄像头/路由器后台全部超时。VpnService 没有「排除」API。
+        // 详见 TunConfig 里的长注释。
+        for (String[] r : TunConfig.routesV4()) {
+            b.addRoute(r[0], Integer.parseInt(r[1]));
         }
+
         // 本 App 自己不进隧道（否则代理请求又回到自己，成环）
         try {
             b.addDisallowedApplication(getPackageName());

@@ -25,7 +25,11 @@ $jniDir = Join-Path $repo 'android\app\src\main\jniLibs'
 if (Test-Path $jniDir) { Remove-Item $jniDir -Recurse -Force }
 New-Item -ItemType Directory -Path $jniDir -Force | Out-Null
 
-foreach ($abi in @('arm64-v8a', 'armeabi-v7a')) {
+# 三个 ABI：
+#   arm64-v8a / armeabi-v7a —— 真机（覆盖几乎所有在用手机）
+#   x86_64                 —— 模拟器（用于在没有真机时验证隧道能不能起来）
+# x86_64 只在 debug 包里打进 APK，见 app/build.gradle 的 abiFilters。
+foreach ($abi in @('arm64-v8a', 'armeabi-v7a', 'x86_64')) {
     $localAbi = Join-Path $jniDir $abi
     New-Item -ItemType Directory -Path $localAbi -Force | Out-Null
     & scp -o ConnectTimeout=10 -o BatchMode=yes "${Target}:C:/tmp/hev-libs/$abi/libhev-socks5-tunnel.so" (Join-Path $localAbi 'libhev-socks5-tunnel.so')

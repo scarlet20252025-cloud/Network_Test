@@ -8,6 +8,7 @@ import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.TextUtils;
+import android.util.Log;
 import android.widget.EditText;
 import android.widget.TextView;
 
@@ -34,7 +35,7 @@ public class MainActivity extends AppCompatActivity {
 
     private TextView txtState, txtDetail, txtLog;
     private EditText txtCode;
-    private MaterialButton btnToggle, btnActivate;
+    private MaterialButton btnToggle, btnActivate, btnSelfCheck;
 
     private FerryConfig cfg;
     private final StringBuilder logBuf = new StringBuilder();
@@ -60,11 +61,13 @@ public class MainActivity extends AppCompatActivity {
         txtCode = findViewById(R.id.txtCode);
         btnToggle = findViewById(R.id.btnToggle);
         btnActivate = findViewById(R.id.btnActivate);
+        btnSelfCheck = findViewById(R.id.btnSelfCheck);
 
         cfg = FerryConfig.load(this);
 
         btnToggle.setOnClickListener(v -> onToggle());
         btnActivate.setOnClickListener(v -> onActivate());
+        btnSelfCheck.setOnClickListener(v -> runSelfCheck());
 
         if (cfg.hasToken()) {
             txtCode.setText(cfg.code);
@@ -72,6 +75,47 @@ public class MainActivity extends AppCompatActivity {
         }
         applyState(FerryVpnService.getLastState(), FerryVpnService.getLastMessage());
         refreshDetail();
+
+        // 自动化测试入口：am start ... --ez autostart true
+        //
+        // 为什么要留这个：真机/模拟器上没法自动点系统 VPN 授权框之后的「开始」按钮，
+        // 而端到端验证必须真的把隧道拉起来。加一个显式意图参数最省事，
+        // 也不会被误触发（普通启动不带这个 extra）。
+        if (getIntent() != null && getIntent().getBooleanExtra("autostart", false)) {
+            log("收到 autostart，自动开始借网");
+            txtCode.postDelayed(this::startVpn, 800);
+        }
+        if (getIntent() != null && getIntent().getBooleanExtra("selfcheck", false)) {
+            log("收到 selfcheck，自动自检");
+            txtCode.postDelayed(this::runSelfCheck, 1200);
+        }
+    }
+
+    /** 自检：五步逐层验证隧道，结果写进日志（也回显在状态栏）。 */
+    private void runSelfCheck() {
+        btnSelfCheck.setEnabled(false);
+        log(getString(R.string.selfcheck_running));
+        SelfCheck.run((items, summary) -> runOnUiThread(() -> {
+            btnSelfCheck.setEnabled(true);
+            for (SelfCheck.Item i : items) log("  " + i);
+            log("自检结果：" + summary);
+            txtDetail.setText(summary);
+            // 落一份文件：adb 抓 logcat 有时序丢行的问题，
+            // 自检结果单独写文件更可靠（也方便用户直接发给我）。
+            try {
+                StringBuilder sb = new StringBuilder();
+                sb.append(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date()))
+                  .append('\n');
+                for (SelfCheck.Item i : items) sb.append(i).append('\n');
+                sb.append(summary).append('\n');
+                java.io.FileOutputStream fos =
+                        openFileOutput("selfcheck.txt", MODE_PRIVATE);
+                fos.write(sb.toString().getBytes("UTF-8"));
+                fos.close();
+            } catch (Exception e) {
+                Log.w("FerryUi", "写 selfcheck.txt 失败", e);
+            }
+        }));
     }
 
     @Override
@@ -202,6 +246,9 @@ public class MainActivity extends AppCompatActivity {
 
     private void log(String s) {
         String ts = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+        // 同时进 logcat：用户报「连不上」时，让他用 `adb logcat -s FerryUi` 抓一段
+        // 比让他复述界面文字准确得多。自检结果也走这条路。
+        Log.i("FerryUi", s);
         logBuf.append(ts).append("  ").append(s).append('\n');
         // 只留最后 4000 字，防止长了以后界面卡
         if (logBuf.length() > 4000) {

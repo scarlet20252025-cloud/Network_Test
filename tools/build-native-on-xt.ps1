@@ -7,13 +7,16 @@
 #
 # 流程：
 #   1. clone hev-socks5-tunnel（含 4 个子模块）到 D:\hev-src
-#   2. ndk-build 出 libhev-socks5-tunnel.so（arm64-v8a + armeabi-v7a）
+#   2. ndk-build 出 libhev-socks5-tunnel.so（三个 ABI，见下面的 $Abis）
 #   3. 把 .so 复制到 C:\tmp\hev-libs\<abi>\
 param(
-    [string[]]$Abis = @('arm64-v8a', 'armeabi-v7a'),
     [string]$HevRepo = 'D:\hev-src',
     [string]$Ndk = 'D:\AndroidSdk\ndk\27.0.12077973',
-    [string]$HevCommit = ''
+    [string]$HevCommit = '',
+    # x86_64 是给模拟器用的（没有真机时靠它验证隧道能否起来）。
+    # 打进 APK 与否由 app/build.gradle 的 abiFilters 决定：
+    # debug 三个 ABI 都打，release 只打两个 arm。
+    [string[]]$Abis = @('arm64-v8a', 'armeabi-v7a', 'x86_64')
 )
 
 $ErrorActionPreference = 'Continue'
