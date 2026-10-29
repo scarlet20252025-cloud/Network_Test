@@ -4,34 +4,34 @@
 > 或者会话一续，待办就没了 —— 已经因此丢过好几次。所以待办**以这个文件为准**，
 > 每次动手前后都更新它。`todo_write` 只当当前这一轮的临时视图用。
 
-最后更新：2026-10-30 02:15
+最后更新：2026-10-30 04:45
 
 ---
 
 ## 正在做
 
-- [ ] **Android「通道通但上不了网」—— 根因已定位，等装机验证**
+- [x] **Android「通道通但上不了网」—— 已修复并真机验证**（2026-10-30 03:05）
   - **根因：`remotePort = 1099`，而 pcs 上只有 1080 在监听**
-    （`netstat` 确认 1099 无任何进程监听）
-  - 证据：`hev.log` 里 `io timeout` 出现 **16982 次**，形态是无限循环：
-    ```
-    io timeout
-    socks5 client connect
-    socks5 session connect
-    socks5 client tcp -> [xxx]:443
-    ```
-    hev 不知道上游连不上，只会一直重连，每次都等满 `connect-timeout: 8000`。
-  - 已做：
-    1. 手机 `shared_prefs/ferry.xml` 的 `remotePort` 已改回 **1080**
-    2. 手机 `files/hev/tunnel.yaml` 的 `port` 手工改成 **1080**（App 只在点「开始借网」时重写它）
-    3. 客户端加了 `probeUpstream()`：启动隧道前先 TCP 探测上游，
-       连不上就**明确报错并停止**，不建 TUN（1.0.51 已编译进 APK）
-  - **卡在哪**：vivo 拒绝 adb 安装
-    （`INSTALL_FAILED_ABORTED: User rejected permissions`），
-    即使屏幕已唤醒、`verifier_verify_adb_installs=0` 也一样。
-    **需要用户在手机上手动允许**：
-    设置 → 系统管理 → 开发者选项 → **USB 安装**（打开）
-    或直接手动安装 `dist/ferry-debug.apk`
+  - 证据：`hev.log` 里 `io timeout` 出现 **16982 次**（无限重连，每次等满 8 秒）
+  - 手机 `nc` 测：1080 OPEN / 1099 Timeout
+  - 修复：手机 `shared_prefs/ferry.xml` + `files/hev/tunnel.yaml` 都改成 1080
+  - **真机验证**：用系统浏览器打开百度，服务端日志收到
+    `10.141.57.9 -> hpd.baidu.com:443 done, 17193 bytes`
+  - 客户端加了 `probeUpstream()` 端口预检（1.0.51 APK 已构建）
+
+- [ ] **自检「3/5 项通过」是假阴性 —— 已定位，方案待定**
+  - 原因：`addDisallowedApplication(getPackageName())` 让本 App（uid 10293）
+    不在 VPN 路由规则内（`ip rule` 里 uidrange 0-10292 / 10294-99999，
+    **10293 正好空着**），所以 App 自己发的 HTTP 必然走物理网卡
+  - `adb shell`（uid 2000）同理，也测不准
+  - **真正有效的验证方法**：用系统浏览器打开网页，看服务端日志有没有该手机记录
+  - 下一轮可改为「读 `/proc/net/dev` 的 tun0 收发字节增量」判断隧道是否有流量
+
+- [ ] **vivo 拒绝 adb 安装，需用户手动开权限**
+  - `INSTALL_FAILED_ABORTED: User rejected permissions`
+  - 屏幕已唤醒、`verifier_verify_adb_installs=0` 也一样被拦
+  - **需要**：设置 → 系统管理 → 开发者选项 → **USB 安装**（打开）
+  - 或直接在手机上下载门户的 `dist/ferry-debug.apk` 手动安装
 
 ## 已修（2026-10-30 凌晨）
 
