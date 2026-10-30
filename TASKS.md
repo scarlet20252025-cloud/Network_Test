@@ -353,15 +353,18 @@ WLAN 排最后。目前无影响，但多网卡广播场景下可能选错网卡
   - 已确认前提：这台手机在校园网里**能直连公网**（自检 2/5 那次 DNS 和 HTTP 都成功），
     所以「禁网」在当前条件下构造不出来 —— 改为验证「上游坏掉时的行为」
   - ⚠ 手机已从 USB 掉线，接回后要先修复配置（做实验时把 remotePort 改成了 1099）
-- [ ] **M5 UDP/游戏延迟量化 —— 已测出结论：中继几乎不贵，但手机上 UDP 根本没通**
+- [x] **M5 UDP/游戏延迟量化 —— 已修好并真机验证**（2026-10-30 17:20）
   - 详见 `docs/M5-Android-UDP实测.md`
-  - 中继净成本：p50 **+0.1 ~ +0.6 ms**（6 轮重复，多次为负=噪声）
-  - **手机侧 UDP 关联建了但 0 包转发**：10 条关联 `上行 0 B / 0 包`；
-    同时间段 Windows 客户端 `上行 640 B / 20 包` → 中继侧正常，问题在 hev
-  - hev 日志有 `socks5 client udp construct`，之后无错误、无后续 → 包静默消失
-  - **下一步**：把 hev `log-level` 调到 `debug` 看 `socks5 session udp fwd b recv`；
-    或试 `udp: 'tcp'`（UDP over TCP）作退路
-  - 测法工具：`tools/measure-android-udp.py`（判据看包数，不只看关联有没有）
+  - 中继净成本：p50 **+0.1 ~ +1.6 ms**（多轮重复，量级在测量噪声内）
+  - **根因**：服务端 UDP ASSOCIATE 按 RFC 返回 `BND.ADDR = 0.0.0.0`
+    （合规），但 hev 会拿这个地址去 `connect()` 自己的 UDP socket，
+    而 Linux/Android 上 `connect(0.0.0.0)` = 「连本机」→ 包全进回环
+  - **修法**：`HevConfig` 里加 `udp-address: <socks5.address>`，
+    这是官方为此提供的覆盖项（README: "Override the UDP address
+    provided by the Socks5 server"）
+  - **验证**：手机关联从 `上行 0 B / 0 包` → `上行 8204 B / 23 包`，
+    且有真实回包（单条 `4038 B 上行 / 17184 B 下行`）
+  - 测法工具：`tools/measure-android-udp.py`（判据看**包数**，不只看关联有没有）
 - [ ] **Per-App 分流**：只让指定 App 走隧道（参考 5G-Proxy-Client 的 `PerAppMode`）
 - [ ] **长期稳定性**：挂着 VPN 用一天，看耗电、断线重连、WiFi↔4G 切换
 - [ ] **手机端功能补充**（用户让评估）：见下面「候选功能」
