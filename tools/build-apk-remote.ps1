@@ -80,7 +80,16 @@ Write-Output '=== 5. 拉回 APK ==='
 $outApk = Join-Path $repo 'dist\ferry-debug.apk'
 $outDir = Split-Path -Parent $outApk
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
-& scp -o ConnectTimeout=10 -o BatchMode=yes "${Target}:C:/tmp/ferry-debug.apk" $outApk
+# scp 的目标路径必须是纯 ASCII。本仓库在 E:\肥鱼不乐园 下，把中文路径直接喂给 scp
+# 会被当成 UTF-8 字节序列塞进 Windows 路径，报
+#   scp: open local "E:/\350\202\245\351\261\274...": Broken pipe
+# 然后 exit 1 —— 看着像传输失败，其实是路径编码。先落到 C:\tmp 再搬。
+$tmpApk = 'C:\tmp\ferry-debug-dl.apk'
+Remove-Item $tmpApk -Force -ErrorAction SilentlyContinue
+& scp -o ConnectTimeout=10 -o BatchMode=yes "${Target}:C:/tmp/ferry-debug.apk" $tmpApk
+if ($LASTEXITCODE -eq 0 -and (Test-Path $tmpApk)) {
+    Copy-Item $tmpApk $outApk -Force
+}
 if ($LASTEXITCODE -eq 0 -and (Test-Path $outApk)) {
     Write-Output ("  APK 已拉回：$outApk  (" + [math]::Round((Get-Item $outApk).Length / 1MB, 2) + " MB)")
 } else {
