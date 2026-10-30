@@ -43,6 +43,22 @@ public class FerryVpnService extends VpnService {
     public static final String ACTION_START = "com.ferry.app.START";
     public static final String ACTION_STOP = "com.ferry.app.STOP";
 
+    /** 停止原因，跟着 ACTION_STOP 一起传。不传就是「用户停止」。 */
+    public static final String EXTRA_REASON = "reason";
+
+    /**
+     * 授权检查周期（毫秒）。
+     *
+     * 必须由**服务自己**查，不能只靠 MainActivity 的 licWatch —— 那条路
+     * 只在界面活着时跑。2026-10-30 实测：授权 13:17:49 到期，界面早被切到
+     * 后台，13:54 隧道还在跑（服务端仍收到这台手机 141 条记录），
+     * 等于白送了 36 分钟。
+     *
+     * 30 秒一次是有意的折中：SharedPreferences 是纯内存读，代价可忽略；
+     * 而临近到期时会精确调度到到期那一刻（见 licWatchTick），不会白等这 30 秒。
+     */
+    private static final long LIC_CHECK_INTERVAL_MS = 30_000L;
+
     /** 状态广播：界面靠它刷新，不用轮询。 */
     public static final String ACTION_STATE = "com.ferry.app.STATE";
     public static final String EXTRA_STATE = "state";
@@ -62,6 +78,24 @@ public class FerryVpnService extends VpnService {
     private static String lastState = STATE_OFF;
     private static String lastMessage = "";
 
+    /** 授权复核定时器。跑在主线程，只做一次 SharedPreferences 读，不做 IO。 */
+    private final android.os.Handler licHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable licWatchTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!running) return;
+            FerryConfig cfg = FerryConfig.load(FerryVpnService.this);
+            if (cfg.locallyExpired()) {
+                Log.i(TAG, "license expired while tunnel up, stopping");
+                stopTunnel("授权已到期，隧道已断开；续期后重新点「开始借网」");
+                stopSelf();
+                return;
+            }
+            scheduleLicWatch(cfg);
+        }
+    };
+
     public static String getLastState() {
         return lastState;
     }
@@ -80,7 +114,10 @@ public class FerryVpnService extends VpnService {
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
         if (ACTION_STOP.equals(action)) {
-            stopTunnel("用户停止");
+            // 界面可以带原因过来（例如「授权过期」），这样状态栏说的
+            // 就是真实原因，而不是一律「用户停止」。
+            String reason = intent.getStringExtra(EXTRA_REASON);
+            stopTunnel(reason == null || reason.isEmpty() ? "用户停止" : reason);
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -128,6 +165,19 @@ public class FerryVpnService extends VpnService {
 
     private void doStart() throws Exception {
         FerryConfig cfg = FerryConfig.load(this);
+
+        // ⓪ 起隧道前先自己判一次授权。
+        //
+        // 界面在点「开始借网」时也会拦（MainActivity.startVpn），但那一路
+        // 拦不住两种绕过方式：系统 Always-on VPN 用 null intent 直接拉起本服务，
+        // 以及界面判完之后、隧道建好之前刚好跨过到期时刻。
+        // 这里再判一次是最后一道闸，代价只是一次 SharedPreferences 读。
+        if (cfg.locallyExpired()) {
+            publish(STATE_ERROR, "授权已到期，不能借网；请续期后重试");
+            running = false;
+            stopSelf();
+            return;
+        }
 
         // ① 先确认远端 SOCKS5 真的能连上。
         //
@@ -224,11 +274,38 @@ public class FerryVpnService extends VpnService {
         }
 
         publish(STATE_ON, "已借网 · 出口 " + cfg.remoteHost + ":" + cfg.remotePort);
+        scheduleLicWatch(cfg);
+    }
+
+    /**
+     * 排下一次授权复核。
+     *
+     * 临近到期时**精确**排到到期那一刻，而不是傻等 30 秒 ——
+     * 用户签的是一天，不该因为我们自己的检查粒度多借出 30 秒。
+     */
+    private void scheduleLicWatch(FerryConfig cfg) {
+        licHandler.removeCallbacks(licWatchTick);
+        long delay = LIC_CHECK_INTERVAL_MS;
+        if (cfg != null && cfg.expiresAt > 0) {
+            long untilExpiry = cfg.expiresAt * 1000L - System.currentTimeMillis();
+            if (untilExpiry > 0 && untilExpiry < delay) delay = untilExpiry;
+        }
+        licHandler.postDelayed(licWatchTick, Math.max(0, delay));
     }
 
     private void stopTunnel(String reason) {
+        licHandler.removeCallbacks(licWatchTick);
         if (!running && tunFd == null) {
-            publish(STATE_OFF, reason);
+            // 已经停了就别再广播一次。
+            //
+            // 这里原来无条件 publish(STATE_OFF, reason)，结果每次真正停止时
+            // 会广播两遍：一次带真实原因（"授权已到期…" / "用户停止"），
+            // 紧接着 stopSelf() → onDestroy() → stopTunnel("服务销毁")
+            // 再把文案盖成「服务销毁」。用户永远看不到真正的原因。
+            // 2026-10-30 加「授权到期」文案时才发现 —— 之前所有停止原因都是白写的。
+            if (!STATE_OFF.equals(lastState)) {
+                publish(STATE_OFF, reason);
+            }
             return;
         }
         running = false;

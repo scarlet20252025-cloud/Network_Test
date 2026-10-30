@@ -48,6 +48,8 @@ public class MainActivity extends AppCompatActivity {
 
     /** 授权状态兜底轮询用的 Handler（见 scheduleLicenseWatch）。 */
     private Handler licWatch;
+    /** 上次界面已知的服务状态，用来在 onResume 时发现「息屏期间错过了什么」。 */
+    private String lastSeenState = FerryVpnService.STATE_OFF;
     private final StringBuilder logBuf = new StringBuilder();
 
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
@@ -57,6 +59,7 @@ public class MainActivity extends AppCompatActivity {
             String msg = intent.getStringExtra(FerryVpnService.EXTRA_MESSAGE);
             applyState(state, msg);
             if (msg != null && !msg.isEmpty()) log(msg);
+            if (state != null) lastSeenState = state;
         }
     };
 
@@ -102,8 +105,14 @@ public class MainActivity extends AppCompatActivity {
             cfg.licState = FerryConfig.LIC_CHECKING;
             log("已激活，" + cfg.leftText());
         }
-        applyState(FerryVpnService.getLastState(), FerryVpnService.getLastMessage());
+        // 顺序同 onResume：先铺授权详情，再按服务状态覆盖主标题。
+        // 反过来写的话 applyState 刚设好的「授权已到期，隧道已断开…」
+        // 会被 refreshDetail 立刻盖成「授权已过期」—— 用户看不到原因。
         refreshDetail();
+        String initState = FerryVpnService.getLastState();
+        applyState(initState, FerryVpnService.STATE_ON.equals(initState)
+                ? null : FerryVpnService.getLastMessage());
+        lastSeenState = initState;
 
         // 授权状态监控：启动即核对一次，之后跟着借网启停再核对，
         // 另外每 5 分钟兜底一次（用户挂着不关的时候，过期了要能发现）。
@@ -136,6 +145,28 @@ public class MainActivity extends AppCompatActivity {
             log("收到 selfcheck，自动自检");
             btnSelfCheck.postDelayed(this::runSelfCheck, 1200);
         }
+        // 测试用：模拟「界面判完之后、隧道建好之前刚好跨过到期时刻」。
+        //
+        // 为什么需要它：doStart() 里那道「起隧道前再判一次授权」的前门，
+        // 正常点按根本走不到 —— 界面在 startVpn() 就拦下了。它防的是
+        // 系统 Always-on VPN 用 null intent 拉起、以及这个时间窗竞态。
+        // 这两条在真机上都复现不了：服务 exported=false，`am startservice`
+        // 直接被拒；Always-on 在 vivo 上设了 secure setting 也不拉起
+        // （实测 always_on_vpn_app 写入成功但进程没起）。
+        //
+        // ⚠ 必须**改盘再发**。早先试过「外面 run-as 改磁盘 + forcestart」，
+        // 结果隧道照建 —— 因为 SharedPreferences 在同一进程里有内存缓存，
+        // FerryConfig.load() 读到的是缓存，不是磁盘。所以这里调 cfg.save()
+        // 让缓存和磁盘一起变，才真正还原「服务读盘时已过期」这个条件。
+        if (it.getBooleanExtra("forceexpiredstart", false)) {
+            log("收到 forceexpiredstart，模拟授权在起隧道前一刻过期");
+            btnToggle.postDelayed(() -> {
+                cfg.expiresAt = System.currentTimeMillis() / 1000L - 60;
+                cfg.save(this);
+                log("已把本地 expiresAt 置为过去，直发 ACTION_START（不走 startVpn 的拦截）");
+                launchService();
+            }, 800);
+        }
     }
 
     @Override
@@ -151,6 +182,13 @@ public class MainActivity extends AppCompatActivity {
      * 为什么需要：用户可能挂着 App 很久不关（甚至息屏），而授权到期是
      * 服务端的时间，本地只能靠缓存的 expiresAt 推断。每 5 分钟核对一次，
      * 到期时能主动告诉用户，而不是等他点了「开始借网」才发现连不上。
+     *
+     * **到期必须连隧道一起停**（2026-10-30 修的 bug）：
+     * 这里原来只改界面文字、不碰隧道，而 FerryVpnService 也不读授权，
+     * 于是「界面写着授权已过期、隧道照跑」。当天实测：授权 13:17:49 到期，
+     * 13:54 服务端还在收这台手机的流量，白用 36 分钟。
+     * 现在两处都加了：这里的 licWatch 停隧道是「即时」的那一路，
+     * 服务内自己的复核（FerryVpnService.licWatchTick）是界面被冻结时的兜底。
      *
      * 用 Handler 而不是 WorkManager：这个检查只在界面活着的时候有意义，
      * 进程被杀掉之后本来就该靠下次启动时的 syncLicense()。
@@ -172,12 +210,31 @@ public class MainActivity extends AppCompatActivity {
                         log("授权已过期，需要续期");
                         refreshDetail();
                     }
+                    // 关键：授权没了就不能再借网。隧道如果还开着就停掉。
+                    if (isTunnelUp()) {
+                        log("授权已过期，已为你断开隧道");
+                        stopTunnelWithReason("授权已到期，隧道已断开；续期后重新点「开始借网」");
+                    }
                 } else {
                     syncLicense();
                 }
                 licWatch.postDelayed(this, 5 * 60 * 1000L);
             }
         }, 5 * 60 * 1000L);
+    }
+
+    private boolean isTunnelUp() {
+        String state = FerryVpnService.getLastState();
+        return FerryVpnService.STATE_ON.equals(state)
+                || FerryVpnService.STATE_CONNECTING.equals(state);
+    }
+
+    /** 停隧道并说明原因。原因会显示在状态栏，别让人以为是自己点错了。 */
+    private void stopTunnelWithReason(String reason) {
+        Intent i = new Intent(this, FerryVpnService.class)
+                .setAction(FerryVpnService.ACTION_STOP)
+                .putExtra(FerryVpnService.EXTRA_REASON, reason);
+        startService(i);
     }
 
     @Override
@@ -226,6 +283,29 @@ public class MainActivity extends AppCompatActivity {
             registerReceiver(stateReceiver, f, Context.RECEIVER_NOT_EXPORTED);
         } else {
             registerReceiver(stateReceiver, f);
+        }
+        // 注册完必须**回读一次**服务状态。
+        //
+        // 为什么：广播是「注册期间才收得到」的一次性事件，onPause 里已经注销了。
+        // 息屏（或切到别的 App）期间隧道如果停了 —— 最典型的是授权到期后
+        // FerryVpnService.licWatchTick 自己断开 —— 那条 STATE_OFF 广播就没人收。
+        // 点亮屏幕回来时 onResume 只重新注册，界面还停在息屏前的「已借网」，
+        // 按钮还是「停止并恢复直连」，而 tun0 其实早就没了。
+        // 2026-10-30 真机实测：14:26:59 隧道已断，14:27 亮屏界面仍显示「已借网」。
+        // 顺序：先 refreshDetail 铺授权详情（出口/剩余/设备），再按服务状态刷主标题；
+        // 只有「停止/错误」这类原因才盖上去 —— 「已借网 · 出口…」那句比授权详情
+        // 信息少，盖上去反而丢东西。
+        refreshDetail();
+        String st = FerryVpnService.getLastState();
+        String msg = FerryVpnService.getLastMessage();
+        applyState(st, FerryVpnService.STATE_ON.equals(st) ? null : msg);
+        // 把「回来时才发现的状态变化」补进日志。
+        //
+        // 广播丢了，界面日志就断在息屏前最后一条「已借网」，用户/排查的人
+        // 根本看不出是什么时候、因为什么断的。这里对比一次就补上。
+        if (!st.equals(lastSeenState)) {
+            if (msg != null && !msg.isEmpty()) log(msg);
+            lastSeenState = st;
         }
     }
 
