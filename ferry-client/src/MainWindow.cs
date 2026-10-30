@@ -67,6 +67,42 @@ namespace Ferry
         int _guardTick;
         string _guardNote = "";
 
+        // 有线上行探测的缓存（见 RefreshUi 里那段注释）。
+        //   _wiredCache        —— UI 线程只读这个，O(1)
+        //   _wiredProbing      —— 防止后台探测重叠（慢机器上探测可能超过刷新间隔）
+        //   _wiredNextProbeAt  —— 下次允许探测的时间点
+        //
+        // 为什么用 DateTime.UtcNow 而不是 Environment.TickCount：
+        // 后者 49 天回绕，虽然这里影响不大，但统一用 UTC 省得以后有人算错。
+        volatile bool _wiredCache;
+        int _wiredProbing;
+        DateTime _wiredNextProbeAt = DateTime.MinValue;
+        const int WiredProbeIntervalSec = 15;
+
+        /// <summary>
+        /// 后台刷新「有没有有线上行」。**只更新缓存，不碰任何控件。**
+        ///
+        /// 为什么不需要 Dispatcher.BeginInvoke 回投：这里改的只是一个
+        /// volatile bool，不是控件。RefreshUi（UI 线程）下一拍自然会读到新值
+        /// 并据此设置控件 —— 控件始终只在 UI 线程被碰。少一次跨线程回投，
+        /// 也就少一个「回投时窗口已经关了」的空引用风险。
+        /// </summary>
+        void RefreshWiredCacheAsync()
+        {
+            if (DateTime.UtcNow < _wiredNextProbeAt) return;
+            if (System.Threading.Interlocked.CompareExchange(ref _wiredProbing, 1, 0) != 0) return;
+            _wiredNextProbeAt = DateTime.UtcNow.AddSeconds(WiredProbeIntervalSec);
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool v = false;
+                try { v = Hotspot.HasWiredUplink(); }
+                catch (Exception) { }
+                finally { System.Threading.Interlocked.Exchange(ref _wiredProbing, 0); }
+                // 缓存是 volatile bool，直接写就是安全的；下次 RefreshUi 会读到。
+                _wiredCache = v;
+            });
+        }
+
         public bool StartBorrowOnLoad = false;
         public bool AutoUpdateOnLoad = false;
 
@@ -1765,7 +1801,28 @@ namespace Ferry
                 //
                 // 只在「热点没开」时锁。已经开着的话（比如网线刚被拔）
                 // 不能让开关动不了 —— 那样用户就没法关掉它了。
-                bool wired = Hotspot.HasWiredUplink();
+                //
+                // ⚠ 绝对不能在 RefreshUi 里同步调 Hotspot.HasWiredUplink()。
+                //
+                // RefreshUi 挂在 1 秒的 DispatcherTimer 上（UI 线程）。
+                // HasWiredUplink 内部要遍历 NetworkInterface.GetAllNetworkInterfaces()
+                // 并对每个以太网卡取 GetIPProperties() —— 这走的是 Windows 的
+                // 网络配置 API，实测单片就要 **70~126 ms**（本机 6 个网卡）。
+                // 也就是每秒有 70~126 ms UI 线程被同步占住：拖动窗口、点按钮、
+                // 滚动日志全部会顿一下；网卡多/装了 VPN 虚拟网卡的机器更糟。
+                //
+                // 2026-10-30 用户报「1.0.51 界面十分卡顿、操作困难」——
+                // 1.0.49 刚把 UI CPU 从 82% 降到 7.2%，1.0.51 加热点硬闸时
+                // 又把这个 O(网卡数) 的重调用塞回了每秒路径。
+                //
+                // 修法：用缓存 + 后台线程刷新。
+                //   · 界面这一帧只读 _wiredCache（O(1)）
+                //   · 真正探测放到 ThreadPool，最多每 15 秒一次
+                //   · 探测完 Dispatcher.BeginInvoke 回 UI 更新缓存
+                // 15 秒足够：网线插拔不是高频操作，而且热点开关本身会走
+                // LockedReason() 的实时判定（见 Hotspot.Start），闸门不受影响。
+                bool wired = _wiredCache;
+                RefreshWiredCacheAsync();
                 if (!hsOn && !wired)
                 {
                     SetText(_rowHotspot, "移动热点    需有线连接（当前只有 WiFi）");

@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "1.0.51"
+#define AppVersion "1.0.52"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -159,6 +159,13 @@ Filename: "{app}\{#AppExeName}"; Description: "立即启动渡口助手"; \
 
 [UninstallRun]
 ; 交给程序自己清：还原原代理 → 杀隧道/代理进程 → 删自启（含计划任务）
+; → 清 HKLM 里残留的旧卸载项。
+;
+; ⚠ 这里保持 runhidden（普通权限），**不要**改成 shellexec 指望提权：
+;   客户端 manifest 是 asInvoker，ShellExecute 也不会给它管理员令牌。
+;   HKLM 那条僵尸项的清理由客户端自己处理 —— DoSilentUninstall 会检测
+;   是否管理员，不是就用 WMI + runas 起一个提权的自己（/elevated-regclean）。
+;   详见 ProgramWpf.cs 里 ②-b 那段注释。
 Filename: "{app}\{#AppExeName}"; Parameters: "/uninstall"; \
   Flags: runhidden waituntilterminated; RunOnceId: "FerryCleanup"
 
@@ -166,6 +173,22 @@ Filename: "{app}\{#AppExeName}"; Parameters: "/uninstall"; \
 Type: files;          Name: "{app}\config.json"
 Type: files;          Name: "{app}\state.json"
 Type: filesandordirs; Name: "{app}"
+
+; 清掉用户目录下遗留的那份配置备份（可选，见 [Code] 里的说明：
+; 默认**不删** %APPDATA%\Ferry\config.backup.json —— 那是重装自愈的唯一保险。
+; 但如果用户明确要"彻底卸载"，可以在控制面板卸载时勾选，这里不做自动删除。）
+
+; ═══════════════════════════════════════════════════════════════════
+;  ⚠ 这里放不了 [Registry] 段的 DeleteKey —— Inno 的 [Registry] 是"安装时"写的，
+;    卸载时的删除要靠 Flags: uninsdeletekey。而那条键本来就不是我们这次装的
+;    （是 0.9.x 管理员安装留下的），Inno 不会去管它。
+;
+;  也**不能**在 [Code] 里删：本安装器是 PrivilegesRequired=lowest，
+;    对 HKLM 没写权限（实测 RegDeleteKeyIncludingSubkeys 静默失败）。
+;
+;  真正的清理在客户端的 DoSilentUninstall()（ProgramWpf.cs）——
+;    它由 [UninstallRun] 以管理员身份执行，用 reg delete 删掉那条僵尸项。
+; ═══════════════════════════════════════════════════════════════════
 
 [Code]
 var
@@ -310,12 +333,46 @@ end;
   /stop 分支会先 RestoreDirect() 还原原代理，再收干净隧道和子进程。
   为什么不用 CloseApplications：它走 Restart Manager 发关闭消息，而托盘程序
   在 OnFormClosing 里 cancel（缩到托盘），结果是卡在「请关闭以下程序」。 }
+{ ═══════════════════════════════════════════════════════════════════
+  关于「管理员安装时代」残留的 HKLM 卸载项
+
+  症状（2026-10-30 用户报）：点卸载 → 软件退出了 → 但什么都没变化，
+  控制面板里还有、快捷方式还在、程序还能打开。
+
+  根因：0.9.5 及更早是 PrivilegesRequired=admin，Inno 把卸载信息写进
+  HKLM；0.9.6 起改成 per-user（lowest），写 HKCU。AppId 没变，于是
+  同一台机器上两条并存：
+
+    HKLM\...\Uninstall\8F3A2B1C-...-1C2D3E4F5A6B_is1   渡口 Ferry          0.9.1
+    HKCU\...\Uninstall\8F3A2B1C-...-1C2D3E4F5A6B_is1   渡口 Ferry (当前用户) 1.0.52
+
+  两条的 UninstallString 指向**同一个** unins000.exe。用户从「应用和功能」
+  点中旧那条（没有"(当前用户)"后缀，看起来更像正式版）→ 跑的是新版卸载器
+  → 它只维护 HKCU → HKLM 那条留着 → 用户看到「卸载没反应」。
+
+  ⚠ 这里**不做**清理，原因（实测）：
+     本安装器是 PrivilegesRequired=lowest，对 HKLM 没有写权限。
+     试过 RegDeleteKeyIncludingSubkeys —— 编译能过，但运行时静默失败：
+     装完 1.0.52 后 HKLM 那条 0.9.1 依然在。
+     （注意 Inno 6 没有 RegDeleteKey 这个 API，正确的是
+       RegDeleteKeyIncludingSubkeys / RegDeleteKeyIfEmpty，
+       从 ISCmplr.dll 的字符串表里能查证；但对我们没用 —— 权限不够。）
+
+  ✅ 真正的清理放在**客户端**的 DoSilentUninstall() 里（ProgramWpf.cs）：
+     客户端卸载时会检测权限，不是管理员就用 WMI + runas 起一个提权的自己
+     （/elevated-regclean 分支），由它调 reg delete 删掉那条僵尸项。
+     卸载流程先跑客户端这一步，再轮到 Inno 自己删文件。
+  ═══════════════════════════════════════════════════════════════════ }
 function InitializeSetup(): Boolean;
 var
   R: Integer;
   OldExe: string;
 begin
   Result := True;
+
+  { 旧注册表项不在这里清 —— 见上面那段说明：权限不够，
+    真正的清理在客户端的 DoSilentUninstall() 里做。 }
+
   { 不用 app 常量：InitializeSetup 阶段它还没定下来，按 DefaultDirName 的拼法构造。 }
   OldExe := ExpandConstant('{localappdata}\Ferry\{#AppExeName}');
   if FileExists(OldExe) then

@@ -124,6 +124,22 @@ namespace Ferry
                 return;
             }
 
+            // ── 只做「删 HKLM 遗留卸载项」这一步（提权后由 /uninstall 拉起）──
+            //
+            // 为什么单独一个分支：/uninstall 是在普通权限下跑的（客户端是
+            // asInvoker，[UninstallRun] 直接起它不会提权），那一步删不掉 HKLM。
+            // 于是 /uninstall 末尾会用一个提权的 powershell 再起本程序，
+            // 只带这个参数 —— 那时进程是管理员，reg delete 才生效。
+            // 不做任何其它事，也不碰网络（用户的网络在 /uninstall 里已经恢复了）。
+            if (HasArg(args, "/elevated-regclean") || HasArg(args, "-elevated-regclean"))
+            {
+                RunRegDelete(
+                    @"Software\Microsoft\Windows\CurrentVersion\Uninstall\"
+                    + "{8F3A2B1C-4D5E-4F60-9A7B-1C2D3E4F5A6B}_is1",
+                    appDir);
+                return;
+            }
+
             // ── 激活自愈：卸载 / 重装 / 换目录之后把 token 找回来 ──
             //
             // 用户反馈过：「卸载重启，或者更新，有时候还是会丢密钥，要重新填」。
@@ -269,6 +285,37 @@ namespace Ferry
             catch (Exception) { }
         }
 
+        /// <summary>
+        /// 用 reg.exe 删掉一条 HKLM 卸载项。**调用者必须已提权。**
+        ///
+        /// 为什么用 reg.exe 而不是 Registry.LocalMachine.DeleteSubKeyTree：
+        ///   后者无权限时抛 UnauthorizedAccessException，而这个方法在
+        ///   DoSilentUninstall 里被 try/catch 包着 —— 抛了等于没做，日志里
+        ///   也看不出是"没权限"还是"没有这条键"。reg.exe 的退出码能区分。
+        /// </summary>
+        static void RunRegDelete(string key, string appDir)
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "reg.exe",
+                    Arguments = "delete \"HKLM\\" + key + "\" /f",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (var pr = System.Diagnostics.Process.Start(psi))
+                {
+                    if (pr == null) return;
+                    pr.WaitForExit(5000);
+                    Trace2(appDir, "reg delete 遗留卸载项 exit=" + pr.ExitCode);
+                }
+            }
+            catch (Exception) { }
+        }
+
         static void DoSilentUninstall(string cfgPath, string appDir)
         {
             // ① 先把网络恢复原状：还原系统代理 → 杀 mihomo → 删 FerryTun 网卡。
@@ -284,6 +331,77 @@ namespace Ferry
 
             // ② 自启（计划任务 + 启动目录快捷方式）
             try { SettingsWindow.SetAutoStart(false); } catch (Exception) { }
+
+            // ②-b 清掉「管理员安装时代」残留的 HKLM 卸载项。
+            //
+            //     为什么会有这条僵尸项（2026-10-30 用户报「卸载后什么都没变」）：
+            //       0.9.5 及更早是 admin 安装 → Inno 把卸载信息写 HKLM；
+            //       0.9.6 起改 per-user（lowest）→ 写 HKCU。AppId 没变，两条并存，
+            //       且 UninstallString 都指向同一个 unins000.exe。
+            //       用户从「应用和功能」点中旧那条（没有"(当前用户)"后缀，
+            //       排序靠前，看着更像正式版）→ 跑的是新版卸载器
+            //       → 它只维护 HKCU → HKLM 那条留着
+            //       → 控制面板还有、快捷方式还在、程序还能打开。
+            //
+            //     为什么不由安装器清：
+            //       安装器是 PrivilegesRequired=lowest，对 HKLM 没写权限。
+            //       实测 RegDeleteKeyIncludingSubkeys 编译能过但运行时静默失败
+            //       （装完 1.0.52 后 HKLM 那条 0.9.1 依然在）。
+            //
+            //     为什么这里要自提权：
+            //       客户端 manifest 是 asInvoker，[UninstallRun] 起它也是普通权限，
+            //       reg delete HKLM 一样会失败（exit 5）。所以先判断是不是管理员：
+            //       不是就用 WMI + runas 起一个提权的自己，只做这一件事然后退出。
+            //
+            //     为什么用 WMI 而不是 Process.Start(Verb=runas)：
+            //       见 Elevator.cs 的长注释 —— 本进程在带 KILL_ON_JOB_CLOSE 的
+            //       Job Object 里，ShellExecute 的提权请求会静默失败并回退成
+            //       普通权限。必须让 WmiPrvSE 起一个不在我们 Job 里的中转进程。
+            //
+            //     失败不抛：删不掉只是控制面板多一条，不能因此让卸载半途而废。
+            try
+            {
+                const string legacy =
+                    @"Software\Microsoft\Windows\CurrentVersion\Uninstall\"
+                    + "{8F3A2B1C-4D5E-4F60-9A7B-1C2D3E4F5A6B}_is1";
+
+                bool stillThere;
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(legacy))
+                        stillThere = (k != null);
+                }
+                catch (Exception) { stillThere = false; }
+
+                if (stillThere)
+                {
+                    if (TunMode.IsAdmin())
+                    {
+                        RunRegDelete(legacy, appDir);
+                    }
+                    else
+                    {
+                        // 自提权：让 WmiPrvSE 起一个 powershell，再由它 runas 起来。
+                        // --elevated-regclean 是我们的隐藏分支（见 main 的参数处理）。
+                        var self = System.Reflection.Assembly.GetEntryAssembly().Location;
+                        var ps =
+                            "Start-Sleep -Milliseconds 600; " +
+                            "Start-Process -FilePath '" + self.Replace("'", "''") + "' " +
+                            "-ArgumentList '/elevated-regclean' -Verb RunAs -WindowStyle Hidden";
+                        var psi = new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = "powershell.exe",
+                            Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"" + ps + "\"",
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        var pr = System.Diagnostics.Process.Start(psi);
+                        if (pr != null) pr.WaitForExit(8000);
+                        Trace2(appDir, "已请求提权清理 HKLM 遗留卸载项");
+                    }
+                }
+            }
+            catch (Exception) { }
 
             // ③ 卸载**不删**用户的激活备份（%APPDATA%\Ferry\config.backup.json）。
             //
