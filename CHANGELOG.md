@@ -1,3 +1,91 @@
+## v0.14.46 — 2026-10-30
+
+> 客户端 1.0.48 → 1.0.51 + 中继服务端两个阻塞 bug + Android 端口配错。
+> 这一晚修掉的东西比版本号多得多。
+
+### 一、界面卡死：82% CPU → 7.2%（1.0.48 / 1.0.49）
+
+`RefreshUi()` 每秒跑一次，里面 **40 处 `.Text =`、37 处 `.Foreground =`、
+14 处 `.Content/.Background/.Visibility`** 全部无条件赋值。WPF 的依赖属性
+赋内容相同的值也会走完整的 失效→measure→arrange→重绘。
+再加上 `Palette` 的 12 个 Brush 每次 get 都 `new SolidColorBrush()`。
+
+修法：Brush 改 `static readonly`；新增 `SetIfChanged/SetText/SetFg/
+SetContent/SetBg/SetVis` 先比后写。
+
+**注意 1.0.48 只改 TextBlock 只降到 78%** —— 必须把
+Content/Background/Visibility 也改到，才有 7.2%。
+
+### 二、Wi-Fi Direct 虚拟网卡抢射频（1.0.51）—— 最隐蔽的一个
+
+CS2 稳定 89ms、抖动 87ms。`ping` 的延迟值只落在 15.625ms 的
+4 倍（62.5ms）和 5 倍（78.1ms）上，形成锯齿。
+
+根因：热点开发时启用、**关热点后没被清理**的
+`Microsoft Wi-Fi Direct Virtual Adapter #2`（`本地连接* 2`），
+一直 Up、持续做 Wi-Fi Direct 探测，和物理网卡共用射频
+（MAC 只差首字节：`94-BB-43-...` vs `9A-BB-43-...`）。
+`本地连接* 2` 的统计是「收 0 字节、发 237,339 字节」。
+
+禁用后 p50 **61.1ms → 4.6ms**，max 76.4 → 15.3ms，慢包 50% → 0%。
+
+1.0.51 的 `Hotspot.Stop()` 会自动禁用它（`CleanupWifiDirectAdapters()`）。
+
+### 三、热点硬闸（1.0.51）
+
+单块无线网卡做 SoftAP 时 STA 和 AP 共用射频，8852BE 的处理方式是
+「踢掉 STA」—— 用户正在用的 WiFi 会断。
+
+新增 `Hotspot.HasWiredUplink()`：必须 Ethernet + **排除虚拟网卡**
+（Radmin VPN / etgame 都自称 iana=6）+ 有 IPv4 + 有默认网关。
+`LockedReason()` 不满足就返回锁定文案。
+
+三处调用：`Start()` 第一行硬闸（绕过 UI 也开不了）/ `OnHotspotToggled()`
+弹框 / `RefreshUi()` 置灰。`RefreshUi` 用 `(hsOn || wired)` ——
+热点已开时不能锁，否则网线一拔就关不掉了。
+
+### 四、Android「通道通但上不了网」
+
+`remotePort = 1099`，而 pcs 上只有 **1080** 在监听。
+`hev.log` 里 `io timeout` 出现 **16982 次** —— hev 不报错，只安静地等满
+`connect-timeout: 8000` 再重连，界面显示「已借网」但什么都打不开。
+
+修法：
+1. 手机配置改 1080
+2. 新增 `FerryVpnService.probeUpstream()` —— **建 TUN 前先 TCP 探测上游**，
+   连不上就明确报错并停止
+
+验证：故意配错端口 → 1 秒内报「连不上出口主机」；
+改回正确端口 → 自检 **5/5 通过**、浏览器 67 条真实流量记录。
+
+### 五、中继的两个阻塞 bug（`wireguard/ferry-socks5-server.py`）
+
+**(a) 每建一条 UDP 关联就 `print(flush=True)`**
+中继是单线程 asyncio，刷盘期间整个事件循环停摆。
+日志 62.8MB、5 秒还在涨 2.5KB。→ 改成每 30 秒汇总一行。
+
+**(b) `sendto(payload, (host, port))` 传域名时同步解析 DNS**
+实测：冷域名 **38.90ms** vs 传 IP **0.38ms**。
+mihomo 给每个 UDP 目标各建一条关联，域名各不相同 → 每个包都是冷解析
+→ 队列堆积 → 延迟逐包爬升 → 缓存命中后骤降。
+→ `DNS_CACHE_TTL=300s` 缓存 + 线程池异步解析 + 未命中丢该包。
+
+### 六、安装包在中文路径下双击必失败
+
+从 `E:\肥鱼不乐园\...\dist\` 双击装包报
+「无法创建目录 %TEMP%\is-XXXX.tmp，错误 5 拒绝访问」。
+
+根因：Inno 的 SetupLdr 从非 %TEMP% 路径启动时要先复制自己到 %TEMP%
+再带 `/SL5` 重跑，这一步在中文源路径下失败，**报错指向了错误的位置**。
+正确装法：先 `copy` 到 `%TEMP%` 再运行。
+
+### 附：干净基线
+
+校园网恢复后实测：纯 WiFi 直连 `p50=3ms / p90=12ms / max=28ms / 尖峰 0`。
+本机无线链路完全正常。
+
+---
+
 ## v0.14.45 — 2026-10-29
 
 > 门户：管理面板新增「已登记的设备」，每台设备可踢下线 / 删除。
