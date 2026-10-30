@@ -765,7 +765,13 @@ th{color:var(--fg2);font-weight:600;font-size:11.5px;text-transform:uppercase;le
 tbody tr:last-child td{border-bottom:0}
 tbody tr:hover{background:var(--card2)}
 
+/* 长串要能断行：注册表路径 / PowerShell 命令 / 哈希这类没有空格的串
+   在窄屏上会把容器撑破。overflow-wrap:anywhere 允许在任意位置断，
+   比 word-break:break-all 温和（优先按词断）。
+   2026-10-30 实测：下载页更新日志里的注册表路径和 PowerShell 命令
+   在 390px 视口下 right 到 432px，超视口 42px。 */
 code{background:var(--code);padding:2px 6px;border-radius:4px;
+     overflow-wrap:anywhere;word-break:break-word;
      font-family:Consolas,Monaco,monospace;font-size:12.5px;color:var(--fg)}
 pre{background:var(--code);padding:12px 14px;border-radius:9px;overflow-x:auto;
     font-size:12.5px;line-height:1.55;border:1px solid var(--line)}
@@ -1613,7 +1619,7 @@ def _nav(active):
     return '<nav class="nav">' + ''.join(parts) + '</nav>'
 
 
-def download_page(detected_ip=''):
+def download_page(detected_ip='', portal_host='10.13.24.1:8080'):
     """下载页。
 
     内容就是原来首页那一整页（当前版本 + 历史版本 + 更新日志 + 三步 +
@@ -1653,6 +1659,15 @@ def download_page(detected_ip=''):
 
     log_html = md_to_html_brief(read_changelog())
 
+    # ── Android 卡片用的变量（2026-10-30 新增）──
+    # 版本号/大小从 dist/android 里读；没有包就显示「暂未发布」，按钮仍然可点
+    # （会得到一个明确的 404 JSON，而不是坏页面）。
+    _apk = android_apk_latest()
+    android_ver = _apk['versionName'] if _apk else '暂未发布'
+    android_size = human_size(_apk['size']) if _apk else '—'
+    # 门户地址由调用方从 Host 头传进来（download_page 是模块级函数，
+    # 拿不到 self）。这样扫码出来的地址就是用户实际访问的那个。
+
     return page('下载渡口 · Ferry', """
 <nav class="nav">
   <a href="/" class="nv">首页</a>
@@ -1662,40 +1677,70 @@ def download_page(detected_ip=''):
 
 <div class="dlwrap">
 
-  <div class="dl-hero">
-    <div class="dl-hero-l">
-      <h1>下载渡口客户端</h1>
-      <p>断网了、手上的活还没做完 &mdash;&mdash; 借一台能出网的主机做应急出口。<br>
-         装一次，之后点一下就能接通，不用改任何网络配置。</p>
-      <div class="dl-actions">
+  <div class="platgrid">
+
+    <!-- ══ Windows ══ -->
+    <div class="platcard win">
+      <div class="plat-head">
+        <div class="plat-ico">&#9635;</div>
+        <div>
+          <div class="plat-title">Windows 客户端</div>
+          <div class="plat-sub">Win10 / 11 · x64</div>
+        </div>
+      </div>
+      <div class="plat-meta">
+        <span>版本 <b>vLATEST</b></span>
+        <span>大小 <b>SIZE</b></span>
+      </div>
+      <div class="plat-actions">
         <a class="btn btn-main" href="/download-cmd">&#9889; 一键安装</a>
-        <a class="btn btn-ghost" href="/download">下载安装包 .exe</a>
-        <a class="btn btn-ghost" href="/download-portable">&#128230; 绿色版（解压即用）</a>
+        <a class="btn btn-ghost" href="/download">下载 .exe</a>
+        <a class="btn btn-ghost" href="/download-portable">绿色版</a>
       </div>
-      <div class="dl-trust">
-        <span>三个入口功能完全一样</span>
-        <span>不需要管理员权限</span>
-        <span>不弹 UAC</span>
-        <span>升级不丢激活</span>
+      <div class="plat-spacer"></div>
+      <div class="plat-note">
+        推荐<b>一键安装</b>：下载一个十几行的脚本，双击后自动拉安装包 &mdash;&mdash;
+        全程不出现「Windows 已保护你的电脑」。装到当前用户目录，不需要管理员。
+        <br><br>
+        <b>绿色版</b>是完整软件包：解压到任意目录、双击 <code>渡口助手.exe</code> 即可，
+        借网 / 全局模式 / 自动更新 / 开机自启全都在。唯一区别是<strong>不安装</strong> &mdash;&mdash;
+        不写注册表、不进「程序和功能」、卸载就是删文件夹。
+        装不上的机器（报 <code>错误 4551</code>，应用控制策略拦截）用这个。
       </div>
-      <p style="font-size:13px;color:var(--fg2);margin:12px 0 0;line-height:1.7">
-        <b>绿色版</b>是完整的软件包：解压到任意目录，双击 <code>渡口助手.exe</code> 就能用，
-        借网 / 全局模式 / 自动更新 / 开机自启全都在。它唯一的不同是<strong>不安装</strong> ——
-        不写注册表、不进「程序和功能」、卸载就是删文件夹。<br>
-        装不上的机器（报 <code>错误 4551</code>，应用控制策略拦截安装程序）用这个就行。
-      </p>
     </div>
 
-    <div class="dl-card">
-      <div class="dl-row"><span>当前版本</span><b>vLATEST</b></div>
-      <div class="dl-row"><span>安装包大小</span><b>SIZE</b></div>
-      <div class="dl-row"><span>系统要求</span><b>Win10 / 11 x64</b></div>
-      <div class="dl-row"><span>安装位置</span><b>当前用户目录</b></div>
-      <div class="dl-tip">
-        <b>推荐点「一键安装」</b>：下载一个十几行的脚本，双击它会自动拉取安装包并启动
-        &mdash;&mdash; 全程<b>不会出现「Windows 已保护你的电脑」</b>。脚本可以右键「编辑」看清每一行。
+    <!-- ══ Android ══ -->
+    <div class="platcard droid">
+      <div class="plat-head">
+        <div class="plat-ico">&#9670;</div>
+        <div>
+          <div class="plat-title">Android 客户端</div>
+          <div class="plat-sub">Android 8.0 及以上</div>
+        </div>
+      </div>
+      <div class="plat-meta">
+        <span>版本 <b>ANDROID_VER_TXT</b></span>
+        <span>大小 <b>ANDROID_SIZE_TXT</b></span>
+      </div>
+      <div class="plat-actions">
+        <a class="btn btn-main" href="/download-android">&#11015; 直接下载 APK</a>
+      </div>
+      <div class="plat-spacer"></div>
+
+      <div class="qrrow">
+        <div class="qrbox"><img src="/static/android-qr.png" alt="扫码下载 Android 版" width="88" height="88"></div>
+        <div class="qrtxt">
+          <b>用手机扫这个码</b>
+          手机扫一扫就能装，不用打地址。
+        </div>
+      </div>
+
+      <div class="plat-note">
+        也可以在手机浏览器打开 <code>PORTALHOST</code> 点「下载 Android 版」。
+        <br>应用内已支持<b>检查更新</b>：装过一次之后，以后在 App 里点一下就能升级。
       </div>
     </div>
+
   </div>
 
   <div class="dl-steps">
@@ -1794,11 +1839,14 @@ def download_page(detected_ip=''):
 
   </div>
 </div>
-""".replace('LATEST', html.escape(latest_ver))
-   .replace('SIZE', html.escape(size_txt))
+""".replace('ANDROID_VER_TXT', html.escape(android_ver))
+   .replace('ANDROID_SIZE_TXT', html.escape(android_size))
    .replace('OLDER_COUNT', str(len(older)))
    .replace('OLDER_HTML', older_html)
-   .replace('LOG_HTML', log_html)) 
+   .replace('LOG_HTML', log_html)
+   .replace('PORTALHOST', html.escape(portal_host))
+   .replace('LATEST', html.escape(latest_ver))
+   .replace('SIZE', html.escape(size_txt))) 
 
 
 # 反馈附件的前端逻辑：粘贴 / 拖拽 / 选择 + 缩略图列表。
@@ -2991,6 +3039,65 @@ tr.fb-more>td:first-child{box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accen
    原来是「居中标题 + 一摞同宽卡片」，三段 SmartScreen 说明 + 三步 + 密钥规则
    全平铺，一屏塞不下重点也看不出来。改成双栏 hero（左文案右版本卡）+
    三列步骤 + 其余全部折叠。 */
+
+/* ── 下载页 v2：双平台并列 + 扫码 ──
+   2026-10-30 重排。原来的 dl-hero 是「左文案 + 右版本卡」，
+   只服务 Windows；现在要并列两个平台，改用 grip 两列。
+   窄屏堆叠，Windows 在前。 */
+.platgrid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:8px 0 22px}
+@media(max-width:860px){.platgrid{grid-template-columns:1fr}}
+
+.platcard{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:20px 20px 18px;box-shadow:var(--shadow);display:flex;flex-direction:column;
+  position:relative;overflow:hidden}
+/* 顶部一条 3px 的平台色带：蓝=Windows，绿=Android。
+   用色带而不是整块换色，深色主题下也不会显脏。 */
+.platcard::before{content:'';position:absolute;left:0;right:0;top:0;height:3px}
+.platcard.win::before{background:linear-gradient(90deg,#4a9eff,#7bb8ff)}
+.platcard.droid::before{background:linear-gradient(90deg,#3ddc97,#6fe3b4)}
+
+.plat-head{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+.plat-ico{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;
+  justify-content:center;font-size:17px;flex:0 0 auto;font-weight:700}
+.platcard.win .plat-ico{background:rgba(74,158,255,.14);color:#4a9eff}
+.platcard.droid .plat-ico{background:rgba(61,220,151,.14);color:var(--accent)}
+.plat-title{font-size:16px;font-weight:700;line-height:1.2}
+.plat-sub{font-size:11.5px;color:var(--fg2);margin-top:2px}
+
+.plat-meta{display:flex;gap:14px;flex-wrap:wrap;margin:10px 0 12px;
+  font-size:12px;color:var(--fg2);font-family:Consolas,Monaco,monospace}
+.plat-meta b{color:var(--fg);font-weight:600}
+
+.plat-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}
+/* 卡片之间高度不一致时（Android 内容更多），用弹性空白把各自的说明推到
+   底部对齐 —— 但**不能**用 margin-top:auto 直接把按钮也推下去，
+   否则内容少的 Windows 卡中间会裂出一大块空白（2026-10-30 截图看到过）。
+   这里放一个弹性占位，只在按钮之后生效。 */
+.plat-spacer{flex:1 1 auto;min-height:8px}
+.plat-actions .btn{padding:9px 16px;font-size:13px;border-radius:10px}
+
+/* Android 卡里的扫码区：左边二维码，右边文字说明 */
+.qrrow{display:flex;gap:14px;align-items:center;margin:14px 0 2px;
+  padding:12px;border-radius:12px;background:var(--card2);border:1px solid var(--line)}
+.qrbox{flex:0 0 auto;background:#fff;border-radius:8px;padding:5px;
+  line-height:0;box-shadow:0 1px 3px rgba(0,0,0,.18)}
+.qrbox img{display:block;width:88px;height:88px;image-rendering:pixelated}
+.qrtxt{flex:1 1 auto;min-width:0;font-size:12px;color:var(--fg2);line-height:1.65}
+.qrtxt b{color:var(--fg);display:block;font-size:13px;margin-bottom:3px}
+/* 手机上自己扫自己没意义 —— 窄屏把扫码区藏掉 */
+@media(max-width:860px){.qrrow{display:none}}
+
+.plat-note{font-size:11.5px;color:var(--fg2);line-height:1.7;margin-top:10px}
+/* 卡片里的长串必须能断行。
+   2026-10-30 实测：手机上 <code>127.0.0.1:18092</code> 这类长串不换行，
+   把卡片撑破、整页横向溢出（最右列像素几乎全是内容 = 被裁）。
+   overflow-wrap:anywhere 让浏览器在必要时**任意位置**断字，
+   比 word-break:break-all 更温和（优先按词断，实在不行才硬断）。 */
+.plat-note code{overflow-wrap:anywhere;word-break:break-word}
+.platcard{min-width:0}
+.platcard *{min-width:0}
+/* 卡片内的 flex 子项也要允许收缩，否则内容会把它撑开 */
+.plat-note,.plat-meta,.plat-actions{max-width:100%;overflow-wrap:anywhere}
 .dlwrap{max-width:900px;margin:0 auto}
 .dl-hero{display:grid;grid-template-columns:1.3fr .7fr;gap:26px;align-items:start;
   padding:14px 0 4px}
@@ -6066,8 +6173,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_html(landing_page(online_now=online))
             elif path == '/download-page':
                 ip1 = self.client_ip()
+                _ph = (self.headers.get('Host') or '10.13.24.1:8080').strip()
                 self.send_html(download_page(
-                    detected_ip=ip1 if PRIVATE_IP_RE.match(ip1) else ''))
+                    detected_ip=ip1 if PRIVATE_IP_RE.match(ip1) else '',
+                    portal_host=_ph))
             elif path == '/feedback':
                 ip2 = self.client_ip()
                 self.send_html(feedback_page(
@@ -6132,6 +6241,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # ── Android 客户端更新（2026-10-30 新增）──
             # 清单和 APK 本体分两个路径：清单要短超时轮询，
             # APK 是几 MB 二进制流（支持 Range 续传），混在一起日志和限流都不好办。
+            elif path.startswith('/static/'):
+                self.handle_static(path)
             elif path == '/android/version':
                 self.handle_android_version()
             elif path == '/download-android':
@@ -6541,6 +6652,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
         self.db.log('download_cmd', self.client_ip(), 'installer-script')
+
+    def handle_static(self, path):
+        """发 portal/static 下的静态资源（目前只有二维码图片）。
+
+        安全边界：只认**白名单文件名**，不做任意路径拼接。
+        用白名单而不是 os.path.join(base, path)：后者一旦有人传
+        `../../etc/passwd` 之类就麻烦，虽然 URL 里通常被规范化，
+        但"不给自己留这种口子"更省心。文件就两个，写死最安全。
+        """
+        ALLOWED = {
+            'android-qr.png': 'image/png',
+            'android-qr.svg': 'image/svg+xml; charset=utf-8',
+        }
+        name = path.rsplit('/', 1)[-1]
+        ctype = ALLOWED.get(name)
+        if not ctype:
+            self.send_json({'ok': False, 'error': 'not found'}, 404)
+            return
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        for base in (os.path.join(here, 'static'), here):
+            fp = os.path.normpath(os.path.join(base, name))
+            if os.path.isfile(fp):
+                try:
+                    with open(fp, 'rb') as f:
+                        data = f.read()
+                except OSError:
+                    break
+                self.send_response(200)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(len(data)))
+                # 二维码内容是稳定的（除非换门户地址），缓存一天足够。
+                # 换地址时把文件名或内容改一下即可，见 docs。
+                self.send_header('Cache-Control', 'public, max-age=86400')
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+
+        self.send_json({'ok': False, 'error': 'not found'}, 404)
 
     def handle_download(self, path):
         """发 Windows 安装程序（.exe）。
