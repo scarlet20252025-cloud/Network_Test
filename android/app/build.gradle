@@ -10,8 +10,13 @@ android {
         applicationId 'com.ferry.app'
         minSdk 26          // Android 8.0：VpnService + 前台服务语义都稳定
         targetSdk 34
-        versionCode 1
-        versionName '0.1.0'
+        // 版本号规则（2026-10-30 起重视它，因为有了应用内更新）：
+        //   versionCode 必须**单调递增**，它是唯一的更新判据；
+        //   versionName 只是给人看的。
+        // 改这里之后一定要重新出包上传门户 —— 客户端靠 /android/version
+        // 返回的 latestCode 和自己的 versionCode 比。
+        versionCode 2
+        versionName '0.2.0'
 
         // 真机只需要两个 arm ABI —— 每多一个 ABI，APK 多一份 .so。
         // x86_64 只在 debug 包里加（见下面的 buildTypes.debug），

@@ -8,6 +8,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- Android 13 起通知要显式申请，否则前台服务通知不显示 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+        应用内更新：下载完 APK 后交给系统安装器。
+        Android 8.0 起必须声明这条权限，否则 startActivity(ACTION_VIEW)
+        会被系统直接拒绝（SecurityException），而且**没有任何提示** ——
+        表现就是「点了更新没反应」。
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!--
         usesCleartextTraffic 必须为 true：
@@ -52,6 +59,29 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Device traffic is forwarded to a SOCKS5 proxy on the campus LAN" />
         </service>
+
+        <!--
+            FileProvider：把下载好的 APK 以 content:// 形式交给系统安装器。
+
+            为什么必须有：
+              Android 7.0（API 24）起 StrictMode 禁止用 file:// 跨应用传文件，
+              直接传会抛 FileUriExposedException；8.0 起更严。
+              唯一正路是 FileProvider —— authority 用 <包名>.fileprovider，
+              路径白名单在 res/xml/file_paths.xml（只暴露 update/ 子目录）。
+
+            exported=false + grantUriPermissions=true 是标准组合：
+              别的应用不能主动查我们的 provider，但收到我们给的 URI 后
+              可以临时读那一个文件。
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 

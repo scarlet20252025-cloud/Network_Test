@@ -4,11 +4,39 @@
 > 或者会话一续，待办就没了 —— 已经因此丢过好几次。所以待办**以这个文件为准**，
 > 每次动手前后都更新它。`todo_write` 只当当前这一轮的临时视图用。
 
-最后更新：2026-10-30 18:55
+最后更新：2026-10-30 20:05
 
 ---
 
 ## 正在做
+
+- [x] **Android 端「应用内更新」+ 状态文字配色 —— 已实现并真机验证**（2026-10-30 20:00）
+  - **更新功能**（之前完全没有，只能手动装 APK）
+    - 服务端：`/android/version`（清单）+ `/download-android`（APK，支持 Range 续传）
+      - APK 放 `dist/android/`，门户用**纯标准库**解二进制 AndroidManifest 读版本
+        （`META-INF/...app-metadata.properties` 里**没有** versionCode，实测）
+      - 判据用 `versionCode`，不能用 `versionName`（字符串比较 `'0.10.0' < '0.9.0'`）
+    - 客户端：`Updater.java` — 检查 → 弹窗 → 下载（进度）→ sha256 校验 →
+      FileProvider 交系统安装器；启动时静默检查一次（3 秒后，失败不打扰）
+    - 三个必备件：`REQUEST_INSTALL_PACKAGES` 权限 / FileProvider 声明 /
+      `res/xml/file_paths.xml`（只暴露 `update/` 子目录）
+  - **状态配色**（用户要求「跟电脑端一样变绿」）
+    - 原来 `txtState` 写死 `@color/ferry_text`，四种状态同一个深灰
+    - 现在：已借网=绿(`ferry_good`) / 连接中=黄(`ferry_warn`) /
+      失败=红(`ferry_bad`) / 未连接=正常色(`ferry_text`)
+    - 像素取样验证：已借网文字 `RGB(47,191,135)` = `#2FBF87` ✓
+      未连接 `RGB(31,42,38)` = `#1F2A26` ✓
+  - 版本号：`versionCode 1→2`，`versionName 0.1.0→0.2.0`
+  - **真机验证到哪一步**：0.2.0 装好后，门户放 0.3.0 →
+    App 弹「发现新版本 0.3.0」→ 点立即更新 → 下载完 → sha256 通过 →
+    系统安装器弹出 0.3.0 安装确认。
+    ⚠ **最后一跳被 vivo 账号验证拦住**（`com.bbk.account/AccountVerifyActivity`
+    要求输入 vivo 账号密码），是厂商策略，App 绕不过。详见踩坑 87。
+
+- [x] **修构建脚本「假成功」**：`build-apk-remote.ps1` 原来构建失败也照样
+      scp 拉回 `C:	mperry-debug.apk`（那是上一次的），输出「APK 已拉回」。
+      现在构建失败直接 exit，不拉取。
+
 
 - [x] **🔴 P0 用户反馈：软件卡顿 + 卸载不成功 —— 已定位并修复（1.0.52）**
       （2026-10-30 用户报，同日修完并端到端验证）

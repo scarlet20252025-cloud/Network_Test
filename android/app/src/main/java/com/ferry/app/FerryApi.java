@@ -49,6 +49,23 @@ public class FerryApi {
         /** 网络层失败（连不上门户），不代表授权无效。 */
         public boolean networkError;
 
+        // ── 更新检查（/android/version）──
+        //
+        // 判断「要不要更新」**必须用 latestCode 比较**，不能比 latest：
+        //   latest 是 versionName（"0.1.0"），字符串比较下 '0.10.0' < '0.9.0'，
+        //   用了会永远提示有新版本、或者永远不提示。
+        //   latestCode 是 versionCode，单调递增的整数，唯一正确判据。
+        /** 服务端最新版本的 versionName（给人看）。 */
+        public String latest = "";
+        /** 服务端最新版本的 versionCode（**用来比较**）。0 = 服务端没包。 */
+        public int latestCode = 0;
+        /** APK 下载路径（相对，拼 portalUrl 用）。 */
+        public String downloadUrl = "";
+        /** APK 字节数。 */
+        public long apkSize = 0;
+        /** APK 的 sha256（服务端没算则为空）。 */
+        public String apkSha256 = "";
+
         @Override
         public String toString() {
             return ok ? "ok" : ("失败：" + error);
@@ -132,6 +149,18 @@ public class FerryApi {
 
     // ── 内部工具 ──
 
+    /**
+     * 查 Android 端有没有新版本。
+     *
+     * 失败时 networkError=true，调用方应当**静默忽略** —— 检查更新
+     * 失败绝不能打扰用户（校园网抖动很常见，弹个"检查更新失败"只会烦人）。
+     */
+    public static Result checkUpdate(String portalUrl, int timeoutMs) {
+        Result r = new Result();
+        getJson(r, trimSlash(portalUrl) + "/android/version", timeoutMs, "android-version");
+        return r;
+    }
+
     private static void postJson(Result r, String url, String body, int timeoutMs, String what) {
         try {
             HttpURLConnection c = open(url, "POST", timeoutMs);
@@ -201,6 +230,12 @@ public class FerryApi {
             r.deviceCount = o.optInt("deviceCount", 0);
             r.deviceMax = o.optInt("deviceMax", 0);
             r.deviceMessage = o.optString("deviceMessage", "");
+            // 更新清单（/android/version 才有，其它接口没有这几个字段就为默认值）
+            r.latest = o.optString("latest", "");
+            r.latestCode = o.optInt("latestCode", 0);
+            r.downloadUrl = o.optString("url", "");
+            r.apkSize = o.optLong("size", 0);
+            r.apkSha256 = o.optString("sha256", "");
             // enabled=0 且不是暂停，就是过期
             if (o.has("enabled") && !o.optBoolean("enabled", true) && !r.expired) {
                 r.expired = true;

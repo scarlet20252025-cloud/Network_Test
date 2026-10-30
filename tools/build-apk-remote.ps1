@@ -76,6 +76,19 @@ $buildArgs = if ($Clean) { '-Clean' } else { '' }
 $buildExit = $LASTEXITCODE
 Write-Output ("  远端构建 exit = $buildExit")
 
+# ⚠ 构建失败就**立刻中止**，不要往下走。
+#
+# 2026-10-30 实测：javac 报了 "已定义了变量 got"，BUILD FAILED，
+# 但 xt 的 C:\tmp\ferry-debug.apk 还是**上一次**留下的那份 ——
+# 于是第 5 步照常把它拉回来，输出「APK 已拉回 6 MB」，
+# 看上去像成功了，装到手机上却是旧代码。白排查一轮。
+if ($buildExit -ne 0) {
+    Write-Output ''
+    Write-Output '!! 远端构建失败，不拉取 APK（C:\tmp\ferry-debug.apk 可能是旧的）'
+    Write-Output '   完整日志：ssh ' + $Target + ' "type C:\tmp\gradle-build.log"'
+    exit $buildExit
+}
+
 Write-Output '=== 5. 拉回 APK ==='
 $outApk = Join-Path $repo 'dist\ferry-debug.apk'
 $outDir = Split-Path -Parent $outApk

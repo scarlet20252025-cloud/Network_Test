@@ -54,6 +54,7 @@ import re
 import secrets
 import socketserver
 import sqlite3
+import struct
 import sys
 import threading
 import time
@@ -5054,6 +5055,201 @@ def list_installers():
     return out
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  Android APK 分发（2026-10-30 新增）
+# ═══════════════════════════════════════════════════════════════════
+#
+# 为什么单独一套、不复用 Windows 那套 installer_path()：
+#   · Windows 是 .exe + Inno，Android 是 .apk，扩展名、包名规则都不一样；
+#   · Android 的版本号有两段（versionCode 整数 + versionName 字符串），
+#     判断「要不要更新」必须用 versionCode —— versionName 是给人看的，
+#     是字符串，'0.10.0' 按字符串比会输给 '0.9.0'。
+#   · 门户还要告诉客户端 APK 多大、sha256 多少，客户端下载完校验一次
+#     （手机上下载中断/被劫持比 PC 常见得多）。
+#
+# APK 放哪：<工程根>/dist/android/。单独一个子目录，避免和安装包混在一起
+# 被 list_installers() 之类按 *Ferry-Setup-*.exe 扫的逻辑看到。
+
+ANDROID_APK_DIRNAME = os.path.join('dist', 'android')
+# 允许分发的包名。防止有人往目录里丢一个别的 apk 被当成官方包发出去。
+ANDROID_ALLOWED_PACKAGES = ('com.ferry.app', 'com.ferry.app.debug')
+
+
+def android_apk_dirs():
+    """返回所有可能存放 APK 的目录（工程根/dist/android，门户同级/dist/android）。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = []
+    for base in (os.path.join(here, '..'), here):
+        d = os.path.normpath(os.path.join(base, ANDROID_APK_DIRNAME))
+        if os.path.isdir(d):
+            out.append(d)
+    return out
+
+
+def _parse_apk_badging(apk_path):
+    """从 APK 里读出 package / versionCode / versionName。
+
+    为什么不用 androguard/aapt：门户只用标准库（AGENTS.md 的硬约定）。
+    所以直接解 ZIP 读二进制 AndroidManifest.xml（AXML）。
+
+    ⚠ 两个实测踩到的坑（2026-10-30）：
+      1. `META-INF/com/android/build/gradle/app-metadata.properties`
+         **没有** versionCode/versionName —— 里面只有 appMetadataVersion
+         和 androidGradlePluginVersion。一度以为能走这条捷径，实测不行。
+      2. AXML 的 START_TAG 节点体布局是：
+             pos+0  : chunk header (type/hsize/size) = 8 字节
+             body+0 : lineNumber(4) comment(4)
+             body+8 : ns(4) name(4)
+             body+16: attributeStart(2) attributeSize(2) attributeCount(2)
+         我第一次写成 body+8/body+16 取值，全错位，属性一个都读不到。
+         正确起点是 **body+8 取 ns/name**、**body+16 取三个 u16**。
+
+    属性值原始类型在 attribute 的 dataType（第 15 字节）：
+        0x03 = 字符串（data 是字符串池索引）
+        0x10 = int（data 就是值）
+    """
+    import zipfile
+
+    def parse_axml(zf):
+        try:
+            data = zf.read('AndroidManifest.xml')
+        except (KeyError, OSError):
+            return None
+        if len(data) < 8:
+            return None
+        try:
+            ax_type, ax_hsize, _ = struct.unpack('<HHI', data[:8])
+            if ax_type != 0x0003:            # RES_XML_TYPE
+                return None
+
+            # ── 字符串池 ──
+            off = ax_hsize
+            sp_type, sp_hsize, sp_size = struct.unpack('<HHI', data[off:off + 8])
+            if sp_type != 0x0001:            # RES_STRING_POOL_TYPE
+                return None
+            cnt, _style, flags, sstart, _ = \
+                struct.unpack('<IIIII', data[off + 8:off + 28])
+            is_utf8 = bool(flags & 0x100)
+            # 偏移表紧跟在 chunk 头之后（sp_hsize 就是头长度，通常 28）
+            tbl_off = off + sp_hsize
+            offsets = struct.unpack('<%dI' % cnt,
+                                    data[tbl_off:tbl_off + 4 * cnt])
+            base = off + sstart
+            strings = []
+            for so in offsets:
+                p = base + so
+                if is_utf8:
+                    n = data[p]
+                    if n & 0x80:
+                        n = ((n & 0x7F) << 8) | data[p + 1]
+                        p += 2
+                    else:
+                        p += 1
+                    n2 = data[p]
+                    if n2 & 0x80:
+                        n2 = ((n2 & 0x7F) << 8) | data[p + 1]
+                        p += 2
+                    else:
+                        p += 1
+                    strings.append(data[p:p + n2].decode('utf-8', 'replace'))
+                else:
+                    n = struct.unpack('<H', data[p:p + 2])[0]
+                    p += 2
+                    if n & 0x8000:
+                        n2 = struct.unpack('<H', data[p:p + 2])[0]
+                        n = ((n & 0x7FFF) << 16) | n2
+                        p += 2
+                    strings.append(data[p:p + n * 2].decode('utf-16-le', 'replace'))
+
+            # ── 遍历 chunk，找 <manifest> ──
+            pos = off + sp_size
+            while pos + 8 <= len(data):
+                ctype, chsize, csize = struct.unpack('<HHI', data[pos:pos + 8])
+                if csize <= 0:
+                    break
+                if ctype == 0x0102:          # RES_XML_START_ELEMENT_TYPE
+                    body = pos + chsize
+                    _ns_i, name_i = struct.unpack('<II', data[body:body + 8])
+                    nm = strings[name_i] if name_i < len(strings) else ''
+                    if nm == 'manifest':
+                        a_start, a_size, a_count = struct.unpack(
+                            '<HHH', data[body + 8:body + 14])
+                        res = {}
+                        for i in range(a_count):
+                            ap = body + a_start + i * a_size
+                            _ans, aname, _araw = struct.unpack(
+                                '<III', data[ap:ap + 12])
+                            dtype = data[ap + 15]
+                            dval = struct.unpack('<I', data[ap + 16:ap + 20])[0]
+                            an = strings[aname] if aname < len(strings) else ''
+                            if an == 'versionCode':
+                                res['versionCode'] = int(dval)
+                            elif an == 'versionName':
+                                if dtype == 0x03:
+                                    if dval < len(strings):
+                                        res['versionName'] = strings[dval]
+                                else:
+                                    res['versionName'] = str(dval)
+                            elif an == 'package':
+                                if dtype == 0x03 and dval < len(strings):
+                                    res['package'] = strings[dval]
+                        if 'versionCode' in res and 'versionName' in res:
+                            return res
+                        return None
+                pos += csize
+        except Exception:
+            return None
+        return None
+
+    try:
+        with zipfile.ZipFile(apk_path) as zf:
+            return parse_axml(zf)
+    except Exception:
+        return None
+
+
+def android_apk_latest():
+    """找版本号最高的 APK，返回 dict；没有就 None。
+
+    每次请求重扫目录（和 installer_path 同样的理由：发布新包不用重启门户）。
+    """
+    best = None
+    for d in android_apk_dirs():
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if not n.lower().endswith('.apk'):
+                continue
+            p = os.path.join(d, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            info = _parse_apk_badging(p)
+            if not info:
+                continue
+            pkg = info.get('package') or ''
+            if pkg and pkg not in ANDROID_ALLOWED_PACKAGES:
+                continue
+            info.update({'path': p, 'size': st.st_size, 'mtime': st.st_mtime,
+                         'name': n, 'sha256': ''})
+            if best is None or info['versionCode'] > best['versionCode']:
+                best = info
+    if best:
+        # sha256 只在选中这个文件后算一次（几 MB，几十毫秒）
+        try:
+            h = hashlib.sha256()
+            with open(best['path'], 'rb') as f:
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    h.update(chunk)
+            best['sha256'] = h.hexdigest()
+        except OSError:
+            pass
+    return best
+
+
 def read_changelog(max_bytes=400000):
     """读 CHANGELOG.md，返回原始文本（给门户展示更新日志用）。"""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -5933,6 +6129,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_version()
             elif path == '/download-latest':
                 self.handle_download_latest()
+            # ── Android 客户端更新（2026-10-30 新增）──
+            # 清单和 APK 本体分两个路径：清单要短超时轮询，
+            # APK 是几 MB 二进制流（支持 Range 续传），混在一起日志和限流都不好办。
+            elif path == '/android/version':
+                self.handle_android_version()
+            elif path == '/download-android':
+                self.handle_download_android()
             elif path == '/about':
                 self.handle_about()
             elif path == '/setup-hosts':
@@ -6500,6 +6703,99 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             for i in range(0, len(data), CHUNK):
                 self.wfile.write(data[i:i + CHUNK])
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def handle_android_version(self):
+        """Android 客户端查更新用的清单。
+
+        返回：
+            ok         —— 服务端有没有可发的 APK
+            latest     —— versionName（给人看的）
+            latestCode —— versionCode（**客户端必须用它比较**）
+            url        —— 下载路径（相对，客户端拼上 portalUrl）
+            size       —— 字节数
+            sha256     —— 下载完校验用
+
+        为什么客户端必须拿 versionCode 比较、不能比 versionName：
+          versionName 是字符串，按字典序 '0.10.0' < '0.9.0' ——
+          用了就会永远提示"有新版本"，或者永远不提示。versionCode
+          是单调递增的整数，是唯一正确的判据。
+        """
+        apk = android_apk_latest()
+        if apk is None:
+            self.send_json({'ok': False, 'error': '还没有发布 Android 安装包',
+                            'latest': '', 'latestCode': 0, 'url': ''}, 200)
+            return
+        self.send_json({
+            'ok': True,
+            'latest': apk['versionName'],
+            'latestCode': apk['versionCode'],
+            'url': '/download-android',
+            'size': apk['size'],
+            'sha256': apk.get('sha256', ''),
+            'notes': '',
+            'built': True,
+        })
+
+    def handle_download_android(self):
+        """下载最新 APK（二进制流，支持单段 Range 续传）。
+
+        为什么要 Range：手机下 6 MB 在弱网下很容易断，下载器/浏览器会带
+        Range 重试。不支持的话每次都从 0 开始，用户会觉得"怎么下不完"。
+        只处理单段（bytes=a-b 或 bytes=-N），够用。
+        """
+        apk = android_apk_latest()
+        if apk is None:
+            self.send_json({'ok': False, 'error': '还没有发布 Android 安装包'}, 404)
+            return
+        path = apk['path']
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            self.send_json({'ok': False, 'error': '安装包读不到'}, 404)
+            return
+
+        rng = (self.headers.get('Range') or '').strip()
+        start, end = 0, size - 1
+        partial = False
+        if rng.startswith('bytes='):
+            try:
+                spec = rng[6:].split(',')[0]
+                a, _, b = spec.partition('-')
+                if a:
+                    start = int(a)
+                    if b:
+                        end = min(int(b), size - 1)
+                elif b:                      # bytes=-N：最后 N 字节
+                    start = max(0, size - int(b))
+                if 0 <= start <= end < size:
+                    partial = True
+            except ValueError:
+                start, end, partial = 0, size - 1, False
+
+        length = end - start + 1
+        try:
+            self.send_response(206 if partial else 200)
+            self.send_header('Content-Type', 'application/vnd.android.package-archive')
+            self.send_header('Content-Disposition',
+                             'attachment; filename="ferry-%s.apk"' % apk['versionName'])
+            self.send_header('Content-Length', str(length))
+            if partial:
+                self.send_header('Content-Range', 'bytes %d-%d/%d' % (start, end, size))
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Ferry-Sha256', apk.get('sha256', ''))
+            self.end_headers()
+            with open(path, 'rb') as f:
+                f.seek(start)
+                left = length
+                while left > 0:
+                    chunk = f.read(min(65536, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             return
 

@@ -21,6 +21,10 @@
     <string name="btn_change_code">换一个激活码</string>
     <string name="label_log">日志</string>
 
+    <!-- 应用内更新 -->
+    <string name="btn_check_update">检查更新</string>
+    <string name="update_checking">正在检查更新…</string>
+
     <string name="notif_channel_name">借网状态</string>
     <string name="notif_title">渡口正在借网</string>
     <string name="notif_text">全部流量经局域网主机转发</string>

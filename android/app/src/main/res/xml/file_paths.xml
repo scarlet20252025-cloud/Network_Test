@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 的可见路径白名单。
+
+  为什么只暴露 update/ 这一个子目录（而不是整个外部目录）：
+    FileProvider 给的是 content:// URI，拿到 URI 的应用能读对应文件。
+    如果写成 <root-path/> 或 <external-path/>，等于把 App 能访问的
+    整个目录树都授权出去了 —— 没必要，也有风险。
+    更新只要让系统安装器读到那个 APK，所以只开 getExternalFilesDir("update")
+    对应的路径（对应代码里 Updater.apkDir()）。
+
+  path 必须与 Java 侧一致：
+    Java: ctx.getExternalFilesDir("update")  →  Android/data/<pkg>/files/update
+  external-files-path 的 name 属性只是内部标识，path 才是真正暴露的相对路径。
+-->
+<paths>
+    <external-files-path name="ferry_update" path="update/" />
+    <!-- 兜底：有些机型 getExternalFilesDir 返回 null，Updater 会退到
+         getFilesDir()/update（内部存储）。这个路径也要开，否则那些机器装不了。 -->
+    <files-path name="ferry_update_internal" path="update/" />
+</paths>

@@ -38,6 +38,8 @@ public class MainActivity extends AppCompatActivity {
     private TextView txtState, txtDetail, txtLog;
     private EditText txtCode;
     private MaterialButton btnToggle, btnActivate, btnSelfCheck, btnChangeCode;
+    /** 「检查更新」入口（2026-10-30 新增） */
+    private MaterialButton btnUpdate;
     /** 激活卡的两种形态：未激活显示输入框，已激活显示摘要。 */
     private TextView txtActivateTitle, txtActivationInfo, txtActivationSub;
     private android.view.View rowInput, boxActivated;
@@ -75,6 +77,7 @@ public class MainActivity extends AppCompatActivity {
         btnToggle = findViewById(R.id.btnToggle);
         btnActivate = findViewById(R.id.btnActivate);
         btnSelfCheck = findViewById(R.id.btnSelfCheck);
+        btnUpdate = findViewById(R.id.btnUpdate);
 
         txtActivateTitle = findViewById(R.id.txtActivateTitle);
         rowInput = findViewById(R.id.rowInput);
@@ -88,6 +91,12 @@ public class MainActivity extends AppCompatActivity {
         btnToggle.setOnClickListener(v -> onToggle());
         btnActivate.setOnClickListener(v -> onActivate());
         btnSelfCheck.setOnClickListener(v -> runSelfCheck());
+        // 检查更新：silent=false —— 这是用户主动点的，没新版也要给个提示，
+        // 否则「点了没反应」会让人以为按钮坏了。
+        btnUpdate.setOnClickListener(v -> {
+            log(getString(R.string.update_checking));
+            Updater.checkAndPrompt(this, cfg, false);
+        });
 
         // 「换一个激活码」：已激活时把输入框重新露出来。
         // 没有这个入口，隐藏输入框之后用户就换不了账号了 —— 会变成死路。
@@ -118,6 +127,13 @@ public class MainActivity extends AppCompatActivity {
         // 另外每 5 分钟兜底一次（用户挂着不关的时候，过期了要能发现）。
         syncLicense();
         scheduleLicenseWatch();
+
+        // 启动时静默检查一次更新（silent=true：没新版完全不打扰）。
+        //
+        // 为什么延迟 3 秒：启动瞬间要拉授权、建界面，再抢网络没意义；
+        // 而且用户刚打开 App 就弹「发现新版本」很突兀。
+        // 检查失败一律静默（校园网抖动很常见，不能因此打扰用户）。
+        btnUpdate.postDelayed(() -> Updater.checkAndPrompt(this, cfg, true), 3000);
 
         // 自动化测试入口：am start ... --ez autostart true
         //
@@ -614,22 +630,41 @@ public class MainActivity extends AppCompatActivity {
         switch (state) {
             case FerryVpnService.STATE_ON:
                 txtState.setText(R.string.state_on);
+                // 「已借网」用绿色，和 Windows 端对齐（那边大状态「正在走渡口」
+                // 也是 Palette.GoodB 薄荷绿）。2026-10-30 用户明确要求：
+                // 「已借网 的文字状态提示要跟电脑端一样变成绿色，而不是保持一个颜色」。
+                setStateColor(R.color.ferry_good);
                 btnToggle.setText(R.string.btn_stop);
                 break;
             case FerryVpnService.STATE_CONNECTING:
                 txtState.setText(R.string.state_connecting);
+                // 正在建立：用暖黄，表示「还没好，等一下」。
+                // 不给绿色 —— 绿色应该只属于「真的通了」，否则用户会
+                // 把"正在连"和"已连上"看混（Windows 端也是这么分的）。
+                setStateColor(R.color.ferry_warn);
                 btnToggle.setText(R.string.btn_stop);
                 break;
             case FerryVpnService.STATE_ERROR:
                 txtState.setText(R.string.state_error);
+                setStateColor(R.color.ferry_bad);
                 btnToggle.setText(R.string.btn_start);
                 break;
             default:
                 txtState.setText(R.string.state_off);
+                // 未连接回到正常文字色（不是灰色）—— 它是常态，不是错误。
+                setStateColor(R.color.ferry_text);
                 btnToggle.setText(R.string.btn_start);
                 break;
         }
         if (msg != null && !msg.isEmpty()) txtDetail.setText(msg);
+    }
+
+    /** 设置大状态文字的颜色。取不到颜色资源时保持原样，不抛。 */
+    private void setStateColor(int colorRes) {
+        try {
+            txtState.setTextColor(androidx.core.content.ContextCompat.getColor(this, colorRes));
+        } catch (Exception ignored) {
+        }
     }
 
     /**

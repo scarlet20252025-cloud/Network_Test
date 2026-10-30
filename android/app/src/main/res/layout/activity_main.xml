@@ -60,6 +60,23 @@
                 android:layout_marginTop="8dp"
                 android:text="@string/btn_selfcheck"
                 android:textSize="14sp" />
+
+            <!--
+                检查更新：做成和「自检」同级的次要按钮。
+                为什么放在状态卡里而不是设置页：这个 App 没有设置页
+                （刻意保持极简，见 DESIGN.md），而"更新"是低频但要找得到的事。
+            -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnUpdate"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="end"
+                android:layout_marginTop="2dp"
+                android:minHeight="36dp"
+                android:text="@string/btn_check_update"
+                android:textColor="@color/ferry_text_muted"
+                android:textSize="12sp" />
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 
