@@ -167,6 +167,71 @@ public class MainActivity extends AppCompatActivity {
                 launchService();
             }, 800);
         }
+        // 诊断用：在 App 自己的进程里试读 /proc/net/dev。
+        //
+        // 为什么必须「在 App 内读」：交接文档 P2 建议自检 ④ 改成
+        // 「读 /proc/net/dev 的 tun0 字节增量」，并注明「不需要 root，Android 10+ 可读」。
+        // 但用 `adb shell run-as <pkg> cat /proc/net/dev` 实测是 Permission denied ——
+        // 然而 run-as 跑在 **runas_app** 域，App 本体跑在 **untrusted_app** 域，
+        // 两者是**不同的 SELinux 域**，run-as 的结果不能代表 App 的真实权限。
+        // 只能让 App 自己读一次，把结果写到 files/ 下再取回来看。
+        if (it.getBooleanExtra("probeifs", false)) {
+            log("收到 probeifs，在 App 内试读 /proc/net/dev");
+            new Thread(() -> {
+                StringBuilder sb = new StringBuilder();
+                sb.append("uid=").append(android.os.Process.myUid()).append('\n');
+                sb.append("selinux=").append(readFile("/proc/self/attr/current")).append('\n');
+                String dev = readFile("/proc/net/dev");
+                if (dev.startsWith("ERR:")) {
+                    sb.append("proc_net_dev=").append(dev).append('\n');
+                } else {
+                    sb.append("proc_net_dev=OK\n");
+                    for (String line : dev.split("\n")) {
+                        String t = line.trim();
+                        if (t.startsWith("tun") || t.startsWith("wlan")) {
+                            sb.append("  ").append(t).append('\n');
+                        }
+                    }
+                }
+                // hev 自己报的计数（对照组：这个肯定能拿到）
+                try {
+                    long[] st = hev.htproxy.TProxyService.TProxyGetStats();
+                    if (st != null && st.length >= 4) {
+                        sb.append("hev_stats=txPkts=").append(st[0])
+                          .append(" txBytes=").append(st[1])
+                          .append(" rxPkts=").append(st[2])
+                          .append(" rxBytes=").append(st[3]).append('\n');
+                    } else {
+                        sb.append("hev_stats=NULL\n");
+                    }
+                } catch (Throwable t) {
+                    sb.append("hev_stats=ERR:").append(t.getClass().getSimpleName()).append('\n');
+                }
+                try {
+                    java.io.FileOutputStream fos = openFileOutput("probeifs.txt", MODE_PRIVATE);
+                    fos.write(sb.toString().getBytes("UTF-8"));
+                    fos.close();
+                } catch (Exception e) {
+                    Log.w("FerryUi", "写 probeifs.txt 失败", e);
+                }
+            }, "ferry-probeifs").start();
+        }
+    }
+
+    /** 读一个小文本文件；失败返回 "ERR:<异常名>: <消息>"，不抛。 */
+    private static String readFile(String path) {
+        java.io.BufferedReader br = null;
+        try {
+            br = new java.io.BufferedReader(new java.io.FileReader(path));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line).append('\n');
+            return sb.toString();
+        } catch (Exception e) {
+            return "ERR:" + e.getClass().getSimpleName() + ": " + e.getMessage();
+        } finally {
+            if (br != null) try { br.close(); } catch (Exception ignored) {}
+        }
     }
 
     @Override

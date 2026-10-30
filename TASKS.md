@@ -74,13 +74,25 @@
   - 验证方法：`adb shell ip -4 addr show wlan0`（应看到 10.141.x.x）
   - 若复现，检查 `FerryVpnService` 的 `closeTun()` 与 VpnService 生命周期
 
-- [ ] **自检「3/5 项通过」是假阴性 —— 已定位，方案待定**
+- [x] **自检「3/5 项通过」是假阴性 —— 已修并真机验证**（2026-10-30 16:44）
   - 原因：`addDisallowedApplication(getPackageName())` 让本 App（uid 10293）
     不在 VPN 路由规则内（`ip rule` 里 uidrange 0-10292 / 10294-99999，
     **10293 正好空着**），所以 App 自己发的 HTTP 必然走物理网卡
-  - `adb shell`（uid 2000）同理，也测不准
-  - **真正有效的验证方法**：用系统浏览器打开网页，看服务端日志有没有该手机记录
-  - 下一轮可改为「读 `/proc/net/dev` 的 tun0 收发字节增量」判断隧道是否有流量
+  - **P2 原方案「读 /proc/net/dev」被实测否掉**：在 App 自己的进程里
+    （`untrusted_app` 域，uid 10293）读它 → `EACCES (Permission denied)`。
+    （用 `adb shell run-as` 试也报同样错，但那是 `runas_app` 域，
+      本来就不能代表 App —— 必须让 App 自己读才算数。）
+  - 正确做法：**保留 `TProxyGetStats`**，它和 `/proc/net/dev` 逐位吻合：
+    `hev: txPkts=197 txBytes=42290 rxPkts=151 rxBytes=41041`
+    `tun0: 收 41041 包 151 / 发 42290 包 197`
+    而且更准（直接是 hev 处理过的隧道流量）
+  - 改了三处：
+    1. ④ HTTP 项改名「HTTP 请求（仅参考）」，文案写明「直连本机网卡，
+       不代表隧道状态」——它算通过也不是证据，失败也不是罪证
+    2. 汇总口径排除「仅参考」项（原来 5 项全算，禁网时必显 3/5 假阴性）
+    3. `checkUplink` 增加包数增量，并区分「读不到统计」和「统计为 0」
+  - 真机验证：**有隧道 4/4 通过**；**无隧道 1/4**，三项失败精确指向
+    TUN 不在 / hev 未运行 / 统计为 0
 
 - [ ] **vivo 拒绝 adb 安装，需用户手动开权限**
   - `INSTALL_FAILED_ABORTED: User rejected permissions`
@@ -341,7 +353,15 @@ WLAN 排最后。目前无影响，但多网卡广播场景下可能选错网卡
   - 已确认前提：这台手机在校园网里**能直连公网**（自检 2/5 那次 DNS 和 HTTP 都成功），
     所以「禁网」在当前条件下构造不出来 —— 改为验证「上游坏掉时的行为」
   - ⚠ 手机已从 USB 掉线，接回后要先修复配置（做实验时把 remotePort 改成了 1099）
-- [ ] **M5 UDP/游戏延迟量化**（Android 侧）：hev `udp: 'udp'` 走远端中继的实测
+- [ ] **M5 UDP/游戏延迟量化 —— 已测出结论：中继几乎不贵，但手机上 UDP 根本没通**
+  - 详见 `docs/M5-Android-UDP实测.md`
+  - 中继净成本：p50 **+0.1 ~ +0.6 ms**（6 轮重复，多次为负=噪声）
+  - **手机侧 UDP 关联建了但 0 包转发**：10 条关联 `上行 0 B / 0 包`；
+    同时间段 Windows 客户端 `上行 640 B / 20 包` → 中继侧正常，问题在 hev
+  - hev 日志有 `socks5 client udp construct`，之后无错误、无后续 → 包静默消失
+  - **下一步**：把 hev `log-level` 调到 `debug` 看 `socks5 session udp fwd b recv`；
+    或试 `udp: 'tcp'`（UDP over TCP）作退路
+  - 测法工具：`tools/measure-android-udp.py`（判据看包数，不只看关联有没有）
 - [ ] **Per-App 分流**：只让指定 App 走隧道（参考 5G-Proxy-Client 的 `PerAppMode`）
 - [ ] **长期稳定性**：挂着 VPN 用一天，看耗电、断线重连、WiFi↔4G 切换
 - [ ] **手机端功能补充**（用户让评估）：见下面「候选功能」

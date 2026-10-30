@@ -30,10 +30,12 @@ import hev.htproxy.TProxyService;
  *   ② hev native 在跑（TProxyIsRunning）
  *   ③ DNS 能解析（www.qq.com —— 走 mapdns，由远端解析）
  *   ④ HTTP 能通（http://www.qq.com）
- *   ⑤ 出口 IP 真的是远端（对比自检拿到的公网 IP 与远端出口）
+ *   ⑤ 隧道是否真的在承载流量（hev 统计的字节增量）
  *
  * 第 ⑤ 步最要紧：前四步全过也可能「其实没走隧道」（比如路由没配上，
- * 流量从 wlan0 直出了）。只有出口 IP 变了才证明真的在借网。
+ * 流量从 wlan0 直出了）。但判据**不能**用「出口 IP 变没变」——
+ * 这台校园网里 pcs 和手机走同一个 NAT 出口，开不开隧道公网 IP 都一样
+ * （2026-10-29 实测都是 120.235.20.202）。见 checkUplink 的版本演进。
  */
 public class SelfCheck {
 
@@ -76,10 +78,18 @@ public class SelfCheck {
             items.add(checkDns());
             items.add(checkHttp(proxyPort));
             items.add(checkUplink());
-            int okCount = 0;
-            for (Item i : items) if (i.ok) okCount++;
-            String summary = okCount + "/" + items.size() + " 项通过"
-                    + (okCount == items.size() ? " —— 隧道正常" : " —— 隧道没完全通");
+            // 统计口径：只算「能证明隧道状态」的项。
+            // 「HTTP 请求（仅参考）」不计入 —— 它的成败取决于本机物理网卡有没有网，
+            // 与隧道无关（本 App 被 addDisallowedApplication 排除，必然直连）。
+            // 把它算进去会让「隧道完全正常但校园网禁网」时显示 3/5，误报。
+            int okCount = 0, total = 0;
+            for (Item i : items) {
+                if (i.name.contains("仅参考")) continue;
+                total++;
+                if (i.ok) okCount++;
+            }
+            String summary = okCount + "/" + total + " 项通过"
+                    + (okCount == total ? " —— 隧道正常" : " —— 隧道没完全通");
             // 出口 IP 只作参考信息，不计入通过数：这台校园网里 pcs 和手机
             // 走同一个 NAT 出口，开不开隧道公网 IP 都一样，拿它当判据会误判。
             Item egress = checkEgressInfo();
@@ -171,10 +181,17 @@ public class SelfCheck {
             c.setReadTimeout(8000);
             c.setInstanceFollowRedirects(false);
             int code = c.getResponseCode();
-            String via = proxyPort > 0 ? "（经本地代理 " + proxyPort + "）" : "（直连，可能不准）";
-            return new Item("HTTP 请求", code > 0, "HTTP " + code + via);
+            // proxyPort=0 时这一项**必然是假阴性**（本 App 被 addDisallowedApplication
+            // 排除在 VPN 路由外，见上面的长注释），所以它算「通过」也不能当证据，
+            // 失败也不能当罪证 —— 文案里必须写明白，别让人拿它下结论。
+            String via = proxyPort > 0
+                    ? "（经本地代理 " + proxyPort + "）"
+                    : "（直连本机网卡，不代表隧道状态）";
+            return new Item("HTTP 请求（仅参考）", code > 0, "HTTP " + code + via);
         } catch (Exception e) {
-            return new Item("HTTP 请求", false, e.getClass().getSimpleName() + ": " + e.getMessage());
+            return new Item("HTTP 请求（仅参考）", false,
+                    e.getClass().getSimpleName() + ": " + e.getMessage()
+                    + "（直连本机网卡，隧道可能仍然正常）");
         } finally {
             if (c != null) c.disconnect();
         }
@@ -200,31 +217,53 @@ public class SelfCheck {
      *   从 TUN 进了隧道 —— 这是端到端、只依赖自己数据的判据。
      */
     private static Item checkUplink() {
-        long before = tunnelBytes();
+        long[] b = tunnelStats();
         boolean reqOk = quickHttp("http://www.qq.com");
-        long after = tunnelBytes();
-        long delta = after - before;
-        if (delta > 0) {
+        long[] a = tunnelStats();
+        if (b == null || a == null) {
+            // 拿不到统计 ≠ 隧道坏。说清楚是拿不到，别让人误以为没流量。
+            return new Item("隧道承载", false, "读不到 hev 统计（so 未加载或未运行）");
+        }
+        long dBytes = (a[1] + a[3]) - (b[1] + b[3]);
+        long dPkts = (a[0] + a[2]) - (b[0] + b[2]);
+        long before = b[1] + b[3];
+        if (dBytes > 0 || dPkts > 0) {
             return new Item("隧道承载", true,
-                    "这次请求让隧道流量增加 " + delta + " 字节");
+                    "这次请求让隧道 +" + dPkts + " 包 / +" + dBytes + " 字节");
         }
         if (before > 0) {
             return new Item("隧道承载", true,
                     "本次没测到增量，但隧道累计已过 " + before + " 字节");
         }
+        // 走到这里 = 统计能读、但一直是 0，且请求也没成功。
+        // 注意：即使请求失败也**不能**断言隧道坏 —— 请求本身可能是被校园网禁网挡的。
         return new Item("隧道承载", false,
-                reqOk ? "隧道统计一直为 0，流量没进隧道" : "请求失败，无法判断");
+                reqOk ? "隧道统计一直为 0，流量没进隧道" : "请求失败且统计为 0，无法判断");
     }
 
-    /** 读 hev 的累计字节数（tx 字节 + rx 字节）；取不到返回 0。 */
-    private static long tunnelBytes() {
+    /**
+     * 读 hev 的四个计数：[0]=tx 包数 [1]=tx 字节 [2]=rx 包数 [3]=rx 字节
+     * （见 hev-jni.c 的 native_get_stats）。拿不到返回 null。
+     *
+     * 为什么不用 `/proc/net/dev`：交接文档 P2 曾建议「读 /proc/net/dev 的 tun0
+     * 字节增量，不需要 root，Android 10+ 可读」——**实测是错的**。
+     * 2026-10-30 在 App 自己的进程里（untrusted_app 域，uid 10293）读它：
+     *     /proc/net/dev: open failed: EACCES (Permission denied)
+     * （注意：用 `adb shell run-as` 去试会得到同样的 Permission denied，
+     *   但那是 runas_app 域，本来就不能代表 App —— 必须让 App 自己读才算数。）
+     *
+     * 而 TProxyGetStats 完全够用，且和 /proc/net/dev 数值逐位吻合（实测）：
+     *     hev_stats = txPkts=197 txBytes=42290 rxPkts=151 rxBytes=41041
+     *     /proc/net/dev tun0 = 收 41041 包 151 / 发 42290 包 197
+     * 它还更准：直接就是「hev 处理过的隧道流量」，不含 tun0 上任何其它东西。
+     */
+    private static long[] tunnelStats() {
         try {
             long[] st = TProxyService.TProxyGetStats();
-            if (st == null || st.length < 4) return 0;
-            // 四个值的含义（见 hev-jni.c）：[0]=tx 包数 [1]=tx 字节 [2]=rx 包数 [3]=rx 字节
-            return st[1] + st[3];
+            if (st == null || st.length < 4) return null;
+            return st;
         } catch (Throwable t) {
-            return 0;
+            return null;
         }
     }
 
