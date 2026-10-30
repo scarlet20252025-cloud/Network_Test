@@ -1594,6 +1594,117 @@ def sample_live(db):
         _live_cache['at'] = t
         return data
 
+def _h(s):
+    """html.escape 的短别名（模板里拼 HTML 用得太多）。"""
+    return html.escape(str(s if s is not None else ""))
+
+
+# 内置浏览器 UA 特征。检测到就说明「下载按钮点了也白点」，必须换成文字指引。
+#
+# 为什么用 UA 字符串匹配而不是更"正规"的能力检测：
+#   这些内置浏览器**对 APK 下载没有任何可探测的信号** —— 不报错、
+#   不发事件、不返回错误码。唯一的线索就是 UA。
+#   宁可误判成"在微信里"（多显示一段指引导），也不要漏判
+#   （用户会卡死在一个点了没反应的按钮上）。
+ANDROID_INAPP_UA_KEYS = ('micromessenger', 'qq/', 'weibo', 'alipayclient',
+                         'dingtalk', 'lark/', 'baiduboxapp')
+
+
+def android_landing_page(portal_host='10.13.24.1:8080', ua=''):
+    """手机扫码后的落地页。
+
+    二维码指向这里、而不是直指 APK —— 理由见文件顶部的注释。
+    """
+    apk = android_apk_latest()
+    ver = _h(apk['versionName']) if apk else '暂未发布'
+    size = human_size(apk['size']) if apk else '—'
+    inapp = any(k in (ua or '').lower() for k in ANDROID_INAPP_UA_KEYS)
+    dl = 'http://' + portal_host + '/download-android'
+
+    if inapp:
+        # 内置浏览器：**不给**下载按钮。
+        # 给一个明知道按了没反应的按钮，比不给更糟 —— 用户会反复点。
+        head = """
+  <div class="msg err" style="margin:0 0 16px">
+    <b>你正在用微信 / QQ 的内置浏览器打开这个页面。</b><br>
+    这类浏览器<b>不允许下载 Android 安装包</b>，点下载不会有任何反应
+    （不报错、也不开始）。请按下面的步骤换到系统浏览器。
+  </div>
+"""
+        guide = """
+  <div class="card">
+    <h2 style="margin-top:0">换成系统浏览器（两步）</h2>
+    <div class="step"><div class="n">1</div><div class="t">
+      <b>点右上角的 <span style="font-size:16px">&#8943;</span> 或 <span style="font-size:16px">&#8226;&#8226;&#8226;</span></b>
+      <div class="hint">微信在右上角，QQ 也在右上角。点开后会看到一排选项。</div>
+    </div></div>
+    <div class="step"><div class="n">2</div><div class="t">
+      <b>选「在浏览器打开」</b>
+      <div class="hint">有的版本写「在手机浏览器中打开」。选完页面会在系统浏览器里重新打开，
+        那时下面这个下载按钮就能用了。</div>
+    </div></div>
+    <div class="hint" style="margin-top:14px">
+      也可以直接把下面这个地址复制到浏览器地址栏：
+      <div class="cmdbox" style="user-select:all">DLURL</div>
+    </div>
+  </div>
+"""
+        btn = """
+  <div class="msg warn" style="margin-bottom:0">
+    换到系统浏览器后，回到这个页面点下载即可。
+  </div>
+"""
+    else:
+        head = ''
+        guide = ''
+        btn = """
+  <a class="dl" href="/download-android">&#11015; 下载并安装（SIZE）</a>
+  <div class="hint" style="text-align:center;margin-top:-6px">
+    点上面按钮开始下载。下载完点开文件，按提示安装。
+  </div>
+"""
+
+    body = """
+<div class="dlwrap">
+  <div class="dlhero" style="padding:14px 8px 8px">
+    <h1 style="font-size:24px;margin:0 0 8px">Android 客户端</h1>
+    <div class="sub" style="font-size:13.5px;margin-bottom:14px">
+      vVER <span style="color:var(--fg2)">·</span> SIZE
+    </div>
+  </div>
+HEAD
+BTN
+GUIDE
+  <div class="card">
+    <h2 style="margin-top:0">装的时候会看到什么</h2>
+    <div class="step"><div class="n">1</div><div class="t">
+      <b>「是否允许来自此来源的应用」</b>
+      <div class="hint">手机自带的检查，选「允许」或「继续安装」。只问一次。</div>
+    </div></div>
+    <div class="step"><div class="n">2</div><div class="t">
+      <b>部分机型（如 vivo）要登录账号确认</b>
+      <div class="hint">这是厂商策略，不是软件问题。如果卡住，可以在
+        「设置 → 应用管理 → 渡口 → 允许安装未知应用」里放行，或从电脑下载后用数据线传过去。</div>
+    </div></div>
+    <div class="step"><div class="n">3</div><div class="t">
+      <b>装好后打开，填管理员给的激活码</b>
+      <div class="hint">激活后点「开始借网」。之后 App 里还有「检查更新」，升级不用再扫码。</div>
+    </div></div>
+  </div>
+
+  <div class="hint" style="text-align:center;margin-top:14px;line-height:1.9">
+    直链（可长按复制）：
+    <div class="cmdbox" style="user-select:all">DLURL</div>
+  </div>
+</div>
+"""
+    body = (body.replace('HEAD', head).replace('BTN', btn)
+                .replace('GUIDE', guide)
+                .replace('VER', ver).replace('SIZE', size)
+                .replace('DLURL', dl))
+    return page('下载 Android 版 · 渡口', body)
+
+
 def page(title, body, refresh=None, theme=None, cookie_header=None):
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ''
     cur = theme or _theme_from_cookie(cookie_header)
@@ -6019,6 +6130,15 @@ Read-Host '按回车退出'
 # ─────────────────────────── HTTP 处理 ───────────────────────────
 
 class Handler(http.server.BaseHTTPRequestHandler):
+
+    # 用 HTTP/1.1 而不是默认的 1.0 —— 见文件顶部/本次改动的说明：
+    # 部分手机浏览器对 HTTP/1.0 响应处理不好（一直加载中或白屏），
+    # 而 curl 完全正常，所以这个问题只在真机浏览器上暴露。
+    #
+    # ⚠ 改成 1.1 后**每个响应都必须有准确的 Content-Length**，
+    #   否则 keep-alive 会让浏览器一直等后续字节。
+    #   本项目 send_html / send_json / 文件下载都已显式设置。
+    protocol_version = 'HTTP/1.1'
     server_version = 'BorrowPortal/1.0'
     db = None
     admin_pw = ''
@@ -6078,6 +6198,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             to = '/'
         self.send_response(302)
         self.send_header('Location', to)
+        # HTTP/1.1 下**必须**显式声明 body 长度，即使是零长度。
+        # 少了这一行，浏览器会按 keep-alive 语义继续等一个 body，
+        # 表现就是「点了登录/跳转，页面一直转圈」。
+        self.send_header('Content-Length', '0')
         if cookie:
             # HttpOnly：即使哪天出现 XSS，会话 cookie 也偷不走。
             # SameSite=Lax：挡住跨站请求带 cookie（CSRF 的第二道闸）。
@@ -6247,6 +6371,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_android_version()
             elif path == '/download-android':
                 self.handle_download_android()
+            elif path == '/get-android':
+                # 扫码落地页（区分微信/QQ 内置浏览器）
+                _ua = self.headers.get('User-Agent') or ''
+                _ph = (self.headers.get('Host') or '10.13.24.1:8080').strip()
+                self.send_html(android_landing_page(portal_host=_ph, ua=_ua))
             elif path == '/about':
                 self.handle_about()
             elif path == '/setup-hosts':
@@ -6255,6 +6384,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_unlock()
             elif path == '/favicon.ico':
                 self.send_response(204)
+                # 204 本身没有 body，但 HTTP/1.1 keep-alive 下仍要显式声明，
+                # 否则部分手机浏览器会挂住等数据。
+                self.send_header('Content-Length', '0')
                 self.end_headers()
             else:
                 # 404 要给出路，而不是只告诉人「没有这个页面」。
