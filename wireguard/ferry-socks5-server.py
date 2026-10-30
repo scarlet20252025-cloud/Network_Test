@@ -395,9 +395,14 @@ async def _open_via_clash(host, port):
     except Exception as e:
         # 记日志：之前这里静默 return None，排查「为什么没走 Clash」时
         # 完全看不出原因（可能是节点挂了、被限流、握手被拒）。
-        if _clash_ok_cache.get('last_err') != str(e)[:60]:
-            _clash_ok_cache['last_err'] = str(e)[:60]
-            log('clash path failed: %s' % e)
+        #
+        # 去重键也必须用 _exc_text：原先用 str(e)，而超时的 str() 是空串，
+        # 于是 `last_err` 一旦被置成 ''，后面所有超时都被当成「已经记过」
+        # 而永远不再输出 —— 正是最该看到的那一类被永久静音。
+        key = _exc_text(e)[:60]
+        if _clash_ok_cache.get('last_err') != key:
+            _clash_ok_cache['last_err'] = key
+            log('clash path failed: %s' % key)
         try:
             w.close()
         except Exception:
@@ -525,6 +530,35 @@ async def _open_upstream(host, port, peer_ip):
 
 def log(msg):
     print('[%s] %s' % (time.strftime('%H:%M:%S'), msg), flush=True)
+
+
+def _exc_text(e):
+    """把异常变成一行有意义的原因文字。
+
+    为什么必须有这个（2026-10-30 实测）：
+      `asyncio.TimeoutError` 在 3.11+ 就是内置 `TimeoutError`，而
+      **`str(TimeoutError())` 是空字符串** —— 它是 OSError 家族里唯一这样的。
+      所以 `log('... 失败: %s' % e)` 会输出「失败: 」，后面什么都没有。
+
+      实测 pcs 上 2 MB 日志（28792 行）里，失败/异常行共 3685 条，
+      其中 **3625 条原因为空（98%）**。这些行正好是最需要诊断的那批
+      （googleapis / chatgpt 之类连不上），结果等于只告诉你有失败、
+      不告诉你为什么失败 —— 分不清是超时、被拒、还是 DNS 挂了。
+
+    为什么还要拼上类型名：
+      同一个空原因既可能是 TimeoutError（等满了 0.9s 超时），
+      也可能是 OSError 的空串分支，只有类型名能区分。有内容的异常
+      （如 `[WinError 10054] 远程主机强迫关闭了一个现有的连接`）已经
+      自带类型线索，就不要再前缀一遍，否则变成
+      「ConnectionResetError: ConnectionResetError [WinError...]」。
+    """
+    name = type(e).__name__
+    text = str(e).strip()
+    if not text:
+        return name
+    if text.startswith(name):
+        return text
+    return '%s: %s' % (name, text)
 
 
 # ── UDP 关联建立的日志降噪 ──
@@ -733,7 +767,7 @@ class UdpRelay:
         try:
             _atyp, host, port, payload = parse_socks5_udp(data)
         except ValueError as e:
-            log('UDP 头解析失败: %s' % e)
+            log('UDP 头解析失败: %s' % _exc_text(e))
             return
         if not payload:
             return
@@ -758,7 +792,7 @@ class UdpRelay:
             try:
                 self._target_transport.sendto(payload, (host, port))
             except Exception as e:
-                log('UDP 发往 %s:%d 失败: %s' % (host, port, e))
+                log('UDP 发往 %s:%d 失败: %s' % (host, port, _exc_text(e)))
             return
         except OSError:
             pass
@@ -768,7 +802,7 @@ class UdpRelay:
             try:
                 self._target_transport.sendto(payload, (ip, port))
             except Exception as e:
-                log('UDP 发往 %s:%d 失败: %s' % (ip, port, e))
+                log('UDP 发往 %s:%d 失败: %s' % (ip, port, _exc_text(e)))
             return
 
         # 域名且未缓存：触发一次异步解析，这一包丢弃
@@ -798,7 +832,7 @@ class UdpRelay:
         try:
             self._client_transport.sendto(pkt, self.udp_peer)
         except Exception as e:
-            log('UDP 回发客户端失败: %s' % e)
+            log('UDP 回发客户端失败: %s' % _exc_text(e))
 
     def close(self):
         if self.closed:
@@ -833,7 +867,7 @@ class _UdpProto(asyncio.DatagramProtocol):
         try:
             self.on_data(data, addr)
         except Exception as e:
-            log('UDP 回调异常: %s' % e)
+            log('UDP 回调异常: %s' % _exc_text(e))
 
     def error_received(self, exc):
         # 静默忽略：这是「对端端口不可达」，属于正常的 UDP 语义
@@ -964,7 +998,7 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
         try:
             up_reader, up_writer, via = await _open_upstream(host, port, peer_ip)
         except Exception as e:
-            log('%s → %s:%d 失败: %s' % (peer_ip, host, port, e))
+            log('%s → %s:%d 失败: %s' % (peer_ip, host, port, _exc_text(e)))
             client_writer.write(b'\x05\x05\x00\x01' + b'\x00' * 6)
             await client_writer.drain()
             client_writer.close()
@@ -985,7 +1019,7 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
     except Exception as e:
-        log('%s 异常: %s' % (peer_ip, e))
+        log('%s 异常: %s' % (peer_ip, _exc_text(e)))
     finally:
         if relay:
             relay.close()
@@ -1030,7 +1064,7 @@ async def reap_idle_relays():
             if dead:
                 log('回收空闲 UDP 关联 %d 个（剩 %d）' % (len(dead), len(_relays)))
         except Exception as e:
-            log('UDP 关联回收出错（忽略）: %s' % e)
+            log('UDP 关联回收出错（忽略）: %s' % _exc_text(e))
 
 
 async def watch_rate_conf(conf_path, initial_mb):
@@ -1080,7 +1114,7 @@ async def watch_rate_conf(conf_path, initial_mb):
         except Exception as e:
             # 文件正被写一半、或内容不是数字 —— 忽略这一轮，下轮再试。
             # 绝不能因为读配置失败就让这个循环退出（那就再也不热更新了）。
-            log('读限速配置失败（忽略）: %s' % e)
+            log('读限速配置失败（忽略）: %s' % _exc_text(e))
         await asyncio.sleep(5)
 
 async def main():

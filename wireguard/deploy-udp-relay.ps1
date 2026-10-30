@@ -160,9 +160,51 @@ function Start-Relay {
   #
   # .cmd 里一行一条命令，没有嵌套引号，cmd.exe 解析不会出错。
   $runner = Join-Path $InstallDir 'run-relay.cmd'
+
+  # ── 启动前轮转日志 ──
+  #
+  # 为什么必须在**启动器里**做、不能在 python 里做：
+  #   日志是 `.cmd` 用 `>>` 追加打开的，句柄在 cmd 手里。python 里去 rename
+  #   自己正在追加的文件，Windows 上会直接失败（文件被占用）。
+  #   而这一步在重定向**之前**执行，此时还没有句柄，rename 一定成功。
+  #
+  # 为什么必须有（2026-10-30 实测）：
+  #   pcs 上 udp-relay.log 单文件已到 **70,766,051 字节（67 MB）**，
+  #   而 pcs 的 C: 只剩 4.8 GB。没有任何轮转意味着它会一直涨到吃满盘，
+  #   一旦写不进去，中继的所有日志（包括真正的错误）就静默消失。
+  #   67 MB 里绝大部分是 TCP `done, N bytes` 这类流水账（2 MB 样本中占 82%）。
+  #
+  # 留 5 份历史：够追溯一两天，最多占 ~5×64MB。
+  #
+  # 为什么把「挪档案」写在轮转成功的分支里（实测踩到）：
+  #   第一版是「先无条件把 .4→.5、.3→.4 …，再看当前文件大不大」。
+  #   结果每次**重启**（哪怕日志只有 1 KB、根本没到阈值）都会把
+  #   log.1 变 log.2、log.2 变 log.3 …… 重启 5 次历史就全没了，
+  #   而真正的轮转一次都没发生 —— 存档变得比不轮转还不可靠。
+  #   现在只有「确实超了 64MB」才进入移位分支，平时一条 move 都不执行。
+  #
+  # 为什么写成 `for %A` 取大小而不是 %%~zA 直接嵌在 if 里：
+  #   cmd 的 `if` 不支持取文件大小，必须先 `for` 把它放进一个变量；
+  #   而 `%%A` 在 .cmd 文件里写（不是命令行里写）就是要双百分号。
+  #   实测：阈值 67108864 时小文件不动、64MB 文件移成 .1，行为正确。
+  $rotate = @(
+    'rem ---- 日志轮转：超过 64MB 才滚一份，最多留 5 份 ----',
+    ('for %%A in ("' + $LogFile + '") do if %%~zA GEQ 67108864 goto doRotate'),
+    'goto afterRotate',
+    ':doRotate',
+    ('if exist "' + $LogFile + '.5" del /q "' + $LogFile + '.5" >nul 2>&1'),
+    ('if exist "' + $LogFile + '.4" move /Y "' + $LogFile + '.4" "' + $LogFile + '.5" >nul 2>&1'),
+    ('if exist "' + $LogFile + '.3" move /Y "' + $LogFile + '.3" "' + $LogFile + '.4" >nul 2>&1'),
+    ('if exist "' + $LogFile + '.2" move /Y "' + $LogFile + '.2" "' + $LogFile + '.3" >nul 2>&1'),
+    ('if exist "' + $LogFile + '.1" move /Y "' + $LogFile + '.1" "' + $LogFile + '.2" >nul 2>&1'),
+    ('if exist "' + $LogFile + '" move /Y "' + $LogFile + '" "' + $LogFile + '.1" >nul 2>&1'),
+    ':afterRotate'
+  )
+
   $lines = @(
     '@echo off',
-    'chcp 936 >nul',
+    'chcp 936 >nul'
+  ) + $rotate + @(
     ('"' + $Python + '" ' + $argStr + ' >> "' + $LogFile + '" 2>&1')
   )
   $content = ($lines -join "`r`n") + "`r`n"

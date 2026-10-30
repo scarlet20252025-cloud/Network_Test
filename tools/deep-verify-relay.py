@@ -166,8 +166,19 @@ try:
         relay_ip, relay_port = None, None
     print('  ASSOCIATE ok, relay=%s:%s' % (relay_ip, relay_port))
 
+    # ⚠ 服务端按 RFC 1928 返回 BND.ADDR = 0.0.0.0（它不知道客户端眼里自己的地址，
+    # 见 ferry-socks5-server.py 里 `\x00\x00\x00\x00` 那段的注释）。
+    # 0.0.0.0 不是可以 sendto 的目标 —— Windows 直接 WinError 10049，
+    # 而这里以前正是这么发的，于是「UDP 正常」也会被报成失败。
+    # 正确做法：把 0.0.0.0 换成我们连过去的那个主机地址。
+    send_ip = '0.0.0.0'
+    if relay_ip in (None, '0.0.0.0', ''):
+        send_ip = RELAY[0]
+    else:
+        send_ip = relay_ip
+
     # 发一个 DNS 查询
-    if relay_ip and relay_port:
+    if relay_port:
         import struct
         q = struct.pack('>HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0)
         q += b'\x07aliyun\x03com\x00'
@@ -177,9 +188,15 @@ try:
               (53).to_bytes(2, 'big') + q
         u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         u.settimeout(8)
-        u.sendto(pkt, (relay_ip, relay_port))
-        data, _ = u.recvfrom(2048)
-        print('  UDP DNS reply %d bytes (header %d)' % (len(data), data[3] if len(data) > 3 else -1))
+        u.sendto(pkt, (send_ip, relay_port))
+        try:
+            data, _ = u.recvfrom(2048)
+            print('  UDP DNS reply %d bytes (header %d)'
+                  % (len(data), data[3] if len(data) > 3 else -1))
+        except socket.timeout:
+            # 外网 UDP 出口被封 / 目标不回，与中继本身无关，单独说清楚
+            print('  UDP 无回包（超时）—— 中继管道本身可能正常，'
+                  '是出口到 223.5.5.5:53 不通；先用环回 echo 判管道')
         u.close()
     s.close()
 except Exception as e:
