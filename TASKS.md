@@ -54,17 +54,35 @@
 **⑥ Android：取消下载无效** —— `setCancelable(true)` 但没接监听，
 用户点取消后 6 MB 照样下完、校验、弹安装器。修：标志位贯通下载循环。
 
+**⑦ 验证脚本：冷却断言改成自适应，不再假红**
+
+`verify-portal-pages.py` 第 6b 节 `sleep(7)` 后重交，前提是实例用
+`FERRY_FB_COOLDOWN=6` 起的。忘了传就是默认 60 秒 → 等不到 → 稳定假红 41/42，
+而且第 5 节「被冷却挡住」还是**通过**的，反而加固了错误判断。
+
+修：发一条探测请求，从错误页「请 N 秒后再试」读出真实窗口，按它决定等多久
+（>20 秒就跳过并打印原因）；第 4 节撞冷却时 skip 而不是判红
+（但 csrf 坏掉那种仍然红）。三种运行方式实测全 0 失败（踩坑 96）。
+
 ### 验证命令（都可重跑）
 
 ```
 cd portal && python -u portal-server.py --port 18091 --db test-stab.db
 python tools/verify-portal-http.py --port 18091 --conns 40 --hold 30   # 17 项全过
-PORTAL_BASE=http://127.0.0.1:18091 python tools/verify-portal-pages.py # 42 项全过
+PORTAL_BASE=http://127.0.0.1:18091 python tools/verify-portal-pages.py # 见下方说明
 powershell -ExecutionPolicy Bypass -File tools\build-apk-remote.ps1    # BUILD SUCCESSFUL 21s
 ```
 
-> `verify-portal-pages.py` **连跑两次**会出现 1 项「提交成功提示」失败 ——
-> 那是反馈冷却（默认 60 秒），不是回归。冷启动跑一次是 42/42。
+> `verify-portal-pages.py` 现在**自己探测冷却窗口**，结果与实例启动参数无关：
+>
+> | 场景 | 结果 |
+> |---|---|
+> | `FERRY_FB_COOLDOWN=6` 起的实例 | 42 通过 0 失败 |
+> | 默认 60 秒冷却的实例 | 41 通过 0 失败（第 6b 自动跳过，打印原因） |
+> | 同一个库再跑一次 | 40 通过 0 失败（第 4 节也 skip） |
+>
+> 早先它假定实例是 `FERRY_FB_COOLDOWN=6` 起的，忘了传就稳定假红 41/42 ——
+> 追了三轮才确认是脚手架的前提没写死，不是门户坏了（踩坑 96）。
 
 ### 刻意没改（查过，不是问题）
 
