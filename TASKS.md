@@ -98,14 +98,21 @@ powershell -ExecutionPolicy Bypass -File tools\build-apk-remote.ps1    # BUILD S
 
 1. **Android 改动只做了编译验证**（xt 上 BUILD SUCCESSFUL），
    **没在真机跑「下载中退出」**。要复现得造慢速下载环境。
-2. **门户改动未部署线上**（pcs 上的 FerryPortal 跑的还是 10-30 那版）。
-   按约定不主动部署，等用户说了再走发版流程（`_deploy_remote.ps1`）。
-3. **P0 CS2 延迟间歇尖峰仍未闭环**：需要在用户说「卡」的当下同时跑
+2. **P0 CS2 延迟间歇尖峰仍未闭环**：需要在用户说「卡」的当下同时跑
    `python tools/measure-64hz.py 256` 与 `ping -n 300 10.13.24.1`。
    手机 `adb devices` 需要真机接上。
 
-> 原第 3 条「`handle_download_android` 没捕 `TimeoutError`」已在
-> `b4e4f82` 修掉（7 处发送点统一补上），不再是限制。
+> 原「门户改动未部署线上」已解除：2026-10-31 19:42 部署到 pcs
+> （备份 `portal-server.py.bak-20261031-194254`，新进程 13064，
+> 与本地 sha256 一致 `10825eae…`）。线上验证 **11/11 全过**，
+> 其中「`Content-Length: abc` → 403 而非 500」是只有新代码才有的指纹。
+>
+> 验证必须在 **pcs 本机**跑 `tools/verify-portal-live.py`：在用户机上跑
+> D 项会报 0/5（借网路径的代理/TUN 自己保持着 TCP 连接），
+> 那是假失败（踩坑 97）。
+>
+> 原「`handle_download_android` 没捕 `TimeoutError`」已在 `b4e4f82` 修掉
+> （7 处发送点统一补上），不再是限制。
 
 ---
 
