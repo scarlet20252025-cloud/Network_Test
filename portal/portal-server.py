@@ -6465,7 +6465,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   <div class="hint">端口 {CFG['port']} 不能省；域名需在 hosts 里配置过才生效。</div>
 </div>
 """), 404)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             # 客户端提前断开（刷新 / 关标签页 / curl --max-time 到点）不是错误。
             # 这类异常在 HTTP 服务里随时可能发生，打日志只会淹没真问题。
             pass
@@ -6541,7 +6541,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_unlock(form)
             else:
                 self.send_html(page('404', '<h1>404</h1>'), 404)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             # 同上：客户端断开不是错误。
             pass
         except Exception as e:
@@ -6861,7 +6861,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 try:
                     self.wfile.write(data)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
                     pass
                 return
 
@@ -6944,7 +6944,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             for i in range(0, len(data), CHUNK):
                 self.wfile.write(data[i:i + CHUNK])
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
         self.db.log('download', ip, fname)
 
@@ -6997,7 +6997,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             for i in range(0, len(data), CHUNK):
                 self.wfile.write(data[i:i + CHUNK])
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
         try:
             self.db.log('download', self.client_ip(), fname)
@@ -7028,7 +7028,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             for i in range(0, len(data), CHUNK):
                 self.wfile.write(data[i:i + CHUNK])
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
 
     def handle_android_version(self):
@@ -7121,7 +7121,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     left -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             return
 
     def handle_api_config(self, qs):
