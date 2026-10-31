@@ -8,6 +8,90 @@
 
 ---
 
+## 2026-10-31 18:00–19:10 稳定性复检（门户 + Android 更新链路）
+
+> 起因：用户要求「再为这个项目做一遍验证检查，提高稳定性，或指出架构错误并修正」。
+> 原则：只改**能复现**的问题，每处修复都有实测数字；不主动部署线上，不动用户正在跑的客户端。
+
+### 已修并复测 ✅
+
+**① 门户：HTTP/1.1 漏了连接生命周期，空闲连接永久占线程（最严重）**
+
+昨天把 `protocol_version` 改成 `'HTTP/1.1'` 修好了手机浏览器白屏（踩坑 91），
+但 1.1 默认开 keep-alive，而 `BaseHTTPRequestHandler.timeout` 是 `None`、
+`ThreadingMixIn` 又是一连接一线程 —— 于是「连上、发一个请求、然后不说话」的
+连接会永久占住一个线程。
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 40 条静默连接 | 线程 7 → 47 | 线程 2 → 42 |
+| 静默 30 秒后 | **44（不回收）** | **4（回收）** |
+
+手机浏览器切后台、扫描器、curl 探测都在制造这种连接。修法：`Handler.timeout = 20`
++ `MAX_CONCURRENT = 128` 信号量（150 条连接 → 128 条可读、22 条被拒）。
+
+**② 门户：`log_message` 遇异常对象抛 TypeError（加 timeout 后才暴露）**
+
+`log_error("Request timed out: %r", e)` 把异常传给 `log_message`，
+旧写法 `'/api/' in args[0]` → `TypeError: not a container or iterable`。
+每条空闲连接超时多刷一段 traceback（实测 40 条 → 40 段）。
+修：先 `isinstance(first, str)`，并把超时日志整体过滤（它是正常事件）。
+
+**③ 门户：畸形 `Content-Length` 直接 500**
+
+`read_form()` 的 `int(Content-Length)` 在 try 之外，`Content-Length: abc` → 500 + traceback。
+修：统一 `_content_length()`，非数字/负数/纯空格当 0。实测 `abc`/`-5`/`99999999`/`   `
+全部变成正常 403。
+
+**④ 门户：`\F` 非法转义 SyntaxWarning**（L1882，每次启动刷一行）
+
+**⑤ Android：更新链路三处 Activity 销毁后弹框**
+
+`BadTokenException`（Android 最常见崩溃之一）。启动 3 秒静默检查 + 8 秒超时，
+回调时 Activity 可能已销毁。修：`alive(Activity)` 判断（isFinishing + API17 isDestroyed），
+三处回到 UI 的路径都先判存活。
+
+**⑥ Android：取消下载无效** —— `setCancelable(true)` 但没接监听，
+用户点取消后 6 MB 照样下完、校验、弹安装器。修：标志位贯通下载循环。
+
+### 验证命令（都可重跑）
+
+```
+cd portal && python -u portal-server.py --port 18091 --db test-stab.db
+python tools/verify-portal-http.py --port 18091 --conns 40 --hold 30   # 17 项全过
+PORTAL_BASE=http://127.0.0.1:18091 python tools/verify-portal-pages.py # 42 项全过
+powershell -ExecutionPolicy Bypass -File tools\build-apk-remote.ps1    # BUILD SUCCESSFUL 21s
+```
+
+> `verify-portal-pages.py` **连跑两次**会出现 1 项「提交成功提示」失败 ——
+> 那是反馈冷却（默认 60 秒），不是回归。冷启动跑一次是 42/42。
+
+### 刻意没改（查过，不是问题）
+
+- **`/android/version` 每次重算 6 MB APK 的 sha256**：查了客户端触发点，
+  只有 `onCreate` 静默一次 + 用户手点一次，**不是轮询**，开销可接受。
+- **Windows 客户端更新链路**：`Api.Version` 自带 try/catch、`DoUpdate` 先落 `.new`
+  再两次原子 rename（踩坑：旧顺序有「目录里没有可执行 exe」的窗口）、
+  失败自动回滚、每步写 `[更新]` 日志、`wc.Proxy = null` 避开借网时的系统代理。
+  `_licTimer` 是 6 小时一次不是每秒。这一块没找到新缺陷。
+- **并发上限的精确值 128**：是「比 OOM 好」的选择，不是调优结果。
+
+### 剩余限制（别当成已解决）
+
+1. **Android 改动只做了编译验证**（xt 上 BUILD SUCCESSFUL），
+   **没在真机跑「下载中退出」**。要复现得造慢速下载环境。
+2. **门户改动未部署线上**（pcs 上的 FerryPortal 跑的还是 10-30 那版）。
+   按约定不主动部署，等用户说了再走发版流程（`_deploy_remote.ps1`）。
+3. **`handle_download_android` 的 except 没捕 `TimeoutError`**：
+   `timeout = 20` 对大文件写入也生效，慢速客户端（20 秒读不动一个字节）
+   会抛 TimeoutError 落到 `do_GET` 兜底 → 多打一行 ERROR。
+   浏览器会带 Range 重试，功能可恢复；影响很小，未改。
+4. **P0 CS2 延迟间歇尖峰仍未闭环**：需要在用户说「卡」的当下同时跑
+   `python tools/measure-64hz.py 256` 与 `ping -n 300 10.13.24.1`。
+   手机 `adb devices` 需要真机接上。
+
+---
+
 ## 正在做
 
 - [x] **「手机扫码下载不了 / 官网 8080 打不开」—— 根因是服务端回了 HTTP/1.0**（2026-10-30 23:05）
