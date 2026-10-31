@@ -1,3 +1,72 @@
+## v0.14.47 — 2026-10-31
+
+> 只改门户服务端（`portal/portal-server.py`）。客户端无改动。
+> 起因：复检昨天「HTTP/1.0 → 1.1」那次改动（踩坑 91），发现它把连接生命周期
+> 一起改了，而相关的默认值没跟上。
+
+### 一、空闲 keep-alive 连接永久占线程（最严重）
+
+`protocol_version = 'HTTP/1.1'` 默认开 keep-alive，而
+`BaseHTTPRequestHandler.timeout` 默认是 `None`、`ThreadingMixIn` 又是一连接一线程。
+于是「连上、发一个请求、然后不说话」的连接会**永久占住一个线程**。
+
+实测（`tools/probe-keepalive-threads.py`）：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 40 条静默连接 | 线程 7 → 47 | 线程 2 → 42 |
+| 静默 30 秒后 | **44（不回收）** | **4（回收）** |
+
+手机浏览器切后台、局域网扫描器、`curl` 探测都会制造这种连接。校园网十几台设备
+叠加，线程数线性上涨 → 内存涨、句柄耗尽、门户越用越慢。
+
+修法：`Handler.timeout = 20`（空闲 20 秒自动关连接）+ 并发上限
+`MAX_CONCURRENT = 128`（超出直接关连接并记 `[限流]`；实测 150 条连接 →
+128 条可读、22 条被拒）。
+
+### 二、`log_message` 遇非字符串参数抛 TypeError
+
+加了 `timeout` 之后才第一次走到超时分支：`log_error("Request timed out: %r", e)`
+把**异常对象**传给 `log_message`，而旧写法 `'/api/' in args[0]` 抛
+`TypeError: argument of type 'TimeoutError' is not a container or iterable`。
+结果是每条空闲连接超时都多刷一段 traceback（实测 40 条 → 40 段），
+真错误全被埋掉。
+
+修法：先 `isinstance(first, str)` 再 `in`；顺带把 `Request timed out`
+从日志里过滤掉 —— 它是正常事件（用户关标签页），不是错误。
+
+### 三、畸形 `Content-Length` 直接 500
+
+`read_form()` 里 `int(self.headers.get('Content-Length'))` 在 try 之外，
+`Content-Length: abc` → ValueError → 500 + 整段 traceback。扫描器随手发几条
+就能刷爆日志。
+
+修法：统一走 `Handler._content_length()`，非数字/负数/纯空格一律当 0（无 body）。
+实测 `abc` / `-5` / `99999999` / `   ` 全部变成正常的 403，不再有 5xx。
+
+### 四、其它
+
+- `portal-server.py:1882` 的 `"$env:TEMP\Ferry-Setup.exe"` 是 Python 非法转义
+  （`\F`），每次启动都刷 `SyntaxWarning`；改成 `\\F`（页面输出不变）。
+- `do_GET` / `do_POST` 的兜底 except 从只捕 `BrokenPipeError` 扩到
+  `(BrokenPipeError, ConnectionResetError)` —— Windows 上客户端强制断开报的是
+  后者，之前会漏到 `handle_error` 打 traceback。
+- `ThreadingServer.handle_error()` 覆写：BrokenPipe / ConnectionReset /
+  ConnectionAborted / Timeout 四类「客户端正常断开」不再打 traceback。
+
+### 验证
+
+```
+python tools/verify-portal-http.py --port 18091 --conns 40 --hold 30   # 17 项全过
+PORTAL_BASE=http://127.0.0.1:18091 python tools/verify-portal-pages.py # 42 项全过
+```
+
+新增两个脚本：`tools/verify-portal-http.py`（回归）、`tools/probe-keepalive-threads.py`（单独量线程）。
+详情见 `docs/踩坑记录.md` 第 94 条。
+
+> 注意：`verify-portal-pages.py` 连跑两次会有 1 项「提交成功提示」失败 ——
+> 那是反馈冷却（默认 60 秒）在起作用，不是回归。冷启动只跑一次是 42/42。
+
 ## v0.14.46 — 2026-10-30
 
 > 客户端 1.0.48 → 1.0.51 + 中继服务端两个阻塞 bug + Android 端口配错。

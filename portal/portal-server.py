@@ -1879,7 +1879,7 @@ def download_page(detected_ip='', portal_host='10.13.24.1:8080'):
         <div class="step"><div class="n">1</div><div class="t">
           <b>用命令行下载（不触发拦截）</b>
           <div class="hint">按 Win+R 输入 <code>powershell</code> 回车，粘贴这行：</div>
-          <div class="cmdbox">Invoke-WebRequest 'http://10.13.24.1:8080/download' -OutFile "$env:TEMP\Ferry-Setup.exe"; Start-Process "$env:TEMP\Ferry-Setup.exe"</div>
+          <div class="cmdbox">Invoke-WebRequest 'http://10.13.24.1:8080/download' -OutFile "$env:TEMP\\Ferry-Setup.exe"; Start-Process "$env:TEMP\\Ferry-Setup.exe"</div>
           <div class="hint" style="margin-top:6px">
             浏览器下载会给文件打上「来自 Internet」的标记（MOTW），SmartScreen 只查带标记的 exe。
             PowerShell 直接下载不带这个标记。
@@ -6139,13 +6139,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
     #   否则 keep-alive 会让浏览器一直等后续字节。
     #   本项目 send_html / send_json / 文件下载都已显式设置。
     protocol_version = 'HTTP/1.1'
+    # ⚠ HTTP/1.1 默认**开启 keep-alive**：一个请求处理完，线程不退出，
+    #   而是阻塞在 readline() 等下一个请求。`BaseHTTPRequestHandler.timeout`
+    #   默认是 None（永不超时），于是每条「连上、发一个请求、然后不说话」的连接
+    #   都会永久占住一个线程（ThreadingMixIn 是一连接一线程）。
+    #   手机浏览器切后台、局域网扫描器、curl 探测都会制造这种连接 ——
+    #   实测 40 条静默连接 → 线程 7 → 47，20 秒后仍 44，且 40/40 仍可复用
+    #   （tools/probe-keepalive-threads.py）。
+    #   设 20 秒后空闲连接自动关闭、线程回收。参考：nginx keepalive_timeout 75s，
+    #   Apache 5s；20s 对「用户翻几页再点下载」完全够用。
+    timeout = 20
     server_version = 'BorrowPortal/1.0'
     db = None
     admin_pw = ''
 
     def log_message(self, fmt, *args):
-        # 只记关键行，避免刷屏
-        if '/api/' in (args[0] if args else ''):
+        # 只记关键行，避免刷屏。
+        #
+        # ⚠ args 不一定都是字符串：`log_error("Request timed out: %r", e)` 传进来的
+        #   是异常对象。早期写法 `'/api/' in (args[0] if args else '')` 遇到非字符串
+        #   会抛 TypeError（"argument of type 'TimeoutError' is not a container"），
+        #   而它发生在 handle_one_request 的超时分支里 —— 于是每条空闲 keep-alive
+        #   连接超时都会多刷一段 traceback，把真错误淹掉（实测 40 条连接 → 40 段）。
+        first = args[0] if args else ''
+        if isinstance(first, str) and '/api/' in first:
+            return
+        # 「Request timed out」是 HTTP/1.1 空闲 keep-alive 连接到点的正常表现
+        # （浏览器关标签页、手机切后台、curl 结束都会走到这里），不是请求失败。
+        # 一次页面浏览可能留下好几条，留着只会稀释真错误。
+        if fmt.startswith('Request timed out'):
             return
         sys.stderr.write(f'[{datetime.now().strftime("%H:%M:%S")}] {self.client_address[0]} '
                          f'{fmt % args}\n')
@@ -6167,6 +6189,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         'X-XSS-Protection': '1; mode=block',
         'Permissions-Policy': 'geolocation=(), microphone=(), camera=()',
     }
+
+    def _content_length(self):
+        """安全解析 Content-Length；畸形值一律当 0（= 无 body）。
+
+        为什么不能直接 `int(self.headers.get('Content-Length') or 0)`：
+        遇到 `Content-Length: abc` 会抛 ValueError。read_form 里那句在 try 之外，
+        于是**任何一条 POST 只要带个畸形头就让服务端 500 + 打整段 traceback**
+        （实测见 tools/probe-http-malformed.py）。扫描器随手发几个就能让日志膨胀、
+        把真错误淹掉。负数同样无意义，一并归零；具体上限由各调用方判断。
+        """
+        raw = (self.headers.get('Content-Length') or '').strip()
+        if not raw:
+            return 0
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        return n if n > 0 else 0
 
     def _sec_headers(self):
         for k, v in self.SEC_HEADERS.items():
@@ -6224,7 +6264,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         fetch(..., {body: JSON.stringify(...)}) 发过来的 csrf 字段
         解析不出来，do_POST 直接 403 —— 而页面上完全看不出原因。
         """
-        n = int(self.headers.get('Content-Length') or 0)
+        n = self._content_length()
         if n <= 0 or n > 65536:
             return {}
         raw = self.rfile.read(n).decode('utf-8', 'replace')
@@ -6425,7 +6465,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   <div class="hint">端口 {CFG['port']} 不能省；域名需在 hosts 里配置过才生效。</div>
 </div>
 """), 404)
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             # 客户端提前断开（刷新 / 关标签页 / curl --max-time 到点）不是错误。
             # 这类异常在 HTTP 服务里随时可能发生，打日志只会淹没真问题。
             pass
@@ -6501,7 +6541,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_unlock(form)
             else:
                 self.send_html(page('404', '<h1>404</h1>'), 404)
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             # 同上：客户端断开不是错误。
             pass
         except Exception as e:
@@ -7155,7 +7195,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         累计 BytesUp/BytesDown，直接报上来最准、最便宜。
         """
         try:
-            n = int(self.headers.get('Content-Length') or 0)
+            n = self._content_length()
             raw = self.rfile.read(n) if n > 0 else b'{}'
             body = json.loads(raw.decode('utf-8') or '{}')
         except Exception:
@@ -7349,7 +7389,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         因为两边是同一条安全边界，不能有一边松。
         """
         try:
-            n = int(self.headers.get('Content-Length') or 0)
+            n = self._content_length()
             raw = self.rfile.read(n) if n > 0 else b'{}'
             body = json.loads(raw.decode('utf-8') or '{}')
         except Exception:
@@ -7796,7 +7836,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({'ok': False, 'error': '需要 multipart/form-data'}, 400)
             return
 
-        n = int(self.headers.get('Content-Length') or 0)
+        n = self._content_length()
         if n <= 0:
             self.send_json({'ok': False, 'error': '空请求'}, 400)
             return
@@ -8412,6 +8452,47 @@ Write-Host "已添加: $line"</pre>
 class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    # 并发上限。ThreadingMixIn 是「一连接一线程」，默认**没有上限** ——
+    # 几百条连接就是几百个线程（每个默认 8MB 虚拟栈），再叠加 HTTP/1.1 的
+    # keep-alive，连接不会自己消失。门户是局域网小工具，128 已远超真实用量
+    # （十几个学生 + 几个并发下载）；超出直接关连接，比 OOM 或全体卡死好。
+    MAX_CONCURRENT = 128
+    _slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            sys.stderr.write('[限流] 并发已达 %d，拒绝 %s\n'
+                             % (self.MAX_CONCURRENT, client_address[0]))
+            try:
+                request.close()
+            except Exception:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request, client_address):
+        """客户端中途断开不是服务端错误，不打整段 traceback。
+
+        BrokenPipe / ConnectionReset / 空闲超时在浏览器刷新、手机切后台、
+        curl --max-time 到点时随时发生。socketserver 默认把 traceback 全打到
+        stderr，真正的错误就被埋了（实测畸形请求探针里就能刷出一屏）。
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                            ConnectionAbortedError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
 
 
 # ─────────────────────────── 启动 ───────────────────────────
