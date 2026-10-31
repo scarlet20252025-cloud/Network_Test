@@ -55,6 +55,25 @@ public class Updater {
     }
 
     /**
+     * Activity 还能不能拿来弹对话框。
+     *
+     * 为什么每个 ui.post 里都要先问一句：检查更新和下载都在后台线程跑
+     * （8 秒超时的网络请求、几 MB 的下载），这期间用户完全可能返回键退出，
+     * 或者转屏导致 Activity 重建。旧 Activity 一旦 destroy，
+     * `new AlertDialog.Builder(act).show()` 就会抛
+     * `WindowManager$BadTokenException: Unable to add window -- token ... is not valid`，
+     * 这是 Android 上最常见的崩溃之一，而且发生在「用户已经离开了」的瞬间 ——
+     * 崩溃日志里看不出和更新有关。
+     *
+     * `isDestroyed()` 是 API 17 才有的，低版本只能靠 isFinishing()。
+     */
+    private static boolean alive(Activity a) {
+        if (a == null || a.isFinishing()) return false;
+        if (Build.VERSION.SDK_INT >= 17 && a.isDestroyed()) return false;
+        return true;
+    }
+
+    /**
      * 检查更新。有新版就弹对话框问用户要不要更新。
      *
      * @param silent true = 静默检查（启动时自动跑），没有新版不打扰用户；
@@ -68,6 +87,12 @@ public class Updater {
             final int myCode = versionCode(act);
             final String myName = versionName(act);
             ui.post(() -> {
+                if (!alive(act)) {
+                    // 用户已经退出（或转屏重建）。静默结束 —— 这是他自己的选择，
+                    // 别为了一个更新把人拽回来，更不能在这里弹框崩溃。
+                    Log.d(TAG, "check done but activity gone: latestCode=" + r.latestCode);
+                    return;
+                }
                 if (r.networkError) {
                     if (!silent) toast(act, "连不上门户，检查更新失败");
                     Log.d(TAG, "check failed: " + r.error);
@@ -108,6 +133,12 @@ public class Updater {
         pd.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
         pd.setCancelable(true);
         pd.setMax(100);
+        // 用户点「取消」必须真的停下来。
+        // 早先只 setCancelable(true) 没接监听：对话框消失了，后台线程照样把
+        // 6 MB 下完、校验通过、然后**弹系统安装器** —— 用户已经说了不要，
+        // 却又被要求装一个包，这是明确的逻辑错误（不只是体验问题）。
+        final boolean[] cancel = {false};
+        pd.setOnCancelListener(d -> cancel[0] = true);
         pd.show();
 
         new Thread(() -> {
@@ -135,6 +166,10 @@ public class Updater {
                 int n;
                 int lastPct = -1;
                 while ((n = in.read(buf)) > 0) {
+                    if (cancel[0]) {
+                        // 用户取消：跳出循环，交给 finally 关流，再删半截文件。
+                        throw new InterruptedException("用户取消");
+                    }
                     fos.write(buf, 0, n);
                     got += n;
                     if (total > 0) {
@@ -191,6 +226,12 @@ public class Updater {
 
     /** 把 APK 交给系统安装器。 */
     private static void installApk(Activity act, File apk) {
+        if (!alive(act)) {
+            // 走到这里说明 Activity 在下载完成到安装之间被销毁了。
+            // 安装包已经落盘，记日志即可；下次启动用户还能手动装。
+            Log.d(TAG, "skip install, activity gone; apk=" + apk.getAbsolutePath());
+            return;
+        }
         try {
             Intent i = new Intent(Intent.ACTION_VIEW);
             Uri uri;
@@ -207,6 +248,10 @@ public class Updater {
             act.startActivity(i);
         } catch (Exception e) {
             Log.w(TAG, "install failed", e);
+            if (!alive(act)) {
+                Log.d(TAG, "cannot show install error dialog, activity gone");
+                return;
+            }
             new AlertDialog.Builder(act)
                     .setTitle("无法启动安装")
                     .setMessage("安装包已下载到：\n" + apk.getAbsolutePath()

@@ -66,6 +66,24 @@ PORTAL_BASE=http://127.0.0.1:18091 python tools/verify-portal-pages.py # 42 项�
 
 > 注意：`verify-portal-pages.py` 连跑两次会有 1 项「提交成功提示」失败 ——
 > 那是反馈冷却（默认 60 秒）在起作用，不是回归。冷启动只跑一次是 42/42。
+### 五、Android 应用内更新：Activity 销毁后弹框崩溃 + 取消无效（`Updater.java`）
+
+- 启动 3 秒后的静默检查、8 秒网络超时之后回调时，Activity 可能已被销毁
+  （用户返回键退出 / 转屏重建），`new AlertDialog.Builder(act).show()`
+  直接抛 `BadTokenException`。这是 Android 最常见的崩溃之一，而且发生在
+  用户已经离开的瞬间，崩溃栈里看不出与更新有关。
+- 同一个毛病在 `installApk` 的 catch 里还有一处。
+- `pd.setCancelable(true)` 但没接 `setOnCancelListener`：用户点「取消」后
+  下载照样跑完 6 MB、校验通过、然后弹系统安装器 —— 已明确拒绝却又被要求安装。
+
+修法：新增 `alive(Activity)`（`isFinishing()` + API17 以上 `isDestroyed()`），
+三处回到 UI 的路径都先判存活；取消改成标志位贯通下载循环
+（`InterruptedException` 落进已有 catch，`finally` 照常关流），
+取消时删半截文件且**不弹「下载失败」**。
+
+验证：xt 上真编译 `BUILD SUCCESSFUL in 21s`（APK 6.02 MB）。
+**未在真机跑「下载中退出」**，这是剩余限制。详见踩坑 95。
+
 
 ## v0.14.46 — 2026-10-30
 
