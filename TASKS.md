@@ -100,13 +100,12 @@ powershell -ExecutionPolicy Bypass -File tools\build-apk-remote.ps1    # BUILD S
    **没在真机跑「下载中退出」**。要复现得造慢速下载环境。
 2. **门户改动未部署线上**（pcs 上的 FerryPortal 跑的还是 10-30 那版）。
    按约定不主动部署，等用户说了再走发版流程（`_deploy_remote.ps1`）。
-3. **`handle_download_android` 的 except 没捕 `TimeoutError`**：
-   `timeout = 20` 对大文件写入也生效，慢速客户端（20 秒读不动一个字节）
-   会抛 TimeoutError 落到 `do_GET` 兜底 → 多打一行 ERROR。
-   浏览器会带 Range 重试，功能可恢复；影响很小，未改。
-4. **P0 CS2 延迟间歇尖峰仍未闭环**：需要在用户说「卡」的当下同时跑
+3. **P0 CS2 延迟间歇尖峰仍未闭环**：需要在用户说「卡」的当下同时跑
    `python tools/measure-64hz.py 256` 与 `ping -n 300 10.13.24.1`。
    手机 `adb devices` 需要真机接上。
+
+> 原第 3 条「`handle_download_android` 没捕 `TimeoutError`」已在
+> `b4e4f82` 修掉（7 处发送点统一补上），不再是限制。
 
 ---
 
