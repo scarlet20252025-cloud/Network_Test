@@ -1879,20 +1879,43 @@ namespace Ferry
                     SetText(_rowHotspot, "移动热点    需有线连接（当前只有 WiFi）");
                     SetFg(_rowHotspot, Palette.MutedB);
                 }
-                _swHotspot.IsEnabled = !_busy && !_hsBusy && (hsOn || wired);
+                SetEnabled(_swHotspot, !_busy && !_hsBusy && (hsOn || wired));
             }
 
-            _btnOn.IsEnabled = !_busy && !borrowing;
-            _btnOff.IsEnabled = !_busy && (borrowing || runtimeUp || (proxyOn && proxySrv == borrowServer));
+            // IsEnabled 也是依赖属性，赋同一个值一样会触发 IsEnabledChanged
+            // 并向下传播到整个可视子树（1.0.49 的教训：Visibility 就是这样）。
+            // 这里每秒无条件写一次，是「系统性扫描依赖属性赋值」时漏掉的最后一类。
+            SetEnabled(_btnOn, !_busy && !borrowing);
+            SetEnabled(_btnOff, !_busy && (borrowing || runtimeUp || (proxyOn && proxySrv == borrowServer)));
+        }
+
+        /// <summary>
+        /// 「值变了才写」版的 IsEnabled。
+        ///
+        /// 为什么需要：RefreshUi 挂在 1 秒的 DispatcherTimer 上，里面任何
+        /// 无条件的依赖属性赋值都会被每秒重放一次。IsEnabled 变化会触发
+        /// IsEnabledChanged 路由事件并递归传播到所有子元素 —— 自定义控件
+        /// （比如 ToggleSwitch 里的 Ellipse + Border）还要重算命中测试。
+        /// 1.0.49 已经因为这个原因把 CPU 从 82% 压到 7.2%，但当时只扫了
+        /// Text/Content/Background/Visibility/Foreground 五类，漏了 IsEnabled。
+        /// </summary>
+        static void SetEnabled(System.Windows.UIElement el, bool val)
+        {
+            if (el == null) return;
+            if (el.IsEnabled == val) return;
+            el.IsEnabled = val;
         }
 
         void SetBusy(bool b)
         {
             _busy = b;
-            _btnOn.IsEnabled = !b;
-            _btnOff.IsEnabled = !b;
-            _btnRefresh.IsEnabled = !b;
-            _btnSettings.IsEnabled = !b;
+            // SetBusy 本身不高频（只在开始/结束操作时调），但既然改成了
+            // 统一的「值变了才写」，这几处也一起走 SetEnabled —— 免得下次
+            // 有人把 SetBusy 挪进定时器路径后又踩同一个坑。
+            SetEnabled(_btnOn, !b);
+            SetEnabled(_btnOff, !b);
+            SetEnabled(_btnRefresh, !b);
+            SetEnabled(_btnSettings, !b);
         }
 
         public void Log(string line)

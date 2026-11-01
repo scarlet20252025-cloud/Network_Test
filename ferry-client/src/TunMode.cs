@@ -940,15 +940,27 @@ namespace Ferry
 
         // ── 系统探测 ────────────────────────────────────────────
 
+        // 进程是不是管理员，一辈子都不会变 —— 首次算完就缓存。
+        //
+        // 为什么必须缓存：RefreshUi 每秒调一次 Elevator.IsAdmin()（见
+        // MainWindow 里的 isAdmin），而 WindowsPrincipal.IsInRole 要遍历
+        // 访问令牌的组成员列表，是一次内核查询（实测 1~5ms），
+        // 外加 WindowsIdentity.GetCurrent() 还要分配对象。
+        // 每秒白烧几毫秒，对拖动窗口这种需要 16ms 预算的操作是实打实的浪费。
+        static int _isAdminCache = -1;   // -1 未算，0 否，1 是
+
         public static bool IsAdmin()
         {
+            if (_isAdminCache >= 0) return _isAdminCache == 1;
             try
             {
                 var id = System.Security.Principal.WindowsIdentity.GetCurrent();
                 var pr = new System.Security.Principal.WindowsPrincipal(id);
-                return pr.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+                _isAdminCache = pr.IsInRole(
+                    System.Security.Principal.WindowsBuiltInRole.Administrator) ? 1 : 0;
             }
-            catch (Exception) { return false; }
+            catch (Exception) { _isAdminCache = 0; }
+            return _isAdminCache == 1;
         }
 
         /// <summary>
