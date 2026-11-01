@@ -424,7 +424,18 @@ namespace Ferry
             {
                 IsReadOnly = true,
                 AcceptsReturn = true,
-                TextWrapping = TextWrapping.Wrap,
+                // ⚠ 不能用 Wrap。
+                //
+                // 2026-11-02 用户报「拖动窗口一顿一顿」。网络全部正常，
+                // 问题在这里：TextBox + TextWrapping.Wrap 时，**每次
+                // AppendText 都要从头重排整个文本**（因为换行位置取决于
+                // 控件宽度）。日志跑到几千行之后，每追加一行就是几十毫秒，
+                // 而心跳/刷新会持续追加 → 拖动窗口时不断撞上重排 → 一顿一顿。
+                //
+                // 日志是定宽的机器输出（时间戳 + 固定格式），本来就不需要
+                // 按窗口宽度折行；超长行走横向滚动条即可。
+                TextWrapping = TextWrapping.NoWrap,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 Height = 190,
                 FontFamily = new FontFamily(Palette.FontMono),
@@ -1893,24 +1904,74 @@ namespace Ferry
             }
             var stamp = DateTime.Now.ToString("HH:mm:ss");
             var text = "[" + stamp + "] " + line;
+
+            // 界面上只保留最近若干行。
+            //
+            // 为什么必须截断：TextBox 的 AppendText 是追加到末尾，但 Scrolling
+            // 与布局会随行数增长而变慢；几千行之后每次追加都要几十毫秒。
+            // 而且日志卡本身只显示 190px 高，多的行看不见，纯属拖慢 UI。
+            if (_logLineCount > 800)
+            {
+                _log.Clear();
+                _logLineCount = 0;
+            }
             _log.AppendText(text + Environment.NewLine);
+            _logLineCount++;
             _log.ScrollToEnd();
 
-            try
+            // 磁盘写入绝不能放在 UI 线程上。
+            //
+            // 原来这里是同步的 File.AppendAllText + FileInfo.Length：
+            // 每次日志都做一次写 + 一次 stat。网卡抖动、mihomo 刷警告时
+            // 日志会成串出现，UI 线程就被磁盘 IO 卡住 —— 表现就是拖动窗口一顿一顿。
+            // 更糟的是超过 200 KB 时会 ReadAllLines + WriteAllLines，
+            // 那是整个文件的读写，一次能卡上百毫秒。
+            //
+            // 改成排队 + 后台线程批量写：UI 只做字符串入队（O(1)）。
+            EnqueueLogFileLine(DateTime.Now.ToString("yyyy-MM-dd ") + text);
+        }
+
+        // ── 日志落盘（后台批量）──
+        readonly object _logFileLock = new object();
+        readonly System.Collections.Generic.List<string> _logFileQueue =
+            new System.Collections.Generic.List<string>();
+        bool _logFileWorkerBusy;
+        int _logLineCount;
+
+        void EnqueueLogFileLine(string full)
+        {
+            lock (_logFileLock) { _logFileQueue.Add(full); }
+            if (_logFileWorkerBusy) return;
+            _logFileWorkerBusy = true;
+            ThreadPool.QueueUserWorkItem(delegate { DrainLogFileQueue(); });
+        }
+
+        void DrainLogFileQueue()
+        {
+            while (true)
             {
-                File.AppendAllText(_logPath,
-                    DateTime.Now.ToString("yyyy-MM-dd ") + text + Environment.NewLine,
-                    new UTF8Encoding(false));
-                var fi = new FileInfo(_logPath);
-                if (fi.Length > 204800)
+                string[] batch;
+                lock (_logFileLock)
                 {
-                    var all = File.ReadAllLines(_logPath);
-                    var keep = new string[Math.Min(500, all.Length)];
-                    Array.Copy(all, all.Length - keep.Length, keep, 0, keep.Length);
-                    File.WriteAllLines(_logPath, keep, new UTF8Encoding(false));
+                    if (_logFileQueue.Count == 0) { _logFileWorkerBusy = false; return; }
+                    batch = _logFileQueue.ToArray();
+                    _logFileQueue.Clear();
                 }
+                try
+                {
+                    File.AppendAllText(_logPath, string.Join(Environment.NewLine, batch) + Environment.NewLine,
+                                       new UTF8Encoding(false));
+                    var fi = new FileInfo(_logPath);
+                    if (fi.Length > 204800)
+                    {
+                        var all = File.ReadAllLines(_logPath);
+                        var keep = new string[Math.Min(500, all.Length)];
+                        Array.Copy(all, all.Length - keep.Length, keep, 0, keep.Length);
+                        File.WriteAllLines(_logPath, keep, new UTF8Encoding(false));
+                    }
+                }
+                catch (Exception) { }
             }
-            catch (Exception) { }
         }
 
         string LeftText()

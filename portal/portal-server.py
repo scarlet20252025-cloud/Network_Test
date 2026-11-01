@@ -8393,12 +8393,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                       csrf=csrf_set('admin|' + self.client_ip())), 400)
             return
 
-        # 续期顺手把「停用」也解除 —— 到期被踢下线的账号，
-        # 续了期还是停用状态的话，用户依然连不上，等于白续。
-        self.db.x('UPDATE clients SET expires_at = ?, enabled = 1, last_seen = ? WHERE ip = ?',
+        # ⚠ 只改到期时间，**不碰 enabled**。
+        #
+        # 2026-11-02 修：原来这里写了 `enabled = 1`，等于把「停用」这个独立
+        # 状态给顶掉了 —— 管理员先停用某人（可能因为违规），后来又给他续期，
+        # 人会自己活过来，停用形同虚设。
+        #
+        # 停用和到期是两件不同的事：
+        #   · 到期 = 时间到了，续期就恢复，这是本接口的职责
+        #   · 停用 = 管理员主动下的判断，只有管理员点「启用」才能解除
+        # 续期不该替管理员做后一个决定。
+        self.db.x('UPDATE clients SET expires_at = ?, last_seen = ? WHERE ip = ?',
                   (new_exp, now(), ip))
-        # 同一 token 下的设备也一并恢复，否则「踢下线」过的设备续期后仍然被拒
-        self.db.x("UPDATE devices SET enabled = 1 WHERE token = ?", (cli['token'],))
         self.db.log('client_renew', self.client_ip(),
                     '%s %s -> %s' % (ip, how, fmt_ts(new_exp)))
         left = max(0, new_exp - now())
