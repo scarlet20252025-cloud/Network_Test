@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Text;
 using Microsoft.Win32;
 
@@ -234,6 +237,50 @@ namespace Ferry
         /// <summary>本地代理的直通端口（不分流，一律走隧道）。0 = 没有。</summary>
         int _bypassPort;
 
+        /// <summary>
+        /// 取当前物理网卡正在用的 DNS 服务器。
+        ///
+        /// 为什么必须动态取、不能只硬编码 223.5.5.5：
+        /// 校园网的内网 DNS（实测是 10.10.1.60 / 10.10.1.61）在「按账号禁网」
+        /// 期间**仍然可用**（禁网挡的是出口，不挡内网解析），而 223.5.5.5
+        /// 这类公网 DNS 在禁网时就出不去。mihomo 用它自己的 nameserver 解析
+        /// 所有域名，配成公网 DNS 就等于「每个域名都解析失败」。
+        ///
+        /// 排除 FerryTun 自身和 TAP/Tunnel 类网卡，避免把上游的 fake-ip
+        /// 解析器（198.18.x.x）当成 DNS 服务器。
+        /// 取不到就返回空列表，调用方退回硬编码的公网 DNS。
+        /// </summary>
+        static List<string> SystemDnsServers()
+        {
+            var list = new List<string>();
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    var name = (ni.Name ?? "") + " " + (ni.Description ?? "");
+                    if (name.IndexOf("FerryTun", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                    if (name.IndexOf("Tunnel", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                    if (name.IndexOf("TAP-", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                    IPAddressCollection dns;
+                    try { dns = ni.GetIPProperties().DnsAddresses; }
+                    catch { continue; }
+                    foreach (var d in dns)
+                    {
+                        if (d.AddressFamily != AddressFamily.InterNetwork) continue;
+                        if (IPAddress.IsLoopback(d)) continue;
+                        var s = d.ToString();
+                        // fake-ip 段不是真 DNS，排除掉
+                        if (s.StartsWith("198.18.") || s.StartsWith("198.19.")) continue;
+                        if (!list.Contains(s)) list.Add(s);
+                    }
+                }
+            }
+            catch { }
+            return list;
+        }
+
         /// <param name="udpHost">上游 UDP 中继地址（仅用于日志/诊断，不写进配置）。
         /// UDP 现在统一走本地代理的 ASSOCIATE，见 ferry-udp 那段注释。</param>
         /// <param name="udpPort">同上。</param>
@@ -320,6 +367,25 @@ namespace Ferry
             sb.AppendLine("    - 192.168.0.0/16");
             // 100.64/10 是运营商级 NAT 段，UU 远控/P2P 工具常用，同样不能吞
             sb.AppendLine("    - 100.64.0.0/10");
+            // mihomo 自己的 DNS 服务器也必须排除出 TUN —— 否则它会死循环：
+            // 要解析域名 → 向 223.5.5.5:53 发 UDP → 这个包按系统路由又回到
+            // 自己的 TUN → gvisor 接住却发不出去 → 5 秒超时 → 重试 → 再超时。
+            //
+            // 2026-11-01 用户日志里的样子（每 5 秒一条，正好就是「隔几秒卡一下」）：
+            //   [UDP] Resolve Ip error: can't resolve ip: all DNS requests failed,
+            //         first error: read udp 10.141.59.235:64724->223.5.5.5:53: i/o timeout
+            sb.AppendLine("    - 223.5.5.5");
+            sb.AppendLine("    - 119.29.29.29");
+            // 114 也在 Proxy.cs 的 CnDns 里用作兜底
+            sb.AppendLine("    - 114.114.114.114");
+            // 系统实际在用的 DNS 也要排除（内网 DNS 通常在 10.x，
+            // 已被上面的私有段覆盖；但换网络后可能是别的地址）。
+            var sysDns = SystemDnsServers();
+            foreach (var d in sysDns)
+            {
+                if (d == "223.5.5.5" || d == "119.29.29.29" || d == "114.114.114.114") continue;
+                sb.AppendLine("    - " + d);
+            }
             sb.AppendLine();
             // TUN 截了 53 端口，系统 DNS 的响应回不来，必须让 mihomo 自己解析
             sb.AppendLine("dns:");
@@ -335,9 +401,21 @@ namespace Ferry
             // FerryTun 网卡就不会一直显示「无法访问 Internet」。
             // （详见 MuteNcsiProbing 调用处被替换成 RestoreNcsiProbing 的注释。）
             sb.AppendLine("  nameserver:");
+            // 优先用系统（内网）DNS：禁网时公网 DNS 出不去，内网 DNS 照样能用。
+            // 实测（2026-11-01）：校园网 DNS 是 10.10.1.60 / 10.10.1.61，
+            // 而硬编码的 223.5.5.5 在借网路径上解析会 5 秒超时。
+            var _dnsForMihomo = SystemDnsServers();
+            if (_dnsForMihomo.Count > 0)
+            {
+                foreach (var d in _dnsForMihomo) sb.AppendLine("    - " + d);
+            }
             sb.AppendLine("    - 223.5.5.5");
             sb.AppendLine("    - 119.29.29.29");
             sb.AppendLine("  proxy-server-nameserver:");
+            if (_dnsForMihomo.Count > 0)
+            {
+                foreach (var d in _dnsForMihomo) sb.AppendLine("    - " + d);
+            }
             sb.AppendLine("    - 223.5.5.5");
             sb.AppendLine("    - 119.29.29.29");
             sb.AppendLine();

@@ -803,11 +803,19 @@ namespace Ferry
                         else if (!_lic.Ok) Log("授权校验失败：" + _lic.Error + "（按本地时间判断）");
                     }
 
-                    // 到期/停用就掐掉借网并清空令牌 —— 强制回到「未激活」。
-                    // 只断网却留着令牌的话，界面还显示"已激活"，用户会反复点
-                    // 开始借网然后失败（WinForms 版踩过）。
-                    var borrowingNow = (_rt != null && _rt.Running);
-                    if (_cfg.Activated && !_lic.Enabled && borrowingNow)
+                    // 到期/停用就掐掉借网、恢复直连、清空令牌。
+                    //
+                    // ⚠ 这里**不能**加 `&& borrowingNow`（原来就有，2026-11-01 修掉）：
+                    // 用户只是开着程序挂着、没点「开始借网」时，系统代理也可能
+                    // 已经被上一次会话留在 127.0.0.1:10801 上（进程却已经停了）。
+                    // 那时浏览器把请求交给一个没人监听的端口 → 连门户都打不开
+                    // → 用户连「去哪要新密钥」都看不到，形成死锁。
+                    // 用户截图实证：系统代理「开 127.0.0.1:10801」/ 本地代理「未运行」
+                    // / 授权「已到期」，三行同时出现在一张卡上。
+                    //
+                    // 清掉令牌还有一个作用：RefreshUi 走「未激活」分支，
+                    // 输入框自然出现，用户可以直接填新密钥续期。
+                    if (_cfg.Activated && !_lic.Enabled)
                     {
                         Log("授权失效，正在恢复直连…");
                         try
@@ -819,7 +827,9 @@ namespace Ferry
                         catch (Exception) { }
                         _cfg.Token = "";
                         try { _cfg.Save(_cfgPath); } catch (Exception) { }
-                        Log("授权已失效，请重新输入密钥激活");
+                        Log(_lic.Expired
+                            ? "授权已到期 —— 在输入框里填新密钥即可续期"
+                            : "授权已失效 —— 在输入框里填新密钥即可恢复");
                     }
 
                     RefreshUi();
@@ -889,9 +899,20 @@ namespace Ferry
             }
             if (!_lic.Enabled && _lic.Ok)
             {
+                // 别只说「去找管理员」—— 用户手里可能已经有新密钥了。
+                // 把输入框露出来并聚焦，让他当场就能续上。
                 MessageBox.Show(this,
-                    _lic.Expired ? "授权已到期，请向管理员续期。" : "账号已停用，请联系管理员。",
+                    _lic.Expired
+                        ? "授权已到期。\n\n在下面「输入密钥」框里填入新密钥，点「激活」即可直接续期继续用。"
+                        : "账号已停用，请联系管理员。",
                     "渡口", MessageBoxButton.OK, MessageBoxImage.Warning);
+                if (_lic.Expired)
+                {
+                    SetVis(_txtCode, Visibility.Visible);
+                    SetVis(_btnActivate, Visibility.Visible);
+                    SetText(_lblActTitle, "密钥已到期");
+                    _txtCode.Focus();
+                }
                 return;
             }
 
@@ -1568,14 +1589,33 @@ namespace Ferry
             }
 
             // 激活区
+            //
+            // 这里有两件必须分开的事：**「有没有令牌」** 和 **「令牌还能不能用」**。
+            // 早先只用 _cfg.Activated（= 令牌非空）当判据，于是出现死锁：
+            // 授权到期了、界面红字写着「请向管理员续期」，可输入框和激活按钮
+            // 是 Collapsed —— 用户手里就算有管理员给的新密钥，也**没有地方输入**。
+            // 2026-11-01 用户截图实证：卡片上同时出现「已激活」（绿）
+            // 和「授权已到期」（红），而输入框根本不在。
+            //
+            // 现在的规则：只要授权不可用（过期 / 停用 / 校验失败），
+            // 就把输入框放出来，让用户能直接填新密钥续上 ——
+            // 续期本来就是「输一个新的 8 位密钥」这么简单的事，
+            // 不该要求用户先卸载、先清配置、或者去找管理员手工改库。
+            bool canRenew = _cfg.Activated && !_lic.Enabled;
             if (_cfg.Activated)
             {
-                SetText(_lblActTitle, "已激活");
-                SetFg(_lblActTitle, Palette.GoodB);
-                SetVis(_txtCode, Visibility.Collapsed);
-                SetVis(_btnActivate, Visibility.Collapsed);
-                if (_lic.Expired) { SetText(_lblActHint, "授权已到期 —— 请向管理员续期"); SetFg(_lblActHint, Palette.BadB); }
-                else if (_lic.Suspended) { SetText(_lblActHint, "账号已停用 —— 请联系管理员"); SetFg(_lblActHint, Palette.BadB); }
+                SetText(_lblActTitle, canRenew ? "密钥已到期" : "已激活");
+                SetFg(_lblActTitle, canRenew ? Palette.BadB : Palette.GoodB);
+                SetVis(_txtCode, canRenew ? Visibility.Visible : Visibility.Collapsed);
+                SetVis(_btnActivate, canRenew ? Visibility.Visible : Visibility.Collapsed);
+                if (canRenew)
+                {
+                    // 换一个说法：不是「去找管理员」，而是「输入新密钥就能继续用」
+                    SetText(_lblActHint, _lic.Expired
+                        ? "授权已到期 —— 在上面的框里输入新密钥，直接续期继续用"
+                        : "授权不可用 —— 在上面的框里输入新密钥，直接续期继续用");
+                    SetFg(_lblActHint, Palette.BadB);
+                }
                 else if (_lic.ExpiresAt > 0)
                 {
                     SetText(_lblActHint, "账号 " + _cfg.AccountIp + " · " + LeftText() + " · " +
