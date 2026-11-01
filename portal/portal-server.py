@@ -8382,6 +8382,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # 已过期（或没设过）就从现在起算；还没过期就往后叠加
             base = cur if cur > now() else now()
             new_exp = base + days * 86400
+            # 负数是「缩短授权」用的（比如给错人了想收回），
+            # 但别把它扣成过期 —— 管理员要的是缩短，不是把人踢下线。
+            # 真要停用请用「停用」按钮，那是明确语义。
+            if new_exp <= now():
+                new_exp = now() + 3600
             how = ('+' if days > 0 else '') + str(days) + ' 天'
         else:
             self.send_html(admin_page(self.db, err='要填天数或到期日期',
