@@ -299,6 +299,27 @@ namespace Ferry
             sb.AppendLine("  route-exclude-address:");
             sb.AppendLine("    - 127.0.0.0/8");
             sb.AppendLine("    - 169.254.0.0/16");
+            // ⚠ 私有网段必须在这里排除，**不能**只靠 clash 规则里的
+            //   `IP-CIDR,10.0.0.0/8,DIRECT` —— 那是两个层次：
+            //   · route-exclude-address：这条流量**要不要进 TUN**（Windows 路由层）
+            //   · clash 规则 DIRECT：进了 TUN 之后**怎么出去**（用户态转发）
+            //
+            // 2026-11-01 实测到的后果（auto-route 生成的是一堆大块路由，
+            // 实测 FerryTun 上挂着 0.0.0.0/2、64.0.0.0/3、128.0.0.0/3、
+            // 172.0.0.0/6、192.0.0.0/2 …，其中 0.0.0.0/2 直接盖住 10/8）：
+            //   · 到内网主机（10.113.66.6）的 SSH/RDP 表现为
+            //     「TCP 能握手、应用层永远没响应」—— gvisor 接下了连接，
+            //     但 SYN 以 TUN 的源地址发出去，回包回不来；
+            //   · 测试机 xt 一开渡口，UU 远控立刻失联，整台机器像断网；
+            //   · 局域网打印机/共享/NAS 全部绕一圈用户态栈，表现为「一顿一顿」。
+            //
+            // 排除私有段不影响借网：pcs(10.13.24.1) 本来就是直连目标
+            // （SOCKS5 服务器地址，mihomo 自己也会排除），出公网走的仍是隧道。
+            sb.AppendLine("    - 10.0.0.0/8");
+            sb.AppendLine("    - 172.16.0.0/12");
+            sb.AppendLine("    - 192.168.0.0/16");
+            // 100.64/10 是运营商级 NAT 段，UU 远控/P2P 工具常用，同样不能吞
+            sb.AppendLine("    - 100.64.0.0/10");
             sb.AppendLine();
             // TUN 截了 53 端口，系统 DNS 的响应回不来，必须让 mihomo 自己解析
             sb.AppendLine("dns:");
