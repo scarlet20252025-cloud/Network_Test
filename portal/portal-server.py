@@ -5028,6 +5028,9 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf='',
   <td class="mono muted" title="{did}">{html.escape((r['device_id'] or '')[:12])}…</td>
   <td class="muted">{fmt_ts(r['last_seen'])}</td>
   <td class="muted">{fmt_ts(r['acc_exp'])}</td>
+  <td>{('永久' if int(r['acc_exp'] or 0) <= 0
+        else ('<span class="bad">已过期</span>' if int(r['acc_exp']) <= now()
+              else '<span class="ok">剩 %d 天</span>' % int((int(r['acc_exp']) - now()) // 86400)))}</td>
   <td>{'<span class="ok">启用</span>' if r['enabled'] else '<span class="bad">已停用</span>'}</td>
   <td class="nowrap">
     <form method="post" action="/admin/device" style="display:inline">{csrf_in}<input type="hidden" name="device_id" value="{did}"><input type="hidden" name="op" value="toggle"><button class="sm ghost" type="submit">{'踢下线' if r['enabled'] else '恢复'}</button></form>
@@ -5035,9 +5038,31 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf='',
   </td>
 </tr>"""
         if not dev_html:
-            dev_html = '<tr><td colspan="10" class="muted">还没有设备登记（老客户端不上报设备标识）</td></tr>'
+            dev_html = '<tr><td colspan="11" class="muted">还没有设备登记（老客户端不上报设备标识）</td></tr>'
 
-        cli_rows = ''.join(f"""<tr data-ip="{html.escape(r['ip'])}" data-rank="{1000000 - i}">
+        cli_rows = ''
+        for i, r in enumerate(cli):
+            _st = license_state_of(r)
+            # 授权状态：三种颜色分开，别让人再去算天数
+            if _st['suspended']:
+                _lic_html = '<span class="bad">已停用</span>'
+            elif _st['expired']:
+                _lic_html = '<span class="bad">已过期</span>'
+            elif _st['expiresAt'] <= 0:
+                _lic_html = '<span class="ok">永久</span>'
+            elif _st['daysLeft'] <= 3:
+                _lic_html = '<span class="warn">剩 %d 天</span>' % _st['daysLeft']
+            else:
+                _lic_html = '<span class="ok">剩 %d 天</span>' % _st['daysLeft']
+            _exp_txt = fmt_ts(_st['expiresAt']) if _st['expiresAt'] > 0 else '永久'
+            # 续期按钮：把 IP 带进表单，弹一个小面板填天数
+            _renew_btn = (
+                '<button type="button" class="sm ghost renewbtn" '
+                'data-ip="%s" data-exp="%s">续期</button>'
+                % (html.escape(r['ip']),
+                   _st['expiresAt'])
+            )
+            cli_rows += f"""<tr data-ip="{html.escape(r['ip'])}" data-rank="{1000000 - i}">
   <td class="st"><span class="dot off"></span><span class="stx">离线</span></td>
   <td class="mono ipcell off" data-ip="{html.escape(r['ip'])}" title="点击查看详情">{html.escape(r['ip'])}</td>
   <td class="notecell" data-ip="{html.escape(r['ip'])}" data-note="{html.escape(r['note'] or '')}">
@@ -5054,12 +5079,14 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf='',
   <td class="num tx"><span class="arw up">&#8593;</span>—</td>
   <td class="num cs">—</td>
   <td class="modecell">—</td>
-  <td>{'<span class="ok">启用</span>' if r['enabled'] else '<span class="bad">停用</span>'}</td>
+  <td>{_lic_html}</td>
+  <td class="muted nowrap">{_exp_txt}</td>
   <td class="muted">{fmt_ts(r['last_seen']) or '从未'}</td>
   <td class="nowrap">
-    <form method="post" action="/admin/toggle" style="display:inline">{csrf_in}<input type="hidden" name="ip" value="{html.escape(r['ip'])}"><button class="sm ghost" type="submit">{'停用' if r['enabled'] else '启用'}</button></form>
+    {_renew_btn}
+    <form method="post" action="/admin/toggle" style="display:inline;margin-left:4px">{csrf_in}<input type="hidden" name="ip" value="{html.escape(r['ip'])}"><button class="sm ghost" type="submit">{'停用' if r['enabled'] else '启用'}</button></form>
   </td>
-</tr>""" for i, r in enumerate(cli))
+</tr>"""
         body = msgbox + f"""
 <div class="card">
   <h2 style="margin-top:0">已登记的设备</h2>
@@ -5073,7 +5100,7 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf='',
   <table id="deviceTable">
     <thead><tr>
       <th>状态</th><th>机型</th><th>平台</th><th>版本</th>
-      <th>最近 IP</th><th>设备标识</th><th>最后活动</th><th>账号到期</th>
+      <th>最近 IP</th><th>设备标识</th><th>最后活动</th><th>账号到期</th><th>授权剩余</th>
       <th>授权</th><th>操作</th>
     </tr></thead>
     <tbody>{dev_html}</tbody>
@@ -5097,13 +5124,75 @@ def admin_page(db, msg='', err='', new_code=None, new_hours=12, csrf='',
       <th class="numh"><span class="arw up">&#8593;</span>上行</th>
       <th class="numh">连接</th>
       <th>模式</th>
-      <th>授权</th><th>最后活动</th><th>操作</th>
+      <th>授权</th><th>到期时间</th><th>最后活动</th><th>操作</th>
     </tr></thead>
     <tbody>{cli_rows}</tbody>
   </table>
   </div>
 </div>
-""" + ADMIN_UI_HTML
+
+<!-- 续期面板：默认隐藏，点「续期」才展开。
+     为什么不直接放进表格行内：表格已经十列了，再塞输入框会挤成一团；
+     而且「+30 天」这类常用操作做成按钮比让人手算日期快得多。 -->
+<div id="renewMask" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:60"></div>
+<div id="renewBox" style="display:none;position:fixed;left:50%;top:24%;transform:translateX(-50%);
+     width:340px;background:var(--card,#fff);border-radius:12px;padding:18px 20px;z-index:61;
+     box-shadow:0 12px 40px rgba(0,0,0,.22)">
+  <div style="font-weight:600;font-size:15px;margin-bottom:2px">手动续期</div>
+  <div class="hint" style="margin:0 0 12px" id="renewIp">—</div>
+  <form method="post" action="/admin/renew" id="renewForm">
+    {csrf_in}
+    <input type="hidden" name="ip" id="renewIpIn" value="">
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+      <button type="button" class="sm ghost qd" data-d="7">+7 天</button>
+      <button type="button" class="sm ghost qd" data-d="30">+30 天</button>
+      <button type="button" class="sm ghost qd" data-d="90">+90 天</button>
+      <button type="button" class="sm ghost qd" data-d="365">+1 年</button>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+      <label class="muted" style="font-size:12.5px">天数</label>
+      <input type="number" name="days" id="renewDays" value="30" min="-3650" max="36500"
+             style="width:90px;padding:6px 8px;border:1px solid var(--line,#d8dbe0);border-radius:7px">
+      <span class="muted" style="font-size:12px">已过期则从现在起算</span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px">
+      <label class="muted" style="font-size:12.5px">或到</label>
+      <input type="date" name="until" id="renewUntil"
+             style="flex:1;padding:6px 8px;border:1px solid var(--line,#d8dbe0);border-radius:7px">
+      <span class="muted" style="font-size:12px">留空则按天数</span>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button type="button" class="sm ghost" id="renewCancel">取消</button>
+      <button type="submit" class="sm">确认续期</button>
+    </div>
+  </form>
+</div>
+<script>
+(function () {{
+  var mask = document.getElementById('renewMask');
+  var box  = document.getElementById('renewBox');
+  if (!mask || !box) return;
+  function open(ip, expTxt) {{
+    document.getElementById('renewIpIn').value = ip;
+    document.getElementById('renewIp').textContent = '账号 ' + ip;
+    document.getElementById('renewDays').value = 30;
+    document.getElementById('renewUntil').value = '';
+    mask.style.display = 'block';
+    box.style.display = 'block';
+  }}
+  function close() {{ mask.style.display = 'none'; box.style.display = 'none'; }}
+  document.addEventListener('click', function (e) {{
+    var b = e.target.closest ? e.target.closest('.renewbtn') : null;
+    if (b) {{ e.preventDefault(); open(b.getAttribute('data-ip'), b.getAttribute('data-exp')); return; }}
+    if (e.target.classList && e.target.classList.contains('qd')) {{
+      document.getElementById('renewDays').value = e.target.getAttribute('data-d');
+      document.getElementById('renewUntil').value = '';
+      return;
+    }}
+    if (e.target.id === 'renewCancel' || e.target === mask) close();
+  }});
+}})();
+</script>""" + ADMIN_UI_HTML
         return admin_shell('users', '设备', '已登录机器、实时速率与备注', body)
 
     # ══════════ 事件 ══════════
@@ -6526,6 +6615,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.handle_admin_revoke(form)
             elif path == '/admin/toggle':
                 self.handle_admin_toggle(form)
+            elif path == '/admin/renew':
+                # 手动续期（2026-11-02）：给天数或给到期日，两者都能用
+                self.handle_admin_renew(form)
             elif path == '/admin/setnote':
                 self.handle_admin_setnote(form)
             elif path == '/admin/device':
@@ -8245,6 +8337,72 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.db.x('UPDATE clients SET enabled = ? WHERE ip = ?', (newval, ip))
         self.db.log('client_toggle', self.client_ip(), f'{ip} -> {newval}')
         self.send_html(admin_page(self.db, msg=f'{ip} 已{"启用" if newval else "停用"}', csrf=csrf_set('admin|' + self.client_ip())))
+
+    def handle_admin_renew(self, form):
+        """管理员手动给某个账号续期（2026-11-02 新增）。
+
+        为什么需要它：密钥是一次性的，用户到期后拿不到新密钥就彻底用不了；
+        而管理员手上往往没有「立刻生成一个能给他」的余地（或者不想泄露新密钥）。
+        直接在后台续期是最小动作 —— 用户什么都不用做，下次心跳自然恢复。
+
+        两种续期方式：
+          · 给天数（days）—— 在**当前到期时间**上加，已过期就从现在算
+          · 给绝对日期（until）—— 直接设成那一天
+        为什么「已过期从现在算」：否则一个过期半年的账号续 30 天
+        仍然是过期的，管理员会觉得「点了没用」。
+        """
+        if not self._require_admin():
+            return
+        ip = (form.get('ip') or '').strip()
+        cli = self.db.q1('SELECT * FROM clients WHERE ip = ?', (ip,))
+        if not cli:
+            self.send_html(admin_page(self.db, err='找不到这个账号：' + ip,
+                                      csrf=csrf_set('admin|' + self.client_ip())), 404)
+            return
+
+        cur = int(cli['expires_at'] or 0)
+        days = 0
+        try:
+            days = int(form.get('days') or 0)
+        except (TypeError, ValueError):
+            days = 0
+        until = (form.get('until') or '').strip()
+
+        if until:
+            # yyyy-mm-dd → 当天 23:59:59，别让「到期日当天还能不能用」变成玄学
+            try:
+                d = datetime.strptime(until, '%Y-%m-%d')
+                new_exp = int(d.replace(hour=23, minute=59, second=59).timestamp())
+            except ValueError:
+                self.send_html(admin_page(self.db, err='日期格式不对，要 yyyy-mm-dd',
+                                          csrf=csrf_set('admin|' + self.client_ip())), 400)
+                return
+            how = '到 ' + until
+        elif days != 0:
+            # 已过期（或没设过）就从现在起算；还没过期就往后叠加
+            base = cur if cur > now() else now()
+            new_exp = base + days * 86400
+            how = ('+' if days > 0 else '') + str(days) + ' 天'
+        else:
+            self.send_html(admin_page(self.db, err='要填天数或到期日期',
+                                      csrf=csrf_set('admin|' + self.client_ip())), 400)
+            return
+
+        # 续期顺手把「停用」也解除 —— 到期被踢下线的账号，
+        # 续了期还是停用状态的话，用户依然连不上，等于白续。
+        self.db.x('UPDATE clients SET expires_at = ?, enabled = 1, last_seen = ? WHERE ip = ?',
+                  (new_exp, now(), ip))
+        # 同一 token 下的设备也一并恢复，否则「踢下线」过的设备续期后仍然被拒
+        self.db.x("UPDATE devices SET enabled = 1 WHERE token = ?", (cli['token'],))
+        self.db.log('client_renew', self.client_ip(),
+                    '%s %s -> %s' % (ip, how, fmt_ts(new_exp)))
+        left = max(0, new_exp - now())
+        self.send_html(admin_page(
+            self.db,
+            msg='%s 已续期 %s（到期 %s，剩 %d 天）' % (
+                ip, how, fmt_ts(new_exp), int(left // 86400)),
+            csrf=csrf_set('admin|' + self.client_ip())))
+
 
     def handle_about(self):
         """关于页：讲清楚它是什么、怎么工作、边界在哪。

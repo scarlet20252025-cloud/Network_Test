@@ -374,17 +374,21 @@ namespace Ferry
             // 2026-11-01 用户日志里的样子（每 5 秒一条，正好就是「隔几秒卡一下」）：
             //   [UDP] Resolve Ip error: can't resolve ip: all DNS requests failed,
             //         first error: read udp 10.141.59.235:64724->223.5.5.5:53: i/o timeout
-            sb.AppendLine("    - 223.5.5.5");
-            sb.AppendLine("    - 119.29.29.29");
+            // ⚠ 这里必须是 **CIDR**（带 /32），不能写裸 IP。
+            // 2026-11-01 栽过一次：写成 `- 223.5.5.5`，mihomo 报
+            //   Parse config error: netip.ParsePrefix("223.5.5.5"): no '/'
+            // 然后 exit 1，TUN 直接起不来 —— 用户装完 1.0.53 当场不能用。
+            sb.AppendLine("    - 223.5.5.5/32");
+            sb.AppendLine("    - 119.29.29.29/32");
             // 114 也在 Proxy.cs 的 CnDns 里用作兜底
-            sb.AppendLine("    - 114.114.114.114");
+            sb.AppendLine("    - 114.114.114.114/32");
             // 系统实际在用的 DNS 也要排除（内网 DNS 通常在 10.x，
             // 已被上面的私有段覆盖；但换网络后可能是别的地址）。
             var sysDns = SystemDnsServers();
             foreach (var d in sysDns)
             {
                 if (d == "223.5.5.5" || d == "119.29.29.29" || d == "114.114.114.114") continue;
-                sb.AppendLine("    - " + d);
+                sb.AppendLine("    - " + d + "/32");
             }
             sb.AppendLine();
             // TUN 截了 53 端口，系统 DNS 的响应回不来，必须让 mihomo 自己解析
