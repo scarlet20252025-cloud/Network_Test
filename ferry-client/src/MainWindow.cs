@@ -857,7 +857,14 @@ namespace Ferry
                         Log("授权失效，正在恢复直连…");
                         try
                         {
-                            FerryCore.RestoreDirect(_cfg, _appDir);
+                            // 只还原我们写过的那次。TUN 模式下 _weSetProxy 是 false，
+                            // 系统代理归用户的 Clash 管，这里绝不能碰
+                            // （否则「授权一到期」就把 Clash 顶掉，比到期本身更糟）。
+                            if (_weSetProxy)
+                            {
+                                FerryCore.RestoreDirect(_cfg, _appDir);
+                                _weSetProxy = false;
+                            }
                             if (_rt != null) { _rt.Stop(); _rt = null; }
                             FerryCore.StopAll(_cfg, _appDir);
                         }
@@ -984,13 +991,30 @@ namespace Ferry
                     _rt = rt;
                     if (!_nodeMode)
                     {
-                        try
+                        if (rt.TunRunning)
                         {
-                            FerryCore.BackupProxyOnce(_cfg, _appDir);
-                            FerryCore.SetProxy(true, rt.BorrowServer);
-                            _weSetProxy = true;
+                            // TUN 起来了 → **不抢系统代理**。
+                            //
+                            // 2026-11-02：这是「渡口全局和 Clash 无法共存」的另一半。
+                            // TUN 已经接管全部流量，系统代理是多余的；一旦写进去，
+                            // 用户常开的 Clash 就再也收不到请求（它只监听 7897，
+                            // 而系统代理被我们改成了 10801）→「开全局 Clash 就废了」。
+                            //
+                            // 留原样还有个好处：认代理的程序照常走 Clash（它有规则、
+                            // 有订阅、有测速），不认代理的程序（游戏、DSH）走 TUN，
+                            // 两条路各司其职。停止借网时也不用还原别人的设置。
+                            Log("全局模式已接管全部流量 —— 系统代理保持原样，留给其它代理软件");
                         }
-                        catch (Exception) { }
+                        else
+                        {
+                            try
+                            {
+                                FerryCore.BackupProxyOnce(_cfg, _appDir);
+                                FerryCore.SetProxy(true, rt.BorrowServer);
+                                _weSetProxy = true;
+                            }
+                            catch (Exception) { }
+                        }
                     }
                     exitIp = rt.ExitIpViaProxy(6000);
                 }
@@ -1011,6 +1035,11 @@ namespace Ferry
                         if (_nodeMode)
                             Log("未接管系统代理；本地端口 SOCKS " + _rt.SocksPort +
                                 " / HTTP " + _rt.HttpPort);
+                        else if (_rt.TunRunning)
+                            // TUN 模式下我们**故意不碰系统代理**（留给了 Clash 等），
+                            // 原来这里还打印「系统代理已切到 xxx」，是句假话 ——
+                            // 排查共存问题时会把人也带偏（2026-11-02 实测踩到）。
+                            Log("TUN 已接管全部流量；系统代理保持原样（未改动）");
                         else
                             Log("系统代理已切到 " + _rt.BorrowServer);
                         if (_rt.TunRunning)
@@ -1123,7 +1152,17 @@ namespace Ferry
             {
                 if (_rt != null)
                 {
-                    FerryCore.RestoreDirect(_cfg, _appDir);
+                    // 只有「我们自己写过系统代理」才还原。
+                    //
+                    // 2026-11-02：TUN 模式下 _weSetProxy 恒为 false（我们故意
+                    // 不碰系统代理，留给了用户的 Clash）。原来这里无条件调
+                    // RestoreDirect，会把一份可能是上次借网留下的**陈旧备份**
+                    // 写回注册表 —— 用户正开着的 Clash 就被顶掉了。
+                    if (_weSetProxy)
+                    {
+                        FerryCore.RestoreDirect(_cfg, _appDir);
+                        _weSetProxy = false;
+                    }
                     _rt.Stop();
                     _rt = null;
                 }
@@ -1158,7 +1197,14 @@ namespace Ferry
 
             try
             {
-                FerryCore.RestoreDirect(_cfg, _appDir);
+                // 同 ElevateNow：只有我们自己写过系统代理才还原。
+                // TUN 模式下 _weSetProxy 恒为 false，系统代理归 Clash 管，
+                // 卸载不该去动它（否则用户卸载渡口后 Clash 也被顶掉）。
+                if (_weSetProxy)
+                {
+                    FerryCore.RestoreDirect(_cfg, _appDir);
+                    _weSetProxy = false;
+                }
                 if (_rt != null) { _rt.Stop(); _rt = null; }
                 FerryCore.StopAll(_cfg, _appDir);
             }
@@ -1304,6 +1350,18 @@ namespace Ferry
             try
             {
                 if (_rt == null || !_rt.Running) return;
+                // TUN 在跑时**绝不碰系统代理**。
+                //
+                // 2026-11-02 用户报「渡口全局和 Clash 无法共存」，根因就在这里：
+                // TUN 已经把全部流量接管了，系统代理那个位置对我们完全多余；
+                // 但只要我们去写它，用户自己的 Clash 就收不到任何流量 ——
+                // 「一开全局，Clash 就哑了」。
+                //
+                // 正确分工：TUN 管「不认代理的程序」，系统代理位置留给 Clash 管
+                // 「认代理的程序」。Clash 自己的出站由 TUN 里的
+                // PROCESS-NAME,clash-verge → clash-egress 放行（实测能匹配上，
+                // 见 CHANGELOG 1.0.37 的日志）。两层各管各的，不打架。
+                if (_rt.TunRunning) return;
                 if (!FerryCore.ProxyEnabled()) return;
                 var want = _rt.BorrowServer;
                 var cur = FerryCore.ProxyServer();
@@ -1444,7 +1502,15 @@ namespace Ferry
                     UpdateLog("还原代理并退出，稍后由延迟启动器拉起新版本");
                     try
                     {
-                        if (_rt != null) { FerryCore.RestoreDirect(_cfg, _appDir); _rt.Stop(); _rt = null; }
+                        // 同其它路径：只有我们写过系统代理才还原。
+                        // TUN 模式下系统代理是 Clash 的，更新程序不该顺手把它改掉 ——
+                        // 用户更新完发现 Clash 哑了，会以为是新版本弄坏的。
+                        if (_weSetProxy)
+                        {
+                            FerryCore.RestoreDirect(_cfg, _appDir);
+                            _weSetProxy = false;
+                        }
+                        if (_rt != null) { _rt.Stop(); _rt = null; }
                     }
                     catch (Exception) { }
 
@@ -1608,17 +1674,26 @@ namespace Ferry
             int httpPort = rt != null ? rt.HttpPort : _cfg.HttpPort;
             int socksPort = rt != null ? rt.SocksPort : _cfg.SocksPort;
             bool bridgeUp = runtimeUp && rt.ProxyAlive;
+            // tunLive 必须在这里算：下面判「借网中」要用到。
+            bool tunLive = rt != null && rt.TunRunning;
 
             string borrowServer = "http://127.0.0.1:" + httpPort;
+            // TUN 在跑时，「借网中」不能再靠系统代理判断。
+            //
+            // 2026-11-02 改：TUN 模式下我们**故意不碰系统代理**（留给了用户的
+            // Clash，见 GuardSystemProxy 的注释）。于是 proxySrv 永远是 Clash 的
+            // 7897、永远不等于 borrowServer —— 原来这条判据会把「正在借网」
+            // 显示成「直连」，用户以为没连上。
+            // TUN 只要在跑就说明流量确实走渡口，直接用 runtime 状态判断。
             bool borrowing = _nodeMode ? (runtimeUp && bridgeUp)
-                                       : (proxyOn && proxySrv == borrowServer && bridgeUp);
+                           : tunLive ? (runtimeUp && bridgeUp)
+                                     : (proxyOn && proxySrv == borrowServer && bridgeUp);
 
             // 纠正「代理指错地方」只在**我们自己是接管模式**时做。
             // 节点模式下那个位置属于用户的 Clash，我们一律不碰。
             // TUN 在跑时不做纠正：TUN 抢的是默认路由，系统代理指向谁都不影响
             // 流量走哪条路。这时还去改它，只会在用户开 Clash 后把状态搅乱
             // （改 3 次 → 转 nodeMode → 界面说「未接管」，可 TUN 明明在跑）。
-            bool tunLive = rt != null && rt.TunRunning;
             if (!_nodeMode && !tunLive && _weSetProxy && runtimeUp && proxyOn && bridgeUp &&
                 proxySrv != borrowServer && proxySrv.StartsWith("http://127.0.0.1:"))
             {

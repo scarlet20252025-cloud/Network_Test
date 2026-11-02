@@ -481,7 +481,16 @@ namespace Ferry
                 sb.AppendLine("    type: fallback");
                 sb.AppendLine("    proxies: [DIRECT, ferry-clash]");
                 sb.AppendLine("    url: 'http://connect.rom.miui.com/generate_204'");
-                sb.AppendLine("    interval: 30");
+                // 30 → 10 秒（2026-11-02）。
+                //
+                // 断网那一刻 DIRECT 已经不通，但 fallback 要等下一轮健康检查
+                // 才会切到 ferry-clash —— 这中间的空白期里，用户的 Clash
+                // 还在往直连上撞，表现为「刚断网那半分钟，翻墙完全不通」。
+                // 10 秒把最坏等待压到 10 秒内，代价是每分钟多 3 次轻量
+                // HEAD 请求（generate_204 无正文，可忽略）。
+                // 和下面 ferry-udp-group 的 interval 保持一致，两个 fallback
+                // 用同一个判据、同一个节奏，行为更好预测。
+                sb.AppendLine("    interval: 10");
                 sb.AppendLine("    timeout: 3000");
             }
             sb.AppendLine("  - name: ferry");
