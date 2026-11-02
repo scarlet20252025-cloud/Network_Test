@@ -584,7 +584,33 @@ namespace Ferry
             else { Log("尚未激活 —— 在「输入密钥激活」框里填入管理员给的密钥"); _txtCode.Focus(); }
 
             _fast = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-            _fast.Tick += delegate { RefreshUi(); GuardSystemProxy(); };
+            _fast.Tick += delegate
+            {
+                // 诊断：量 RefreshUi / GuardSystemProxy 各占多少 UI 线程时间。
+                //
+                // 为什么加这个：2026-11-02 用户反复报「拖动窗口一顿一顿」。
+                // 外部测量（往窗口发 WM_NULL）显示 p50=0.5ms 但 p90=66ms、
+                // 20% 的采样都在顿挫 —— 典型的「周期性整块占用」。
+                // 与其继续在代码里猜哪个属性赋值慢，不如让程序自己报数。
+                //
+                // 只在超过一帧预算（15ms）时才写日志，正常情况不产生噪声。
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                RefreshUi();
+                sw.Stop();
+                double uiMs = sw.Elapsed.TotalMilliseconds;
+
+                var sw2 = System.Diagnostics.Stopwatch.StartNew();
+                GuardSystemProxy();
+                sw2.Stop();
+                double guardMs = sw2.Elapsed.TotalMilliseconds;
+
+                if (uiMs > 15 || guardMs > 15)
+                {
+                    Log(string.Format("[耗时] RefreshUi={0:F1}ms Guard={1:F1}ms 变更={2}次",
+                                      uiMs, guardMs, _uiSetCount));
+                }
+                _uiSetCount = 0;
+            };
             _fast.Start();
 
             _slow = new DispatcherTimer { Interval = TimeSpan.FromSeconds(Math.Max(10, _cfg.NetCheckSec)) };
@@ -1180,6 +1206,8 @@ namespace Ferry
                         _hsBusy = false;
                         if (!string.IsNullOrEmpty(err)) Log("关闭热点失败：" + err);
                         else Log("移动热点已关闭");
+                        // 状态变了，让 State() 的缓存失效，界面立刻反映真实状态
+                        Hotspot.InvalidateStateCache();
                         RefreshUi();
                     }));
                 });
@@ -1250,6 +1278,8 @@ namespace Ferry
                         var ssid = Hotspot.CurrentSsid();
                         Log("移动热点已开启" + (string.IsNullOrEmpty(ssid) ? "" : "：" + ssid));
                     }
+                    // 同上：状态刚变过，别让界面还读着旧缓存
+                    Hotspot.InvalidateStateCache();
                     RefreshUi();
                 }));
             });
@@ -1512,7 +1542,17 @@ namespace Ferry
             var cur = tb.GetValue(prop);
             if (Equals(cur, val)) return;
             tb.SetValue(prop, val);
+            _uiSetCount++;
         }
+
+        /// <summary>
+        /// 诊断计数器：这一轮 RefreshUi 真正写了几次依赖属性。
+        ///
+        /// 为什么需要：理论上全部走了「值变了才写」，空闲时应该接近 0。
+        /// 如果实测每秒还有很多次，说明有地方在抖动
+        /// （比如某个字段在两个值之间来回翻），那才是真正的浪费来源。
+        /// </summary>
+        static int _uiSetCount;
 
         static void SetText(System.Windows.Controls.TextBlock tb, string val)
         {
@@ -1557,8 +1597,11 @@ namespace Ferry
 
         void RefreshUi()
         {
+            // 分段计时（临时诊断，定位那 700ms 到底花在哪）
+            var _t0 = System.Diagnostics.Stopwatch.StartNew();
             bool proxyOn = FerryCore.ProxyEnabled();
             string proxySrv = FerryCore.ProxyServer();
+            double _tReg = _t0.Elapsed.TotalMilliseconds;
 
             var rt = _rt;
             bool runtimeUp = rt != null && rt.Running;
@@ -1739,7 +1782,10 @@ namespace Ferry
             // 完全不合理。
             bool tunUp = rt != null && rt.TunRunning;
             bool wantTun = _cfg.UseTun;
+            var _tAdminSw = System.Diagnostics.Stopwatch.StartNew();
             bool isAdmin = Elevator.IsAdmin();
+            _tAdminSw.Stop();
+            double _tAdmin = _tAdminSw.Elapsed.TotalMilliseconds;
 
             if (tunUp)
             {
@@ -1801,13 +1847,17 @@ namespace Ferry
             }
 
             // ══════════ 移动热点状态 ══════════
+            double _tHotspotState = 0;
             //
             // 和全局模式同一个原则：开关显示**用户意图**（_cfg.HotspotOn），
             // 文字说明**实际状态**（Hotspot.State() / 网卡有没有拿到 192.168.137.1）。
             // 两者不一致时文字要写清楚，否则「开关是开的、热点其实没起来」会让人
             // 以为手机连不上是手机的问题。
             {
+                var _ths = System.Diagnostics.Stopwatch.StartNew();
                 var hsState = Hotspot.State();
+                _ths.Stop();
+                _tHotspotState = _ths.Elapsed.TotalMilliseconds;
                 // 实测热点起来后状态可能停在 InTransition（已经在广播了），
                 // 只认 "On" 会把它显示成「正在开启…」永远转圈。
                 bool hsOn = hsState.Length > 0
@@ -1887,6 +1937,15 @@ namespace Ferry
             // 这里每秒无条件写一次，是「系统性扫描依赖属性赋值」时漏掉的最后一类。
             SetEnabled(_btnOn, !_busy && !borrowing);
             SetEnabled(_btnOff, !_busy && (borrowing || runtimeUp || (proxyOn && proxySrv == borrowServer)));
+
+            // 分段计时输出（临时诊断）：只在总耗时异常时打印，定位那 700ms
+            _t0.Stop();
+            double _tTotal = _t0.Elapsed.TotalMilliseconds;
+            if (_tTotal > 50)
+            {
+                Log(string.Format("[分段] 总={0:F0}ms 注册表={1:F1} IsAdmin={2:F1} HotspotState={3:F1}",
+                                  _tTotal, _tReg, _tAdmin, _tHotspotState));
+            }
         }
 
         /// <summary>

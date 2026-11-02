@@ -118,9 +118,71 @@ namespace Ferry
             return prop == null ? null : prop.GetValue(task, null);
         }
 
+        // ── State() 的缓存与后台刷新 ──
+        //
+        // 2026-11-02 定论（分段计时日志实测）：
+        // MainWindow.RefreshUi() 挂在 1 秒的 DispatcherTimer 上，**无条件**调用 State()。
+        // 而 State() 在真进程里单次耗时 **767~1016 ms**：
+        //     Manager() → PickShareProfile() → WinRT GetConnectionProfiles()
+        //     → 遍历每个连接配置档，逐个反射调 GetNetworkConnectivityLevel
+        //     → 反射遍历 _tetheringMgr.GetMethods()
+        //     → CreateFromConnectionProfile 激活一个新 manager
+        // 于是每秒有 0.8~1 秒 UI 线程被占满 —— 拖动窗口就是一帧一顿。
+        //
+        // ⚠ 反面教训：用 PowerShell 单独调同一段 WinRT API 只要 25 ms，差 30 倍。
+        // 因为 PowerShell 不做 WPF 的 STA 封送、也不在 UI 消息循环里跑。
+        // **别拿外部脚本的耗时去推断进程内的耗时。**
+        //
+        // 修法：UI 线程永不阻塞 —— 只读缓存，真正的查询交给 ThreadPool。
+        static volatile string _stateCache = "";
+        static DateTime _stateCacheAt = DateTime.MinValue;
+        static int _stateBusy = 0;
+        static bool _statePrimed = false;
+        const int StateCacheMs = 5000;
+
+        /// <summary>让缓存失效。热点被开启/关闭后调用。</summary>
+        public static void InvalidateStateCache()
+        {
+            _stateCacheAt = DateTime.MinValue;
+            _mgrCache = null;
+            _mgrCacheAt = DateTime.MinValue;
+        }
+
         /// <summary>当前热点状态："On" / "Off" / 其他（Starting 等）。取不到返回空。</summary>
         public static string State()
         {
+            // 首次同步查一次。启动时慢 1 秒无感，但之后永远不再阻塞 UI。
+            // 不这样做的话，第一秒会返回 "" → 界面闪一下「本机不支持」。
+            if (!_statePrimed)
+            {
+                _stateCache = QueryStateBlocking();
+                _stateCacheAt = DateTime.UtcNow;
+                _statePrimed = true;
+                return _stateCache;
+            }
+
+            // 过期就在后台刷一次，本次先返回旧值（最多旧 5 秒，界面无感）。
+            if ((DateTime.UtcNow - _stateCacheAt).TotalMilliseconds >= StateCacheMs
+                && System.Threading.Interlocked.CompareExchange(ref _stateBusy, 1, 0) == 0)
+            {
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    try { _stateCache = QueryStateBlocking(); }
+                    catch (Exception) { }
+                    finally
+                    {
+                        _stateCacheAt = DateTime.UtcNow;
+                        System.Threading.Interlocked.Exchange(ref _stateBusy, 0);
+                    }
+                });
+            }
+            return _stateCache;
+        }
+
+        /// <summary>真正去查（慢，800ms 量级，只能在后台线程或首次启动时调）。</summary>
+        static string QueryStateBlocking()
+        {
+            // EnsureLoaded 内部只做一次类型解析，失败结果也缓存了 —— 便宜。
             if (EnsureLoaded() != "") return "";
             try
             {
@@ -174,8 +236,26 @@ namespace Ferry
             catch (Exception) { return ""; }
         }
 
+        // Manager 的缓存。
+        //
+        // 为什么必须缓存（2026-11-02 分段计时实测）：
+        // State() 单次 767~1016ms 几乎全花在这条链上 —— PickShareProfile()
+        // 要遍历所有连接配置档并逐个反射调 GetNetworkConnectivityLevel，
+        // 然后 CreateFromConnectionProfile 再激活一个全新 manager 对象。
+        // 每秒重建一次，等于每秒把 UI 线程按住 0.8 秒。
+        //
+        // 30 秒：换网络（插拔网线 / 切 WiFi）不是高频动作，
+        // 真换了由 InvalidateStateCache 主动失效。
+        static object _mgrCache = null;
+        static DateTime _mgrCacheAt = DateTime.MinValue;
+        const int MgrCacheMs = 30000;
+
         static object Manager()
         {
+            if (_mgrCache != null &&
+                (DateTime.UtcNow - _mgrCacheAt).TotalMilliseconds < MgrCacheMs)
+                return _mgrCache;
+
             var profile = PickShareProfile();
             if (profile == null) return null;
             // CreateFromConnectionProfile 有重载，按参数类型精确找，避免传错。
@@ -185,7 +265,13 @@ namespace Ferry
                 var ps = m.GetParameters();
                 if (ps.Length != 1) continue;
                 if (!ps[0].ParameterType.IsInstanceOfType(profile)) continue;
-                return m.Invoke(null, new object[] { profile });
+                var mgr = m.Invoke(null, new object[] { profile });
+                if (mgr != null)
+                {
+                    _mgrCache = mgr;
+                    _mgrCacheAt = DateTime.UtcNow;
+                }
+                return mgr;
             }
             return null;
         }

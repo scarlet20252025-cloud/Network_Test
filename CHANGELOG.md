@@ -1,3 +1,110 @@
+## v1.0.60 — 2026-11-02
+
+> **修掉「拖动窗口一顿一顿」的真正根因**：`Hotspot.State()` 在 UI 线程上
+> 每次耗时 767~1016 ms，而 `RefreshUi` 每秒无条件调它一次。
+
+### 一、根因：每秒 800ms 的 WinRT 查询
+
+现象：拖动主窗口一顿一顿，静止时不明显。
+
+排查过程（每一步都有数据，不是猜的）：
+
+| 测试 | 结果 |
+|---|---|
+| 空白 WPF 窗口对照（同一时刻、同一壁纸软件在跑） | p90=**0.7ms**，0/648 顿挫 |
+| 渡口助手 | p90=**66.5ms**，92/447 = 20% 顿挫 |
+| 窗口最小化（WPF 停渲染、定时器照跑） | 仍 22% 顿挫，**毫无好转** |
+| `GuardSystemProxy` 耗时 | 0.0ms |
+| GC `% Time in GC` | 0.0% |
+
+空白窗口 0/648 vs 渡口 20%，**当场排除「线程抢占 / 壁纸软件抢 CPU」**——
+外部负载对两者完全等价。最小化后不掉，说明卡在定时器里的代码，不是 WPF 绘制。
+
+程序自己报数（临时诊断，>50ms 才打印）：
+
+```
+[分段] 总=768ms  注册表=0.2  IsAdmin=0.0  HotspotState=767.5
+[分段] 总=836ms  注册表=0.4  IsAdmin=0.0  HotspotState=835.6
+[分段] 总=1016ms 注册表=0.2  IsAdmin=0.0  HotspotState=1015.8
+```
+
+`Hotspot.State()` 一口吃掉全部耗时。它内部每秒重建整条链路：
+
+```
+PickShareProfile()  → WinRT GetConnectionProfiles()（遍历所有连接配置档）
+                    → 逐个反射调 GetNetworkConnectivityLevel
+→ 反射遍历 _tetheringMgr.GetMethods()
+→ CreateFromConnectionProfile 激活一个全新 manager 对象
+```
+
+**修法**：
+- `State()` 改成 UI 只读缓存 + `ThreadPool` 后台刷新（5 秒 TTL），
+  启动时同步查一次避免界面闪「本机不支持」
+- `Manager()` 加 30 秒缓存，不再每次重建 manager
+- 热点开关动作后 `InvalidateStateCache()`，点开关无延迟
+
+**效果**：
+
+```
+p50 = 0.6 ms
+p90 = 1.2 ms      ← 修复前 66.5 ms（55 倍）
+p99 = 4.8 ms
+max = 9.4 ms      ← 修复前 142.8 ms
+slow(>25ms) = 0/655   ← 修复前 92/447（20%）
+```
+
+修完已基本追平空白 WPF 窗口（p90=0.7ms）。
+
+### 二、⚠ 一个必须记住的教训
+
+排查过程中我用 PowerShell 单独调同一段 WinRT API，测出只要 **25ms**，
+于是判过「不是它」——**差了 30 倍**。
+
+原因是 PowerShell 不做 WPF 的 STA 封送、也不在 UI 消息循环里跑。
+
+**用外部脚本测出来的耗时，不能代表进程内的耗时。**
+真实数字只能由进程自己报（Stopwatch 埋点）。
+
+### 三、附带修的两处（同一类病：无条件重复赋值）
+
+1. **`IsEnabled` 每秒无条件写三处**（`_swHotspot` / `_btnOn` / `_btnOff`）
+   1.0.49 那次把 CPU 从 82% 压到 7.2%，方法是「所有依赖属性赋值先比后写」，
+   但只扫了 `Text` / `Content` / `Background` / `Visibility` / `Foreground` 五类，
+   **漏了 `IsEnabled`**。它变化会触发 `IsEnabledChanged` 路由事件并向下传播。
+   新增 `SetEnabled`（值变了才写）。
+
+2. **`Elevator.IsAdmin()` 每秒一次内核查询**
+   `WindowsPrincipal.IsInRole` 要遍历访问令牌的组成员列表（1~5ms），
+   `WindowsIdentity.GetCurrent()` 还要分配对象。进程权限一辈子不变 →
+   首次算完缓存。
+
+### 四、日志控件不再拖慢 UI
+
+- `TextWrapping` 从 `Wrap` 改为 `NoWrap` + 横向滚动条：
+  Wrap 模式下每次 `AppendText` 都要按当前宽度从头重排整段文本
+- `Log()` 的写文件从 UI 线程移到队列 + 后台线程批量写：
+  原来是同步 `File.AppendAllText` + `FileInfo.Length`，超 200KB 还要
+  整个文件 `ReadAllLines` + `WriteAllLines`
+- 界面日志只保留最近 800 行（日志卡只有 190px 高，多的看不见）
+
+### 五、管理面板：手动续期（配套 1.0.55 已发布）
+
+- `/admin/users` 增加「授权」状态列（永久 / 剩 N 天 / 已过期 / 已停用）
+  与「到期时间」列
+- 「续期」按钮 → 弹面板：`+7` / `+30` / `+90` / `+1年` 快捷键，
+  也能直接填天数或指定日期
+- 已过期账号从**现在**起算（否则过期半年的号续 30 天仍是过期）
+- 续期**不动 `enabled`**：到期由续期恢复，停用只有管理员点「启用」才能解除
+  （早先版本续期会顺手把停用也解掉，等于停用形同虚设）
+
+### 六、新增诊断工具
+
+- `tools/diag-ui-latency.cs` —— 往窗口发 `WM_NULL`，量 UI 线程消息延迟
+- `tools/probe-ui-latency.py` / `probe-ui-spikes.py` / `probe-ui-phase.py`
+- `tools/probe-ui-render-vs-logic.py` —— 最小化窗口区分「渲染卡」还是「逻辑卡」
+- `tools/blank-wpf.cs` —— 空白 WPF 窗口，做对照基准
+- `tools/echo_srv.py` / `start-echo-pcs.cmd` —— pcs 上的 TCP echo（64Hz 延迟测量用）
+
 ## v1.0.54 — 2026-11-02
 
 > 修 1.0.53 的致命回归：**装了 1.0.53 的人 TUN 直接起不来**。
