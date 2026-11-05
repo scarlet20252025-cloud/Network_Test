@@ -711,7 +711,19 @@ namespace Ferry
             //   用户看到的是「借网了但完全上不了网」，且毫无线索。
             //
             // 所以改成三条件同时满足：进程活着 + 网卡存在 + 没出现过 TUN 失败日志。
-            for (int i = 0; i < 30; i++)
+            //
+            // ⚠ 12 秒 → 30 秒（2026-11-02，xt 主机实测）：
+            //   那台机器同时装着 EasyTier（etgame Tunnel）和 WireGuard
+            //   （ferry-wg），两个都是 Wintun 网卡。实测 mihomo 建出 FerryTun
+            //   只要 1.1 秒（Get-NetAdapter 立刻能看到），但
+            //   **NetworkInterface.OperationalStatus 变 Up 要 10 秒以上**
+            //   ——系统枚举网卡列表在这种多 TUN 环境下明显变慢。
+            //   原来 30 次 × 400ms = 12 秒卡在临界点上，于是「网卡明明建好了
+            //   却报 TUN 未启用」，用户看到的就是截图里那句
+            //   「TUN 网卡没能在 12 秒内创建」。
+            //   75 次 × 400ms = 30 秒，留足余量；正常机器仍在 1~2 秒内返回。
+            string lastSeen = "";
+            for (int i = 0; i < 75; i++)
             {
                 System.Threading.Thread.Sleep(400);
                 if (_proc == null || _proc.HasExited)
@@ -745,10 +757,18 @@ namespace Ferry
                     RestoreNcsiProbing(_appDir);
                     return "";
                 }
+
+                // 记录「网卡已经在了、但状态还不是 Up」这种情况。
+                // 失败时把它写进错误信息 —— 否则用户只看到「没创建」，
+                // 而实际上网卡早就建好了、只是 OperationalStatus 还没跟上，
+                // 两边说的根本不是一件事（2026-11-02 xt 主机踩到）。
+                if (AdapterPresent("FerryTun")) lastSeen = "网卡已存在但状态未就绪";
             }
 
             Stop();
-            return "TUN 网卡没能在 12 秒内创建。详见日志里的 [TUN] 行。";
+            return "TUN 网卡没能在 30 秒内创建" +
+                   (lastSeen.Length > 0 ? "（" + lastSeen + "）" : "") +
+                   "。详见日志里的 [TUN] 行。";
         }
 
         public void Stop()
