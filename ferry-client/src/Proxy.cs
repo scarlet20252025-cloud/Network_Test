@@ -530,7 +530,6 @@ namespace Ferry
                     _log("UDP 关联数已达上限 " + MaxUdpAssoc + "，且无法淘汰，拒绝新关联 (" + clientEp + ")");
                     return;
                 }
-                Interlocked.Decrement(ref _udpAssoc);   // 淘汰的那条自己会减
             }
 
             try

@@ -663,20 +663,35 @@ def parse_socks5_udp(data):
     """
     if len(data) < 4:
         raise ValueError('UDP 头过短')
-    _rsv, frag, atyp = struct.unpack('>HBB', data[:4])
+    rsv, frag, atyp = struct.unpack('>HBB', data[:4])
+    if rsv != 0:
+        raise ValueError('UDP RSV 非零')
     if frag != 0:
         # 分片（FRAG != 0）需要客户端自己重组，本服务不支持。
         # 实际绝大多数客户端（含 mihomo）都不分片，直接丢弃即可。
         raise ValueError('不支持 UDP 分片')
     off = 4
     if atyp == 1:                                   # IPv4
+        if len(data) < off + 4:
+            raise ValueError('UDP 头缺 IPv4 地址')
         host = socket.inet_ntoa(data[off:off + 4])
         off += 4
     elif atyp == 3:                                 # 域名
+        if len(data) < off + 1:
+            raise ValueError('UDP 头缺域名长度')
         n = data[off]
-        host = data[off + 1:off + 1 + n].decode('idna', 'replace')
+        if n == 0 or len(data) < off + 1 + n:
+            raise ValueError('UDP 头域名不完整')
+        raw = data[off + 1:off + 1 + n]
+        try:
+            # idna 编码器不支持 errors='replace'；非法 IDNA 直接丢弃。
+            host = raw.decode('idna')
+        except UnicodeError as e:
+            raise ValueError('UDP 头域名不是有效 IDNA') from e
         off += 1 + n
     elif atyp == 4:                                 # IPv6
+        if len(data) < off + 16:
+            raise ValueError('UDP 头缺 IPv6 地址')
         host = socket.inet_ntop(socket.AF_INET6, data[off:off + 16])
         off += 16
     else:

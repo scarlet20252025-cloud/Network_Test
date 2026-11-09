@@ -702,3 +702,25 @@ ICMP 与游戏 UDP 是两条不同的路径，量纲也不同。
 
 可选进一步优化：重试阈值 2.5 秒 → 1.2 秒，把偶发 1 秒级卡顿再压一档。
 需走隔离端口 ≥100 次完整验证 + 一次重启，等用户明确说做再做。
+
+## 2026-11-09 渡口 UDP 解析与关联计数修复（已验证）
+
+### 已完成 ✅
+
+1. **pcs 生产中继丢弃域名型 UDP 包**
+   - 根因：`relay/ferry-socks5-server.py:736` 使用 `decode('idna', 'replace')`；Python 的 `idna` codec 不支持 `errors='replace'`，每个 ATYP=3 包都会抛 `UnicodeError: Unsupported error handling: replace`。
+   - 修复：`relay/` 与未启用的 `wireguard/` 同源副本统一改为 `raw.decode('idna')`；非法 IDNA、截断地址、零长度域名、非零 RSV 统一 `ValueError` 丢包，避免静默删字节造成误路由。
+   - 生产部署：先备份为 `ferry-socks5-server.py.bak-20261109-110909`，在 1081 隔离端口验证后替换 1080；停止旧 PID 10616，再经 `schtasks /Run /TN FerryUdpRelay` 启动新 PID 7468。启动器已加 `python -B`，并清理该目录 `__pycache__`；旧日志已归档为 `udp-relay.before-isolation-20261109-112831.log`。
+   - 验证：两份 parser 各 4 个合法 + 7 个非法用例全部通过；1081 隔离端口 `TCP CONNECT + HTTP 100/100`、域名型 UDP 回环 `100/100`；生产 1080 真实 ATYP=3 → `223.5.5.5:53` DNS 查询 **10/10**，RTT **9.2–12.1ms**；生产新日志中旧 `Unsupported error handling: replace` 和 `UDP 头解析失败` 均为 **0**。
+
+2. **客户端 UDP 关联统计负数**
+   - 根因：`ferry-client/src/Proxy.cs:533` 在淘汰旧关联后额外 `Interlocked.Decrement(ref _udpAssoc)`，而被淘汰关联自身的 `finally:542` 已递减一次，导致统计逐次漂成负数。
+   - 修复：删除 `:533` 的重复递减。客户端源码通过 WPF 构建（`dist/渡口助手.exe` 202240 bytes）；直接编译并执行 `verify-udpassoc-cap.cs`：上限 512、100/100 关联建立、0 拒绝、ALL PASS。
+   - 该客户端改动只进入源码和构建产物，当前用户机运行中的客户端没有被重启或替换，避免断网。
+
+### 当前结论与限制
+
+- 已确认的直接丢包根因是生产中继对域名型 SOCKS5 UDP 包的解析回归；修复后生产域名型 UDP 已能稳定返回。
+- 这次没有把 UDP 回环测试用于生产：生产机未部署临时回环目标；生产使用真实 `223.5.5.5:53` DNS 包完成验证。
+- 游戏实际服务器的端到端 UDP RTT 仍需在用户说“卡”的同一时刻，用游戏内数值配合 `python tools/measure-64hz.py 256` 与 `ping -n 300 10.13.24.1` 对齐确认。此前已知的本机↔pcs TCP 正常和 pcs 公网 ICMP 稳定，不能代替这个游戏口径。
+- `ports.json` 仍是陈旧的 10800/10801，而运行实例实际可能是 10801/10802；这是诊断脚本的独立风险，后续应修正端口发现逻辑并做读写兼容。
