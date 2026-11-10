@@ -369,7 +369,7 @@ namespace Ferry
             btnMin.Click += delegate { WindowState = WindowState.Minimized; };
             winBtns.Children.Add(btnMin);
 
-            var btnClose = WinButton(Icons.Close);
+            var btnClose = WinButton(Icons.Close, true);
             btnClose.Margin = new Thickness(6, 0, 0, 0);
             btnClose.Click += delegate { Close(); };   // 关闭 = 收托盘，见 OnWindowClosing
             winBtns.Children.Add(btnClose);
@@ -462,26 +462,71 @@ namespace Ferry
         }
 
         /// <summary>标题行右侧的窗口按钮（最小化 / 关闭）。</summary>
-        static Button WinButton(string icon)
+        ///
+        /// 1.2.6 及以前这两个按钮悬停/按下**没有任何反馈**：模板里那层 Border 的
+        /// Background 被写死成 Transparent，既没有 TemplateBinding 也没有触发器，
+        /// 鼠标移上去就只是一根不会动的手型光标 —— 用户报「光标放右上角没有反馈」。
+        ///
+        /// 现在的做法：
+        ///   · Border 的底色改成 TemplateBinding Button.Background；
+        ///   · 悬停 / 按下交给 Style 触发器改 Background（普通按钮 12% / 21% 白叠层，
+        ///     关闭按钮按 Windows 惯例整块变红 #C42B1C）；
+        ///   · 图标 Stroke 绑到 Button.Foreground，所以底色一变，线条跟着提亮（关闭变白）。
+        ///
+        /// ⚠ Background / Foreground 必须写在 Style 的 Setter 里，不能写成本地值 ——
+        ///   本地值优先级高于 Style 触发器，写了触发器就永远不生效（这次差点又踩）。
+        static Button WinButton(string icon, bool isClose = false)
         {
+            var path = Icons.Make(icon, Palette.MutedB, 13);
+            path.SetBinding(System.Windows.Shapes.Shape.StrokeProperty,
+                new System.Windows.Data.Binding("Foreground")
+                {
+                    RelativeSource = new System.Windows.Data.RelativeSource(
+                        System.Windows.Data.RelativeSourceMode.FindAncestor, typeof(Button), 1)
+                });
+
             var b = new Button
             {
                 Width = 30,
                 Height = 26,
                 Cursor = Cursors.Hand,
-                Background = Brushes.Transparent,
                 BorderThickness = new Thickness(0),
-                Content = Icons.Make(icon, Palette.MutedB, 13)
+                Content = path,
+                ToolTip = isClose ? "关闭（收到托盘）" : "最小化"
             };
+
             var t = new ControlTemplate(typeof(Button));
             var bd = new FrameworkElementFactory(typeof(Border));
-            bd.SetValue(Border.BackgroundProperty, Brushes.Transparent);
+            bd.SetValue(Border.BackgroundProperty,
+                new TemplateBindingExtension(Control.BackgroundProperty));
+            bd.SetValue(Border.CornerRadiusProperty, new CornerRadius(7));
+            bd.SetValue(Border.SnapsToDevicePixelsProperty, true);
             var cp = new FrameworkElementFactory(typeof(ContentPresenter));
             cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
             cp.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
             bd.AppendChild(cp);
             t.VisualTree = bd;
             b.Template = t;
+
+            var st = new Style(typeof(Button));
+            st.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
+            st.Setters.Add(new Setter(Control.ForegroundProperty, Palette.MutedB));
+
+            var over = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true };
+            over.Setters.Add(new Setter(Control.BackgroundProperty,
+                isClose ? Palette.CloseHoverB : Palette.WinHoverB));
+            over.Setters.Add(new Setter(Control.ForegroundProperty,
+                isClose ? Brushes.White : Palette.TextB));
+            st.Triggers.Add(over);
+
+            var down = new Trigger { Property = Button.IsPressedProperty, Value = true };
+            down.Setters.Add(new Setter(Control.BackgroundProperty,
+                isClose ? Palette.ClosePressB : Palette.WinPressB));
+            down.Setters.Add(new Setter(Control.ForegroundProperty,
+                isClose ? Brushes.White : Palette.TextB));
+            st.Triggers.Add(down);
+
+            b.Style = st;
             return b;
         }
 

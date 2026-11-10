@@ -51,6 +51,16 @@ namespace Ferry
         public static readonly Color Bad      = Color.FromRgb(224, 138, 130); // #E08A82
         public static readonly Color Idle     = Color.FromRgb(126, 145, 132); // #7E9184
 
+        // ── 标题栏窗口按钮（最小化 / 关闭）──
+        //
+        // 这两个按钮没有文字也没有边框，只靠底色变化表达「可以点、正在点」。
+        // 普通悬停用低透明度白叠层（在任何深色底上都成立），
+        // 关闭按 Windows 惯例给整块红底 —— 红只出现在悬停/按下，静止时不抢视线。
+        public static readonly Color WinHover      = Color.FromArgb(31, 255, 255, 255);  // 12% 白
+        public static readonly Color WinPress      = Color.FromArgb(54, 255, 255, 255);  // 21% 白
+        public static readonly Color CloseHover    = Color.FromRgb(196, 43, 28);         // #C42B1C
+        public static readonly Color ClosePress    = Color.FromRgb(163, 34, 23);         // #A32217
+
         public static readonly Brush BgB     = Freeze(new SolidColorBrush(Bg));
         public static readonly Brush CardB   = Freeze(new SolidColorBrush(Card));
         public static readonly Brush Card2B  = Freeze(new SolidColorBrush(Card2));
@@ -76,6 +86,11 @@ namespace Ferry
         public static readonly Brush WarnB     = Freeze(new SolidColorBrush(Warn));
         public static readonly Brush BadB      = Freeze(new SolidColorBrush(Bad));
         public static readonly Brush IdleB     = Freeze(new SolidColorBrush(Idle));
+
+        public static readonly Brush WinHoverB   = Freeze(new SolidColorBrush(WinHover));
+        public static readonly Brush WinPressB   = Freeze(new SolidColorBrush(WinPress));
+        public static readonly Brush CloseHoverB = Freeze(new SolidColorBrush(CloseHover));
+        public static readonly Brush ClosePressB = Freeze(new SolidColorBrush(ClosePress));
 
         static Brush Freeze(SolidColorBrush b) { b.Freeze(); return b; }
 

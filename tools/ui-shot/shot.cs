@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
@@ -52,6 +53,14 @@ static class Shot
         enc.Frames.Add(BitmapFrame.Create(rtb));
         using (var fs = File.Create(path)) enc.Save(fs);
         Console.WriteLine("saved " + Path.GetFileName(path) + "  " + pw + "x" + ph);
+    }
+
+    /// <summary>深度遍历视觉树，收集所有元素（自检找控件用）。</summary>
+    static void Collect(DependencyObject d, List<DependencyObject> acc)
+    {
+        acc.Add(d);
+        int n = VisualTreeHelper.GetChildrenCount(d);
+        for (int i = 0; i < n; i++) Collect(VisualTreeHelper.GetChild(d, i), acc);
     }
 
     /// <summary>固定版式：按窗口真实尺寸排列（主窗口五个页面都走这里）。</summary>
@@ -185,9 +194,10 @@ static class Shot
         //
         // 1.2.5 的症状是「点了没用」：没新版本 / 连不上门户时直接 return，
         // 界面上只有按钮多一圈焦点虚线框。这里断言状态文字非空。
+        MainWindow up = null;
         try
         {
-            var up = new MainWindow(cfgPath, appDir);
+            up = new MainWindow(cfgPath, appDir);
             up.SelectPageForShot(4);                     // 关于页
             var state = up.SelfTestUpdateClick();
             bool visible = !string.IsNullOrWhiteSpace(state);
@@ -200,6 +210,62 @@ static class Shot
         {
             Console.WriteLine("SELFTEST update-click: THREW " + ex.GetType().Name + ": " + ex.Message);
             Environment.ExitCode = 5;
+        }
+
+        // ── 自检：标题栏窗口按钮（最小化 / 关闭）必须有悬停反馈 ──
+        //
+        // 1.2.6 及以前这两个按钮完全没反馈：模板里那层 Border 的 Background 写死
+        // 成 Transparent，也没有触发器，鼠标移上去只有光标变手型。用户报
+        // 「光标放右上角没有反馈」。这里断言：找到 2 个 30×26 的按钮，且各自的
+        // Style 上至少有 2 条触发器（IsMouseOver + IsPressed）—— 样式被改空就会红。
+        try
+        {
+            if (up == null) throw new InvalidOperationException("窗口未创建，无法检查窗口按钮");
+            var all = new List<DependencyObject>();
+            // 从 Content 开始遍历：窗口没 Show 过，Window 自身还没有视觉子树，
+            // 直接传 Window 会得到 0 个元素（第一版就是这么踩的，found=0）。
+            Collect((DependencyObject)up.Content, all);
+
+            int found = 0, withTrig = 0;
+            var winBtns = new List<Button>();
+            foreach (var d in all)
+            {
+                var bt = d as Button;
+                if (bt == null) continue;
+                // 窗口按钮的识别特征：内容是一个矢量图标 + 有提示文字。
+                // 只按 30×26 挑会捞到 7 个同尺寸的其它按钮（下拉箭头、开关等）。
+                if (!(bt.Content is System.Windows.Shapes.Path)) continue;
+                if (bt.ToolTip == null) continue;
+                found++;
+                winBtns.Add(bt);
+                int n = bt.Style == null ? 0 : bt.Style.Triggers.Count;
+                if (n >= 2) withTrig++;
+                Console.WriteLine("SELFTEST winbtn: triggers=" + n);
+            }
+            Console.WriteLine("SELFTEST winbtn: found=" + found + " with-triggers=" + withTrig);
+            if (found != 2 || withTrig != 2) Environment.ExitCode = 6;
+
+            // 悬停预览：把 IsMouseOver 触发器的设值直接落到按钮上。
+            // 离屏渲染没有鼠标，改不了 IsMouseOver；但模板的 Border 底色走的是
+            // TemplateBinding Background，所以把同一个画刷写成局部值，看到的
+            // 就是悬停时真实的样子。只为截图，不参与断言。
+            foreach (var bt in winBtns)
+            {
+                var trg = bt.Style.Triggers[0] as Trigger;
+                if (trg == null) continue;
+                foreach (SetterBase sb in trg.Setters)
+                {
+                    var st2 = sb as Setter;
+                    if (st2 != null) bt.SetValue(st2.Property, st2.Value);
+                }
+            }
+            SaveFixed(up, Path.Combine(outDir, "shot-10-titlebar-hover.png"),
+                Palette.WinW, Palette.WinH, scale);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("SELFTEST winbtn: THREW " + ex.GetType().Name + ": " + ex.Message);
+            Environment.ExitCode = 7;
         }
 
         app.Shutdown();
