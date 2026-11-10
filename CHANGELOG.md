@@ -1,3 +1,193 @@
+## v1.1.1 — 2026-11-10
+
+> **把「连不上」分成线路级 / 目标级；回退日志改成窗口汇总；补上防回归守卫。**
+>
+> - 只改客户端分流层与验证链路：**未改服务端 relay、未重启中继**。
+> - 起因：用户截图里 13 条「国内目标连不上，改走本机代理」全是同一个方向，
+>   而代码里并不存在「国内 → 本机代理 → 渡口」三级串联 —— 实际是
+>   `ConnectSmart` 按目标**二选一**，失败时**互换一次**兜底。设计意图成立，
+>   但实现有失败语义混淆、日志刷屏、主语错位、测试缺口等问题。
+
+### 一、失败语义混淆：目标不可达被当成线路故障
+
+`ConnectSocks` 以前只有「成功 / 失败」两种结果。SOCKS5 上游明确回
+`REP≠0`（例如 `0x05` Host unreachable）说明**上游活着，只是这个目标从它的出口
+不可达**；旧代码把它和「连不上上游」一视同仁写进 5 分钟失败记忆
+（`MarkFailed`），该目标就被硬绕开 5 分钟，线路恢复也不会立刻重试。
+
+新增 `enum SocksFailKind { None, Line, Target }` 和 6 参数
+`out SocksFailKind fail` 重载（保留原 5 参数入口不动，不影响其它调用点）：
+收到 REP≠0 判 `Target`，握手前断开 / 没收到 REP 判 `Line`。
+`ConnectSmart` 里**只有 `Line` 写失败记忆**，两条分支照旧互换一次兜底。
+
+### 二、日志：刷屏、主语错位、不记第二跳结果
+
+| 旧问题 | 1.1.1 |
+|---|---|
+| 每条回退打一行，探测流量也跟着刷 | 60 秒窗口汇总一行：`〔渡口→本机代理〕N 次（目标级 x / 线路级 y），第二跳成功 a / 失败 b；示例 host:port` |
+| 只记「改走」，不记改走之后成没成 | `NoteFallback` 记录第二跳结果 |
+| `_loggedOnce` 整表 `Clear()` 后又开始刷屏 | 改 `Dictionary<string, DateTime>` + 300 秒时间窗 |
+| 看不出是哪一跳失败 | 汇总里区分「线路级 / 目标级」 |
+| DNS / 连通性探测也进汇总 | `IsInfrastructureTarget` 静默，不计数 |
+| 境外回退渡口等满 8 秒 | 2.5 秒快速超时：真境外从大陆出口必然打不开，只为救回「判错成境外」的国内目标 |
+
+顺带修 `RootDomain`：IP 字面量保留完整 IP，不再错误地取后两段做聚合键。
+
+### 三、全局模式文案
+
+TUN 只决定「谁进隧道」，**分流仍然只在本地代理层做一次**（AGENTS.md 硬规则；
+1.0.16 曾在 TUN 模式下关掉分流，导致境外全 502）。旧 UI 写「UDP / 游戏都走渡口」
+会让人以为 TCP 也被全量接管。WPF `MainWindow.cs` 与旧 WinForms `MainForm.cs`
+同步改成「已开启（TUN 接管；TCP 仍按目标分流）」。
+
+### 四、防回归：用户明确要求「别引出新问题、也别让旧的错误回滚」
+
+改动前先把 `Proxy.cs` / `TunMode.cs` / `MainWindow.cs` / `FerryRuntime.cs` /
+文档 / 全部 `verify*.cs` 物理备份到 `scratch/fix-20261110-1340/baseline/`，
+跑出 `baseline-verify.txt`：**7 个验证器在改动前就是红的**。逐条定位为过期
+断言或验证器自身缺陷，不是产品故障 —— 没有为了让测试变绿去回滚任何实现。
+
+- 新建 `tools/verify-regression-guard.cs`：把历史事故结论钉成断言 ——
+  fake-ip 判境外（踩坑 72）、境外传原始域名（踩坑 73）、26 条防回环例外、
+  `clash-egress`、`MATCH,ferry` 在最后、失败记忆有界、1.1.0 直连 UDP、
+  两份中继严格 IDNA、UI 旧文案已移除。
+- 新建 `tools/verify-fallback.cs`：用 fake SOCKS 模拟 REP=0 / `0x05` / 无 REP，
+  断言 Line/Target/None 分类、只有 Line 写记忆、10 次回退只出 1 行汇总且带第二跳结果。
+- 新建 `tools/run-verify.ps1`（编整个 `src\*.cs`、固定 cwd、只按 exit code 判定）
+  与 `tools/verify-tunconfig.ps1`。
+- 校正 7 个过期验证器：`verify-udp-group`（1.0.26 的 fallback 结论）、
+  `verify-fakeip`（1.0.16）、`verify-split`（本地解析方向）、`verify-fakeip-split`
+  （空 udpHost）、`verify-tun-exclude`（无条件加载 exe）、`verify-sharedup`
+  （1.0.29 共享关联）、`verify-cnrules`（/16 精度）。**断言跟着正确实现走，实现没动。**
+- `verify-scenarios.cs` 自包含化：上游与本机代理全用本地 fake、端口段按 PID 错开；
+  消除「真实远端 10.13.24.1 是否可达 / 本机 7897 是否在跑 / 连跑撞 TIME_WAIT」
+  造成的偶发假红。`DetectLocalProxy` 场景改为断言函数契约，不再断言本机恰好开着 Clash。
+- 文档更正：`docs/分流架构.md` 五之三（1.1.0 直连远端 UDP 合法，旧「必须走本地代理」
+  是误判）、新增五之四（失败分类与回退日志）、更正 1.0.29「共享上游关联」；
+  `mihomo-keeper.ps1` 补上「别把裸发 1080 的结论套到 mihomo」的防误读注释。
+
+### 五、验证与边界
+
+- 全套 16 个验证器连跑 **3 轮 × 16 = 48 次全绿**（`scratch/fix-20261110-1340/final-verify.txt`）；
+  `verify-scenarios` 另连跑 13 次全绿。
+- `tools/verify-tunconfig.ps1`：43 项结构断言 ALL PASS。
+- `tools/test-relay-udp-parser.py`：两份中继副本各 4 有效 + 7 无效 UDP 头、
+  2 有效 + 2 无效域名用例全过，静态断言禁止 `ascii+ignore` 降级；`py_compile` 通过。
+- `TunMode.cs` / `FerryRuntime.cs` 与改动前基线**逐字节一致**，本轮没动 TUN 配置生成器；
+  1.1.0 做过的 `mihomo -t` 语法校验结论继续有效。
+- **未在本机做 A/B 复测**：这台机器正靠渡口上网且 mihomo 在跑，按硬规则不动 TUN。
+- 已知边界：`tools/verify-split.cs` 仍以真实远端作上游（3 轮均全绿），
+  其余验证器已自包含；它的核心不变量另有 `verify-regression-guard` 静态断言双覆盖。
+
+### 六、上线记录（2026-11-10 15:07，用户授权后执行）
+
+- **门户分发（pcs `C:/ferry-portal/dist/`）**：`Ferry-Setup-1.1.1.exe`（17,732,074 B，
+  sha256 `755d999b…e0fe50`）、`渡口助手.exe`（205,312 B，`46aaa312…e7f097`）、
+  `Ferry-Portable-1.1.1.zip`（22,647,955 B，`df99c5fa…c1475c`）、`CHANGELOG.md`。
+  远端逐项 `Get-FileHash` 与本地一致；`version.json` 由门户从
+  `dist/Ferry-Setup-*.exe` 自动推出为 `1.1.1`（没手写）。
+- **三个端点真下载校验**：`/download-latest`、`/download-client`、`/download-portable`
+  下载后 hash 与本地逐字节一致；`/download-page` 已渲染 v1.1.1 更新日志。
+- **真链路自动更新（xt 测试机）**：`渡口助手.exe /update` 从 `1.1.0.0`（202,240 B）
+  升到 `1.1.1.0`（205,312 B），退出码 0；`update-selftest.log` 全步骤齐全
+  （当前 1.1.0.0 → 服务端版本 = 1.1.1 → 下载完成 205,312 字节 → 改名成功 →
+  复制成功 → WMI 结果 = True → 成功），升级后 exe 的 sha256 与本地一致。
+- **服务端未动**：本轮无 relay 改动，`FerrySocks5` / `FerryUdpRelay` 两个计划任务未重启。
+- 用户端 `/update` 或重装即得 1.1.1，无需人工干预。
+
+---
+
+## v1.1.0 — 2026-11-10
+
+> **合并 mihomo UDP 丢包修复；修掉中继域名解析的静默降级。**
+>
+> - TUN 的 UDP 出口改为直连远端 SOCKS5，UDP 出口组由 `fallback` 改成固定 `select`。
+> - `relay` / `wireguard` 两份中继统一用严格 IDNA 域名编解码，非法域名明确拒绝连接。
+> - 回归测试扩展为同时覆盖 UDP 头解析与域名编解码，两份副本都跑。
+
+### 一、40% UDP 丢包：根因是出口组漂移，不是链路质量
+
+现象：借网（TUN）时 UU 加速器显示 98%~100% 丢包。**UU 界面数字不能当判据** ——
+向 UU 节点 `157.148.78.41:2130` 发的裸 UDP 包在所有层（含绕过 mihomo 的远端直发）
+都无应答。改用 NTP `203.107.6.88:123` 发 100 包：修复前 60/100 收包、**40.0%** 丢、
+p50 45.9ms；逐跳 ping（三个网关 + 远端）与 TCP 抓网页均为 0% 丢包，说明物理链路没问题。
+
+两个叠加原因：
+
+1. `ferry-udp-group` 是 `fallback [DIRECT, ferry-udp]` + 10 秒健康检查。禁网时段本机
+   物理网卡没过校园网 Portal 认证，`DIRECT` 永久不可用；mihomo 每 10 秒重判一次成员，
+   UDP 会话在两条候选间反复漂移，约 40% 的包被送到不通的分支。
+2. 本地 UDP 中继 `127.0.0.1:10801` 转发层多一跳，经它发 NTP 单发直接超时；
+   直连远端 SOCKS5 则 47ms 成功。
+
+修复：`ferry-udp` 的 `server/port` 改为配置里的远端中继（`udpHost:udpPort`），
+`ferry-udp-group` 改成单成员 `select [ferry-udp]`。实测 100/100 收包、**0.0%** 丢、
+p50 39.7ms（p95 40.8ms），TCP 侧未受影响。
+
+### 二、澄清一个反复误判的旧结论
+
+`mihomo/mihomo-keeper.ps1` 与 0.9.30 的 CHANGELOG 写过「指向 `10.13.24.1:1080`
+的 UDP 根本没通 / 只会收到 ICMP port unreachable」。这句话**只对比了裸发固定端口**，
+不能套到 mihomo 的 `socks5 + udp: true`：
+
+- 远端中继按 RFC 1928 工作，每条 TCP `ASSOCIATE` 临时开一个随机 UDP 端口，
+  端口放在回复的 `BND.PORT`；1080 是**控制端口**，本来就不监听 UDP。
+- mihomo 会先做 ASSOCIATE 再往 BND 端口发包。本次诊断实测 BND 为
+  `10.13.24.1:55732/55734`，DNS 8ms、NTP 47ms 均成功。
+- 所以「直连远端」与「裸发 1080」是两件事，本次合并的是前者。
+  两个 mihomo.exe（项目 vendor 与修复包）逐字节同源，不是内核版本差异。
+
+### 三、顺带修掉的正确性 bug
+
+`relay` / `wireguard` 的 TCP CONNECT 分支原来在 IDNA 解码失败时兜底
+`decode('ascii', 'ignore')`：`evil<0xFF>.example` 会被静默删成 `evil.example`，
+连接被发到**另一台主机**。Clash 出站侧也有对称的 `encode('ascii', 'ignore')`，
+会把国际化域名悄悄改名。现在抽出共用的 `decode_socks5_domain` /
+`encode_socks5_domain`，非法域名直接回 SOCKS5 `0x04` 并关连接；
+UDP 头解析也改用同一个函数，避免「TCP 拒绝、UDP 放行」的分流绕过。
+
+### 四、验证与已知边界
+
+- `python tools/test-relay-udp-parser.py`：两份副本各 4 有效 + 7 无效 UDP 头用例、
+  2 有效 + 2 无效域名用例，全过；`py_compile` 通过。
+- `mihomo -t` 语法校验通过：修复包配置与**生成器实际产出的 YAML** 均退出码 0；
+  原始分层实测见 `docs/UDP丢包分层诊断-20261110.md` §7.3。
+- `tools/verify-tunconfig.ps1`：43 项结构断言 ALL PASS（含 7 条 1.1.0 新增断言）。
+- **本次未在本机做 A/B 复测**：这台机器正靠渡口上网且 mihomo 在跑（PID 30012），
+  按硬规则不重启客户端 / 不动 TUN。0% 丢包数据来自另一台机器（用户目录 26257）
+  的分层诊断报告；本机生效的 `tun-config.yaml` 仍是旧配置，升级后才会切到新路径。
+- 前置条件：远端 `ferry-socks5-server.py` 必须带 `--udp` 启动（默认关闭）；
+  服务端回复的 `BND.ADDR` 是 `0.0.0.0`，客户端须按控制连接对端地址还原（踩坑 84）。
+- 取舍：改成 `select` 后**有网时段国内 UDP 也会绕一趟远端**，不再走 DIRECT。
+  渡口的典型场景就是禁网时段、DIRECT 本来就不可用，故为净收益。
+- **已上线（2026-11-10 13:21）**：按 `AGENTS.md` 第四节完成门户分发、
+  服务端部署与真链路验收，逐项实测结果见下。
+  - 门户：4 个产物传到 pcs（`Ferry-Setup-1.1.0.exe`、`渡口助手.exe`、
+    `CHANGELOG.md`、`Ferry-Portable-1.1.0.zip`），hash 与本地逐一一致；
+    `/version.json` 返回 `1.1.0`，`/download-client` 200 / 202240 字节 /
+    `X-Ferry-Version: 1.1.0`，`/download-portable` 200 / 22626568 字节。
+    覆盖前已留备份 `client.exe.bak-20261110-1310`、
+    `CHANGELOG.md.bak-20261110-1310`。
+  - 自动更新验收：xt 测试机 `C:\ferry-update-test\渡口助手.exe /update`，
+    从 `1.0.2.0`（132608 字节）升到 `1.1.0.0`（202240 字节）；
+    `update-selftest.log` 七步齐全（查版本→下载→改名→复制→WMI 启动→退出旧进程），
+    **不是手工覆盖**。
+  - 服务端：`relay/ferry-socks5-server.py` 部署到
+    `C:\Users\PCserver\AppData\Local\Ferry\`，备份
+    `ferry-socks5-server.py.bak-20261110-1310`，重启后单实例、1080 LISTENING。
+    在线探测：正常 CONNECT 回 `05 00`；非法 IDNA 域名 `evil\xff.example`
+    立即回 `05 04` 并记日志「域名非法，拒绝 CONNECT」——修复确实生效。
+  - 注意：`wireguard/ferry-socks5-server.py` 是另一条线路的同名副本，
+    pcs 线上跑的是 `relay` 基线（已比对 hash），**本次只部署了实际在跑的那份**。
+  - 重启陷阱：`FerrySocks5` 任务带 `MultipleInstancesPolicy=IgnoreNew` 且
+    `RestartOnFailure Interval=PT1M`。`/Run` 裸调用会被忽略，自动拉起又要等约
+    1 分钟，短轮询会误判「起不来」并触发回滚。正确顺序是先 `/End` 清状态再
+    `/Run`，并按端口监听 + 真实 TCP 连接判定（不要只查进程）。
+- 本机可直接复用的回归入口：`python tools/test-relay-udp-parser.py`、
+  `powershell -ExecutionPolicy Bypass -File tools\verify-tunconfig.ps1`。
+
+---
+
 ## v1.0.63 — 2026-11-09
 
 > **修复渡口 UDP 丢包与关联统计异常。**

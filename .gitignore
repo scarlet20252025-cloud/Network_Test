@@ -39,6 +39,10 @@ __pycache__/
 # 构建产物（安装包 2 MB 一个版本，不入库；需要时用 ISCC 重编）
 dist/
 
+# 外部送来的 UDP 修复包：含 config.json（明文激活令牌）+ 61MB 二进制，
+# 且是另一台机器专用（远端地址/端口写死），只作参考，绝不入库。
+.incoming-udp-fix-20261110/
+
 # 代码签名私钥 —— 绝不入库（公钥 .cer 可以）
 installer/ferry-sign.pfx
 

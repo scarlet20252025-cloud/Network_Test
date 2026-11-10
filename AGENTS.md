@@ -42,9 +42,20 @@
 | `tools/verify-cfg-recovery.ps1` | **配置自愈**验证（卸载/重装后令牌能不能找回） | 动过 Config.cs / 安装器 |
 | `tools/verify-lifecycle.cs` | **借网生命周期**（反复启停、Clash 开关、UDP、残局） | 动过 FerryRuntime / Ferry.cs |
 | `tools/verify-scenarios.cs` | **分流场景矩阵**（接管/节点模式 × 有无代理 × 代理挂掉） | 动过 Proxy.cs 的分流 |
+| `tools/verify-fallback.cs` | **失败分类**（Line/Target）、第二跳结果、窗口汇总、探测静默 | 动过 ConnectSmart / ConnectSocks |
+| `tools/verify-regression-guard.cs` | **历史修复不变量**（fake-ip、26 条防回环、clash-egress、1.1.0 直连 UDP、严格 IDNA…） | 任何一次改分流前后都要跑 |
+| `tools/run-verify.ps1` | **统一验证入口**：把整个 `src\*.cs` 和验证器一起编 | 见下方说明 |
 | `tools/verify-updatecheck.cs` | **检查更新链路**（版本接口、窗口构造、版本比较） | 动过 SettingsWindow / Api |
 | `docs/分流架构.md` | **分流的三层结构、判定表、六次演进史** | 动 `Proxy.cs` 分流 / `TunMode.cs` 规则之前 |
 | `docs/` | 原理与踩坑（**先读**） | 每次踩新坑 |
+
+**验证器怎么跑（1.1.1 补）**：`verify.cmd` 只编 `Proxy.cs + CnIpRanges.cs`，
+凡引用 `FerryRuntime` / `TunMode` / `Cfg` 的验证器都会 CS0246。全套用
+`powershell -ExecutionPolicy Bypass -File tools\run-verify.ps1 -Name <验证器名>`。
+改分流前后各跑一遍并逐条对比结果，**基线里本来就红的项不算回归，但 PASS→FAIL
+一律算**。别为了让测试变绿去回滚实现：历史上 `verify-udp-group`（1.0.26 结论）、
+`verify-fakeip`（1.0.16 结论）、`verify-sharedup`（1.0.29 结论）都曾因为断言过期，
+反过来诱导人把后来修好的行为改回去。
 
 ## 二之二、Android 版（2026-10-29 起）
 
