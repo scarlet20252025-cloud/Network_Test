@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows;
+using System.Windows.Threading;
 
 namespace Ferry
 {
@@ -37,9 +38,20 @@ namespace Ferry
 
         const int SW_RESTORE = 9;
 
+        [System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+
         [STAThread]
         static void Main(string[] args)
         {
+            // 显式 AppUserModelID —— 任务栏图标的缓存 key 是「exe 路径 + AppID」。
+            // 不设 AppID 时系统按 exe 路径派生，**换掉 exe 里的图标也不会失效缓存**，
+            // 表现就是「界面全变了，任务栏还是青色双箭头」。给一个固定 AppID 后，
+            // 这条进程在任务栏里就是新条目，图标会重新从 exe / WM_SETICON 取。
+            // 必须在任何窗口创建前调用，且以后不能再改（否则每次启动都新建分组）。
+            try { SetCurrentProcessExplicitAppUserModelID("Ferry.Client.Desktop"); }
+            catch (Exception) { }
+
             var app = new Application();
             app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
@@ -61,6 +73,20 @@ namespace Ferry
                 }
                 catch (Exception) { }
             };
+            app.DispatcherUnhandledException += delegate (object s, System.Windows.Threading.DispatcherUnhandledExceptionEventArgs e)
+            {
+                // UI 线程异常默认会让进程整套退出 —— 一个按钮里漏个判空就「点一下软件没了」。
+                // 这里兜住并落盘：宁可界面某个功能失灵，也别让用户正在用的隧道直接断掉。
+                try
+                {
+                    File.AppendAllText(Path.Combine(appDir, "assistant.log"),
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " [UI异常] " +
+                        e.Exception + Environment.NewLine, new UTF8Encoding(false));
+                }
+                catch (Exception) { }
+                e.Handled = true;
+            };
+
             AppDomain.CurrentDomain.ProcessExit += delegate
             {
                 Trace2(appDir, "进程退出");

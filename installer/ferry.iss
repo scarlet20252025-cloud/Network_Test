@@ -32,7 +32,7 @@
 ; ═══════════════════════════════════════════════════════════════════════
 
 #define AppName "渡口 Ferry"
-#define AppVersion "1.1.1"
+#define AppVersion "1.2.6"
 #define AppExeName "渡口助手.exe"
 #define PortalBase "http://10.13.24.1:8080"
 
@@ -124,8 +124,10 @@ Source: "..\mihomo\wintun.dll";              DestDir: "{app}"; Flags: ignorevers
 Source: "..\vendor\mihomo.exe";              DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\渡口助手"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "在借网与直连之间切换"; Tasks: startmenuicon
-Name: "{autodesktop}\渡口助手";  Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "在借网与直连之间切换"; Tasks: desktopicon
+; AppUserModelID 必须和客户端 SetCurrentProcessExplicitAppUserModelID 里的字符串一致：
+; 固定到任务栏时系统按 AppID 归组，ID 对不上就会变成两个图标（旧图标 + 新图标）。
+Name: "{autoprograms}\渡口助手"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "在借网与直连之间切换"; AppUserModelID: "Ferry.Client.Desktop"; Tasks: startmenuicon
+Name: "{autodesktop}\渡口助手";  Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "在借网与直连之间切换"; AppUserModelID: "Ferry.Client.Desktop"; Tasks: desktopicon
 
 ; 注意：这里**故意没有** {userstartup} 的快捷方式。
 ;

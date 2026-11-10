@@ -20,7 +20,9 @@ namespace Ferry
     internal class FeedbackWindow : Window
     {
         readonly Cfg _cfg;
-        ComboBox _cmbKind;
+        readonly System.Collections.Generic.List<Button> _kindChips =
+            new System.Collections.Generic.List<Button>();
+        int _kindIndex;
         TextBox _txtContact, _txtBody;
         TextBlock _msg;
         Button _btnSend;
@@ -38,6 +40,8 @@ namespace Ferry
 
         void BuildUi()
         {
+            ScrollBars.EnsureInstalled();
+
             Title = "意见反馈";
             Width = 500;
             SizeToContent = SizeToContent.Height;
@@ -45,11 +49,21 @@ namespace Ferry
             WindowStartupLocation = WindowStartupLocation.CenterOwner;
             ResizeMode = ResizeMode.NoResize;
             Background = Palette.BgB;
+            // 125% / 150% 缩放下窗口内的 1px 线条和 12px 小字容易发虚，
+            // 打开布局取整 + 像素对齐会明显干净一些。
+            UseLayoutRounding = true;
+            SnapsToDevicePixels = true;
             FontFamily = new FontFamily(Palette.FontUI);
             FontSize = Palette.FsBody;
             Foreground = Palette.TextB;
 
-            var root = new StackPanel { Margin = new Thickness(22, 18, 22, 18) };
+            // 根容器必须自带背景：Window.Background 只画窗口表面，
+            // 离屏渲染（以及窗口刚创建的那一帧）拿到的是透明 → 一片白。
+            var root = new StackPanel
+            {
+                Margin = new Thickness(22, 18, 22, 18),
+                Background = Palette.BgB
+            };
             Content = root;
 
             root.Children.Add(new TextBlock
@@ -72,20 +86,38 @@ namespace Ferry
             root.Children.Add(new TextBlock
             {
                 Text = "反馈类型",
-                FontSize = Palette.FsSmall,
-                Foreground = Palette.MutedB,
+                FontSize = Palette.FsBody,
+                Foreground = Palette.TextB,
                 Margin = new Thickness(0, 0, 0, 4)
             });
-            _cmbKind = new ComboBox { FontSize = Palette.FsBody, Padding = new Thickness(6, 4, 6, 4) };
-            foreach (var k in Kinds) _cmbKind.Items.Add(k);
-            _cmbKind.SelectedIndex = 0;
-            root.Children.Add(_cmbKind);
+            // 原来用 ComboBox：默认模板的下拉是白底，配深色主题就是白底白字，
+            // 整块看不清。改成一排胶囊按钮，选中态自己画，颜色完全可控。
+            var chips = new WrapPanel();
+            root.Children.Add(chips);
+            for (int i = 0; i < Kinds.Length; i++)
+            {
+                int idx = i;
+                var chip = new Button
+                {
+                    Content = Kinds[i],
+                    FontSize = Palette.FsTiny,
+                    Padding = new Thickness(10, 5, 10, 5),
+                    Margin = new Thickness(0, 0, 6, 6),
+                    Cursor = System.Windows.Input.Cursors.Hand,
+                    BorderThickness = new Thickness(1)
+                };
+                Ui.Round(chip, 8);
+                chip.Click += delegate { SelectKind(idx); };
+                chips.Children.Add(chip);
+                _kindChips.Add(chip);
+            }
+            SelectKind(0);
 
             root.Children.Add(new TextBlock
             {
                 Text = "联系方式（选填，方便回复你）",
-                FontSize = Palette.FsSmall,
-                Foreground = Palette.MutedB,
+                FontSize = Palette.FsBody,
+                Foreground = Palette.TextB,
                 Margin = new Thickness(0, 12, 0, 4)
             });
             _txtContact = new TextBox
@@ -93,15 +125,18 @@ namespace Ferry
                 FontSize = Palette.FsBody,
                 Padding = new Thickness(8, 6, 8, 6),
                 BorderBrush = Palette.Line2B,
-                BorderThickness = new Thickness(1)
+                BorderThickness = new Thickness(1),
+                Background = Palette.Card2B,
+                Foreground = Palette.TextB,
+                CaretBrush = Palette.TextB
             };
             root.Children.Add(_txtContact);
 
             root.Children.Add(new TextBlock
             {
                 Text = "详细描述",
-                FontSize = Palette.FsSmall,
-                Foreground = Palette.MutedB,
+                FontSize = Palette.FsBody,
+                Foreground = Palette.TextB,
                 Margin = new Thickness(0, 12, 0, 4)
             });
             _txtBody = new TextBox
@@ -113,16 +148,20 @@ namespace Ferry
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 Padding = new Thickness(8, 6, 8, 6),
                 BorderBrush = Palette.Line2B,
-                BorderThickness = new Thickness(1)
+                BorderThickness = new Thickness(1),
+                Background = Palette.Card2B,
+                Foreground = Palette.TextB,
+                CaretBrush = Palette.TextB
             };
+            ScrollBars.ApplyTo(_txtBody);
             root.Children.Add(_txtBody);
 
             // 附件
             root.Children.Add(new TextBlock
             {
                 Text = "截图或文件（选填，可多选）",
-                FontSize = Palette.FsSmall,
-                Foreground = Palette.MutedB,
+                FontSize = Palette.FsBody,
+                Foreground = Palette.TextB,
                 Margin = new Thickness(0, 12, 0, 4)
             });
 
@@ -180,7 +219,7 @@ namespace Ferry
                 Padding = new Thickness(28, 8, 28, 8),
                 BorderThickness = new Thickness(0),
                 Background = Palette.AccentB,
-                Foreground = Brushes.White,
+                Foreground = Palette.OnAccentB,
                 Cursor = System.Windows.Input.Cursors.Hand
             };
             _btnSend.Click += delegate { DoSend(); };
@@ -200,6 +239,22 @@ namespace Ferry
             };
             btnCancel.Click += delegate { Close(); };
             btnRow.Children.Add(btnCancel);
+        }
+
+
+        /// <summary>胶囊选中态：选中的填主色，其余描边透明底。</summary>
+        void SelectKind(int index)
+        {
+            _kindIndex = index;
+            for (int i = 0; i < _kindChips.Count; i++)
+            {
+                var b = _kindChips[i];
+                bool on = i == index;
+                b.Background = on ? Palette.AccentB : Brushes.Transparent;
+                b.Foreground = on ? Palette.OnAccentB : Palette.TextB;
+                b.BorderBrush = on ? Palette.AccentB : Palette.Line2B;
+                b.FontWeight = on ? FontWeights.SemiBold : FontWeights.Normal;
+            }
         }
 
         void PickFiles()
@@ -245,7 +300,7 @@ namespace Ferry
                 return;
             }
 
-            var kind = KindKeys[Math.Max(0, Math.Min(KindKeys.Length - 1, _cmbKind.SelectedIndex))];
+            var kind = KindKeys[Math.Max(0, Math.Min(KindKeys.Length - 1, _kindIndex))];
             var contact = (_txtContact.Text ?? "").Trim();
 
             _btnSend.IsEnabled = false;

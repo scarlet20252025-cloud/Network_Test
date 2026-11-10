@@ -56,6 +56,13 @@ $refs = @(
 $icon = Join-Path $here 'app.ico'
 $iconArg = if (Test-Path $icon) { "/win32icon:$icon" } else { '' }
 
+# 侧栏头像内嵌进 exe：不能依赖安装目录里恰好有这个文件（丢了会静默降级成色块）
+$avatar = Join-Path $here 'avatar.png'
+$resArg = if (Test-Path $avatar) { "/resource:$avatar,avatar.png" } else { '' }
+
+# 图标也内嵌一份：托盘运行时优先读这个，不再依赖安装目录的 app.ico
+$icoResArg = if (Test-Path $icon) { "/resource:$icon,app.ico" } else { '' }
+
 $manifest = Join-Path $here 'src\app.manifest'
 if (-not (Test-Path $manifest)) { throw "缺少 manifest：$manifest" }
 
@@ -63,11 +70,18 @@ $cscArgs = @(
   '/nologo', '/target:winexe', "/out:$out", '/codepage:65001',
   '/optimize+', '/platform:anycpu', '/warn:2',
   "/win32manifest:$manifest"
-) + $refs + @($iconArg, '') + $srcs
+) + $refs + @($iconArg, $resArg, $icoResArg, '') + $srcs
 $cscArgs = $cscArgs | Where-Object { $_ -ne '' }
 
-& $csc $cscArgs
-if ($LASTEXITCODE -ne 0) { throw "编译失败（exit $LASTEXITCODE）" }
+& $csc $cscArgs 2>&1 | Tee-Object -Variable cscOut | Out-Host
+if ($LASTEXITCODE -ne 0) {
+  # csc 的错误有时只在管道里出现一次，滚动后就看不到了 —— 落一份文件，
+  # 排查时直接看 build-error.log，不用重跑一遍慢慢翻屏。
+  $log = Join-Path $root 'scratch\build-error.log'
+  New-Item -ItemType Directory -Force (Split-Path $log) | Out-Null
+  [IO.File]::WriteAllText($log, ($cscOut | Out-String), (New-Object Text.UTF8Encoding $true))
+  throw "编译失败（exit $LASTEXITCODE），详情见 $log"
+}
 
 $f = Get-Item $out
 Write-Host ("Compiled: " + $f.FullName + "  (" + $f.Length + " bytes)")

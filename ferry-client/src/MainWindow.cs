@@ -8,7 +8,13 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
+using System.Windows.Input;
+using System.Windows.Interop;
+using Ellipse = System.Windows.Shapes.Ellipse;
+using System.Windows.Shell;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using WF = System.Windows.Forms;
 
@@ -43,16 +49,29 @@ namespace Ferry
         // ── 界面元素 ──
         TextBlock _lblAcct, _lblBig, _lblDesc, _lblQuota;
         TextBlock _lblVer;
+        TextBlock _lblUpdState;
+        Button _btnCheckUpdate;
         TextBlock _rowBridge, _rowProxy, _rowTun;
         Border _card;
         TextBlock _lblActTitle, _lblActHint;
         TextBox _txtCode;
-        Button _btnActivate, _btnOn, _btnOff, _btnRefresh, _btnSettings, _btnUpd, _btnGlobal;
+        Button _btnActivate, _btnOn, _btnOff, _btnSettings, _btnUpd, _btnGlobal;
         TextBlock _rowHotspot;
         ToggleSwitch _swHotspot;
         TextBox _log;
         Border _actCard;
-        StackPanel _mainStack;
+
+        // ── 1.2.0 新界面：侧栏 + 分页 ──
+        NavRail _nav;
+        Grid _pageHost;
+        TextBlock _lblPageTitle, _lblPageHint;
+        StackPanel _actionHost;
+        FrameworkElement _pageTunnel, _pageLog, _pageSpeed, _pageSettings, _pageAbout;
+        Button _btnLogClear, _btnSpeedRun, _btnSaveSettings;
+        SpeedTestView _speed;
+        TextBlock _speedSummary;
+        SettingsView _settingsView;
+        bool _noAnim;
 
         // ── 定时器 ──
         DispatcherTimer _fast, _slow, _hbTimer, _licTimer;
@@ -113,11 +132,16 @@ namespace Ferry
             _logPath = Path.Combine(appDir, "assistant.log");
             _cfg = Cfg.Load(cfgPath);
 
+            // 必须在建界面之前：这条隐式样式只管 FocusVisualStyle，
+            // 建完再装的话已经创建好的按钮不会重新应用。
+            Ui.InstallNoFocusRing();
+
             BuildUi();
             BuildTray();
 
             Loaded += delegate
             {
+                if (!_noAnim) StartWindowFadeIn();
                 Kickoff();
                 if (_cfg.StartMinimized) { Hide(); }
                 if (StartBorrowOnLoad) { Dispatcher.BeginInvoke(new Action(delegate { DoStart(); })); }
@@ -130,109 +154,465 @@ namespace Ferry
         // 全部用 StackPanel / Grid —— 高度由内容决定，不写死任何一个数字。
         // 这是与 WinForms 版最本质的区别。
 
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y,
+                                        int cx, int cy, uint flags);
+
+        const int WM_SETICON = 0x0080;
+        const int ICON_SMALL = 0;
+        const int ICON_BIG = 1;
+        const int ICON_SMALL2 = 2;
+        const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002;
+        const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010, SWP_FRAMECHANGED = 0x0020;
+
+        // HICON 必须由字段持有。局部 Icon 一旦被回收，句柄就失效，
+        // 任务栏会退回系统默认图标 —— 这类「换图标不生效」有一半是这个原因。
+        System.Drawing.Icon _winBigIcon, _winSmallIcon;
+
+        /// <summary>把内嵌 app.ico 以原生 WM_SETICON 方式贴到窗口上（大/小/小2 三个槽位）。</summary>
+        void ApplyNativeWindowIcon()
+        {
+            try
+            {
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                using (var st = asm.GetManifestResourceStream("app.ico"))
+                {
+                    if (st == null) return;
+                    var bytes = new byte[st.Length];
+                    int off = 0;
+                    while (off < bytes.Length)
+                    {
+                        int n = st.Read(bytes, off, bytes.Length - off);
+                        if (n <= 0) break;
+                        off += n;
+                    }
+
+                    var hwnd = new WindowInteropHelper(this).Handle;
+                    if (hwnd == IntPtr.Zero) return;
+
+                    _winBigIcon = new System.Drawing.Icon(new MemoryStream(bytes),
+                                                          new System.Drawing.Size(32, 32));
+                    _winSmallIcon = new System.Drawing.Icon(new MemoryStream(bytes),
+                                                            new System.Drawing.Size(16, 16));
+
+                    SendMessage(hwnd, WM_SETICON, (IntPtr)ICON_BIG, _winBigIcon.Handle);
+                    SendMessage(hwnd, WM_SETICON, (IntPtr)ICON_SMALL, _winSmallIcon.Handle);
+                    SendMessage(hwnd, WM_SETICON, (IntPtr)ICON_SMALL2, _winSmallIcon.Handle);
+
+                    // 不改几何，只让窗口框架重画一次，标题栏图标立刻跟着换。
+                    SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                }
+            }
+            catch (Exception) { }
+        }
+
         void BuildUi()
         {
+            ScrollBars.EnsureInstalled();
+
             Title = "渡口 Ferry";
-            Width = 520;
-            Height = 780;
-            MinWidth = 520;
-            MinHeight = 600;
+
+            // WPF 层的图标：标题栏、Alt-Tab 预览、任务栏跳转列表都用它。
+            try
+            {
+                using (var st = System.Reflection.Assembly.GetExecutingAssembly()
+                           .GetManifestResourceStream("app.ico"))
+                {
+                    if (st != null)
+                    {
+                        // 取 32×32 那一帧，别直接用「最大帧」——
+                        // Icon(stream) 会拿 256×256，缩放给 16px 用时又糊又慢。
+                        using (var ico = new System.Drawing.Icon(st, new System.Drawing.Size(32, 32)))
+                        {
+                            Icon = Imaging.CreateBitmapSourceFromHIcon(
+                                ico.Handle, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+
+            // 窗口句柄一创建就再发一次原生 WM_SETICON。
+            // 只设 WPF 的 Window.Icon 不够：任务栏按钮取的是 ICON_BIG，
+            // 而系统在 AppID 未变时会沿用旧的图标缓存（实测更新 exe 后仍是旧图标）。
+            SourceInitialized += delegate { ApplyNativeWindowIcon(); };
+
+            Width = Palette.WinW;
+            Height = Palette.WinH;
+            MinWidth = Palette.MinW;
+            MinHeight = Palette.MinH;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             Background = Palette.BgB;
             FontFamily = new FontFamily(Palette.FontUI);
             FontSize = Palette.FsBody;
             Foreground = Palette.TextB;
-            ResizeMode = ResizeMode.CanMinimize;
 
-            // 主界面**整页不滚动**：内容本来就装得下 780 高，加滚动容器只会
-            // 在右侧留一条永远不用的竖条（用户 2026-10-28 明确要求去掉）。
-            //
-            // 之前是 ScrollViewer + Auto（Auto = 高出 1 像素就画条），后来改 Hidden
-            // 只是「看不见但还能滚」—— 用户要的是「不要滚动这件事本身」。
-            //
-            // 现在内容直接放进窗口。为防内容超出（不同 DPI / 字体），
-            // 下面日志框用可伸缩高度（见 _log 的 Height 与 logCard 的 MinHeight），
-            // 由 Grid 分配剩余空间，而不是靠滚动条兜底。
-            //
-            // 日志框内部仍然有自己的滚动条（那是终端区域，用户说不用动）。
-            _mainStack = new StackPanel { Margin = new Thickness(20, 16, 20, 12) };
-            Content = _mainStack;
+            // 自绘标题栏（参考的启动器就是无系统边框的）。用 WindowChrome 而
+            // 不是 AllowsTransparency：后者会关掉硬件加速，而这个界面每秒都在
+            // 刷新状态，掉帧很明显。CaptionHeight=0 表示拖动由我们自己处理，
+            // ResizeBorderThickness 保留系统级的边缘缩放和贴边。
+            WindowStyle = WindowStyle.None;
+            ResizeMode = ResizeMode.CanResize;
+            WindowChrome.SetWindowChrome(this, new WindowChrome
+            {
+                CaptionHeight = 0,
+                ResizeBorderThickness = new Thickness(6),
+                GlassFrameThickness = new Thickness(0),
+                CornerRadius = new CornerRadius(0),
+                UseAeroCaptionButtons = false
+            });
 
-            // ── 顶部：标题 + 账号 ──
-            var header = new Grid { Margin = new Thickness(0, 0, 0, 14) };
+            var shell = new Grid();
+            // 根容器必须有背景：Window 的 Background 只画窗口表面，
+            // 离屏渲染（RenderTargetBitmap 渲染的是 Content）时透明区会变成黑块
+            // —— 深色主题下整条标题带发黑就是这么来的。
+            shell.Background = Palette.ShellBgB;
+            // 必须显式给一行 Star：不写行定义时 Grid 用 Auto 行，
+            // 没有内容的 Border（下面两团光斑）会被量成 0 高，整层等于不存在。
+            shell.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            shell.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(Palette.SideW) });
+            shell.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            Content = shell;
+
+            // 右上角一团极淡的环境光。放在最底层、不参与命中测试，
+            // 侧栏是半透明的，所以这团光也会轻微透到导航栏上，整块看起来是一张纸。
+            var glow = new Border
+            {
+                Background = Palette.GlowB,
+                IsHitTestVisible = false
+            };
+            Grid.SetColumnSpan(glow, 2);
+            shell.Children.Add(glow);
+
+            var glowCool = new Border
+            {
+                Background = Palette.GlowCoolB,
+                IsHitTestVisible = false
+            };
+            Grid.SetColumnSpan(glowCool, 2);
+            shell.Children.Add(glowCool);
+
+            // ── 左侧导航 ──
+            _nav = new NavRail(
+                new[] { "隧道", "日志", "测速", "设置", "关于" },
+                new[] { Icons.Tunnel, Icons.Log, Icons.Speed, Icons.Settings, Icons.About });
+            _nav.PageChanged += OnPageChanged;
+            _lblAcct = _nav.AccountLabel;      // 账号显示在侧栏底部
+            Grid.SetColumn(_nav, 0);
+            shell.Children.Add(_nav);
+
+            // ── 右侧：标题行 + 页面 ──
+            var main = new Grid();
+            main.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            main.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            Grid.SetColumn(main, 1);
+            shell.Children.Add(main);
+
+            var header = new Grid { Margin = new Thickness(Palette.ContentPad, 16, 18, 10) };
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            _mainStack.Children.Add(header);
+            header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            // 拖动挂在**整窗**上，不再只挂标题行：
+            // 之前只有标题那一块能拖，标题上方的 16px 和左侧整条侧栏都拖不动，
+            // 用户实际是想「按住窗口任何空白处就能挪」。交互控件（按钮、输入框、
+            // 导航项）会自己把按下事件吃掉，所以不会误拖。
+            shell.MouseLeftButtonDown += delegate (object s, MouseButtonEventArgs e)
+            {
+                if (e.ButtonState == MouseButtonState.Pressed) DragMove();
+            };
+            Grid.SetRow(header, 0);
+            main.Children.Add(header);
 
-            var titleStack = new StackPanel();
+            var titleStack = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            _lblPageTitle = Ui.H1("隧道");
+            titleStack.Children.Add(_lblPageTitle);
+            _lblPageHint = Ui.Sub("连接状态与出口");
+            titleStack.Children.Add(_lblPageHint);
             Grid.SetColumn(titleStack, 0);
             header.Children.Add(titleStack);
 
-            titleStack.Children.Add(new TextBlock
+            _actionHost = new StackPanel
             {
-                Text = "渡口",
-                FontSize = Palette.FsTitle,
-                FontWeight = FontWeights.Bold,
-                Foreground = Palette.TextB
-            });
-            titleStack.Children.Add(new TextBlock
-            {
-                Text = "内网应急接入 · 断网时借一台能出网的主机中转",
-                FontSize = Palette.FsSmall,
-                Foreground = Palette.MutedB,
-                TextWrapping = TextWrapping.Wrap,
-                Margin = new Thickness(0, 2, 0, 0)
-            });
-
-            var rightStack = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
-            Grid.SetColumn(rightStack, 1);
-            header.Children.Add(rightStack);
-
-            _lblAcct = new TextBlock
-            {
-                Text = "",
-                FontSize = Palette.FsSmall,
-                Foreground = Palette.MutedB,
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center,
                 HorizontalAlignment = HorizontalAlignment.Right
             };
-            rightStack.Children.Add(_lblAcct);
+            Grid.SetColumn(_actionHost, 1);
+            header.Children.Add(_actionHost);
 
-            _btnUpd = MakeButton("更新", false, 0);
+            // 更新按钮常驻在标题行：任何时候发现新版本都看得见，
+            // 不用先切到「关于」页（用户以前抱怨过「更新按钮藏起来了」）。
+            _btnUpd = Ui.Primary("更新", 16, 7);
             _btnUpd.FontSize = Palette.FsSmall;
-            _btnUpd.Padding = new Thickness(12, 4, 12, 4);
-            _btnUpd.Margin = new Thickness(0, 6, 0, 0);
             _btnUpd.Visibility = Visibility.Collapsed;
+            _btnUpd.Margin = new Thickness(0, 0, 10, 0);
             _btnUpd.Click += delegate
             {
                 if (_latestVer.Length == 0) { Log("[更新] 还没拿到版本号，忽略点击"); return; }
                 DoUpdate(_latestVer);
             };
-            rightStack.Children.Add(_btnUpd);
+            _actionHost.Children.Add(_btnUpd);
 
-            // 版本号常驻显示（用户要求：放在更新按钮下面，任何时候都能看到）。
-            // 以前只有设置页里能看到版本，排查「他装的是哪一版」得让他去翻设置。
-            _lblVer = new TextBlock
+            var winBtns = new StackPanel
             {
-                Text = "v" + typeof(MainWindow).Assembly.GetName().Version.ToString(3),
-                FontSize = Palette.FsSmall,
-                Foreground = Palette.MutedB,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Margin = new Thickness(0, 4, 0, 0)
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
             };
-            rightStack.Children.Add(_lblVer);
+            Grid.SetColumn(winBtns, 2);
+            header.Children.Add(winBtns);
+
+            var btnMin = WinButton(Icons.Minus);
+            btnMin.Click += delegate { WindowState = WindowState.Minimized; };
+            winBtns.Children.Add(btnMin);
+
+            var btnClose = WinButton(Icons.Close);
+            btnClose.Margin = new Thickness(6, 0, 0, 0);
+            btnClose.Click += delegate { Close(); };   // 关闭 = 收托盘，见 OnWindowClosing
+            winBtns.Children.Add(btnClose);
+
+            // ── 页面容器 ──
+            _pageHost = new Grid
+            {
+                Margin = new Thickness(Palette.ContentPad, 0, Palette.ContentPad, 20)
+            };
+            Grid.SetRow(_pageHost, 1);
+            main.Children.Add(_pageHost);
+
+            BuildPageButtons();
+            BuildTunnelPage();
+            BuildLogPage();
+            BuildSpeedPage();
+            BuildSettingsPage();
+            BuildAboutPage();
+
+            _pageHost.Children.Add(_pageTunnel);
+            _pageHost.Children.Add(_pageLog);
+            _pageHost.Children.Add(_pageSpeed);
+            _pageHost.Children.Add(_pageSettings);
+            _pageHost.Children.Add(_pageAbout);
+
+            Closing += OnWindowClosing;
+            _nav.Select(0);
+        }
+
+        /// <summary>开窗淡入：160ms 从 0.2 到 1，避免第一帧硬闪一下。</summary>
+        void StartWindowFadeIn()
+        {
+            Opacity = 0;
+            BeginAnimation(UIElement.OpacityProperty,
+                new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(170)));
+        }
+
+        /// <summary>离屏渲染工具（tools/ui-shot）切页用，运行时不调用。</summary>
+        public void SelectPageForShot(int index)
+        {
+            _noAnim = true;                     // 别截到动画中间态
+            if (_nav != null) _nav.Select(index);
+        }
+
+        /// <summary>
+        /// 自检：在**直连状态**下真的走一遍「一键测试」的点击处理器。
+        ///
+        /// 这条路径 1.2.4 及以前会崩：处理器里写的是 `!_rt.Running`，而直连时
+        /// _rt 是 null → NullReferenceException → WPF 不接 → 进程整套退出。
+        /// 借网状态下 _rt 不为 null，所以自测时永远碰不到，只能靠这个入口复现。
+        ///
+        /// 返回界面日志文本，调用方可据此确认处理器真的跑到了 RunAll 之前那步。
+        /// </summary>
+        public string SelfTestSpeedClick()
+        {
+            if (_btnSpeedRun == null) return "(没有一键测试按钮)";
+            _btnSpeedRun.RaiseEvent(new RoutedEventArgs(
+                System.Windows.Controls.Primitives.ButtonBase.ClickEvent, _btnSpeedRun));
+            return _log == null ? "" : _log.Text;
+        }
+
+        /// <summary>
+        /// 自检：真的点一次「检查更新」，把状态文字回给调用方。
+        ///
+        /// 1.2.5 及以前这条路径没有可见反馈 —— 没新版本或连不上门户时直接 return，
+        /// 界面上唯一的变化是按钮多出一圈焦点虚线框，看起来就是「点了没用」。
+        /// 这里要断言点完之后状态文字**非空**：空字符串就是那个 bug 复发了。
+        /// </summary>
+        public string SelfTestUpdateClick()
+        {
+            if (_btnCheckUpdate == null) return "(没有检查更新按钮)";
+            _btnCheckUpdate.RaiseEvent(new RoutedEventArgs(
+                System.Windows.Controls.Primitives.ButtonBase.ClickEvent, _btnCheckUpdate));
+            return _lblUpdState == null ? "" : (_lblUpdState.Text ?? "");
+        }
+
+        /// <summary>离屏渲染时灌几行长日志，用来检查自动换行与滚动条外观。</summary>
+        public void FillLogForShot()
+        {
+            for (int i = 1; i <= 12; i++)
+                Log("2026-11-10 16:58:" + (10 + i) + "  [样例] 第 " + i +
+                    " 行日志：这是一条比较长的机器输出，用来确认日志区会自动换行、不再出现横向滚动条，" +
+                    "并且右侧滚动条是细的圆角样式。");
+        }
+
+        /// <summary>离屏渲染时跑一次状态回写，让截图里是真实文案而不是「检查中」。</summary>
+        public void RefreshForShot()
+        {
+            try { RefreshUi(); } catch (Exception) { }
+        }
+
+        /// <summary>标题行右侧的窗口按钮（最小化 / 关闭）。</summary>
+        static Button WinButton(string icon)
+        {
+            var b = new Button
+            {
+                Width = 30,
+                Height = 26,
+                Cursor = Cursors.Hand,
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Content = Icons.Make(icon, Palette.MutedB, 13)
+            };
+            var t = new ControlTemplate(typeof(Button));
+            var bd = new FrameworkElementFactory(typeof(Border));
+            bd.SetValue(Border.BackgroundProperty, Brushes.Transparent);
+            var cp = new FrameworkElementFactory(typeof(ContentPresenter));
+            cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+            cp.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+            bd.AppendChild(cp);
+            t.VisualTree = bd;
+            b.Template = t;
+            return b;
+        }
+
+        // ══════════════════════ 页面按钮（只建一次，切换时挂到标题行） ══════════════════════
+
+        void BuildPageButtons()
+        {
+            _btnLogClear = Ui.Secondary("清空日志", 14, 7);
+            _btnLogClear.FontSize = Palette.FsSmall;
+            _btnLogClear.Click += delegate { try { _log.Clear(); } catch (Exception) { } Log("日志已清空"); };
+
+            _btnSpeedRun = Ui.Primary("一键测试", 18, 7);
+            _btnSpeedRun.FontSize = Palette.FsSmall;
+            _btnSpeedRun.Click += delegate
+            {
+                // ⚠ 这里原来写的是 `!_rt.Running`，**没判空**。
+                // 直连状态下 _rt 是 null（从未开始借网），点一下就是 NullReferenceException，
+                // 而这个异常抛在按钮 Click 里 —— WPF 不接，进程整套退出。
+                // 借网时 _rt 不为 null，所以只在这个路径崩，很难靠借网自测发现。
+                var rt = _rt;
+                if (rt == null || !rt.Running)
+                    Log("当前是直连，测的是不经渡口的裸链路；开始借网后再测可对比");
+                try { _speed.RunAll(); }
+                catch (Exception ex) { Log("测速启动失败：" + ex.Message); }
+            };
+
+            _btnSaveSettings = Ui.Primary("保存设置", 18, 7);
+            _btnSaveSettings.FontSize = Palette.FsSmall;
+            _btnSaveSettings.Click += delegate
+            {
+                if (_settingsView != null && _settingsView.Apply()) Log("设置已保存");
+            };
+
+            // 旧界面遗留的「设置」按钮：保留字段（RefreshUi 会设它的 IsEnabled），
+            // 但不再挂到任何容器上 —— 设置入口已经换成侧栏导航。
+            _btnSettings = Ui.Secondary("设置", 14, 7);
+            _btnSettings.Visibility = Visibility.Collapsed;
+        }
+
+        void OnPageChanged(int index)
+        {
+            var pages = new FrameworkElement[] { _pageTunnel, _pageLog, _pageSpeed, _pageSettings, _pageAbout };
+            for (int i = 0; i < pages.Length; i++)
+                pages[i].Visibility = i == index ? Visibility.Visible : Visibility.Collapsed;
+
+            string[] titles = { "隧道", "日志", "测速", "设置", "关于" };
+            string[] hints =
+            {
+                "连接状态、出口与共享方式",
+                "运行日志与诊断信息",
+                "固定站点的延迟与失败率",
+                "沿用渡口原有的设置项",
+                "版本、更新与说明"
+            };
+            _lblPageTitle.Text = titles[index];
+            _lblPageHint.Text = hints[index];
+
+            // 标题行只保留更新按钮，其余按页挂载
+            while (_actionHost.Children.Count > 1) _actionHost.Children.RemoveAt(1);
+            switch (index)
+            {
+                case 1: _actionHost.Children.Add(_btnLogClear); break;
+                case 2: _actionHost.Children.Add(_btnSpeedRun); break;
+                case 3: _actionHost.Children.Add(_btnSaveSettings); break;
+            }
+
+            if (index == 1) { try { _log.ScrollToEnd(); } catch (Exception) { } }
+
+            AnimateIn(pages[index]);
+        }
+
+        /// <summary>
+        /// 切页动效：新页面淡入 + 从右侧滑进 14px，200ms EaseOut。
+        ///
+        /// 只改不透明度和平移，**不改尺寸** —— 改尺寸会触发整页重新测量，
+        /// 日志那种几千行的 TextBox 重新折行要几十毫秒，看起来就是卡一下。
+        /// 离屏渲染（tools/ui-shot）会把 _noAnim 打开，否则截到动画中间态。
+        /// </summary>
+        void AnimateIn(FrameworkElement page)
+        {
+            if (page == null) return;
+
+            if (_noAnim)
+            {
+                page.Opacity = 1;
+                var reset = page.RenderTransform as TranslateTransform;
+                if (reset != null) reset.X = 0;
+                return;
+            }
+
+            var tt = page.RenderTransform as TranslateTransform;
+            if (tt == null)
+            {
+                tt = new TranslateTransform();
+                page.RenderTransform = tt;
+            }
+            var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+            var dur = TimeSpan.FromMilliseconds(200);
+            page.BeginAnimation(UIElement.OpacityProperty,
+                new DoubleAnimation(0, 1, dur) { EasingFunction = ease });
+            tt.BeginAnimation(TranslateTransform.XProperty,
+                new DoubleAnimation(14, 0, dur) { EasingFunction = ease });
+        }
+
+        // ══════════════════════ 隧道 ══════════════════════
+
+        void BuildTunnelPage()
+        {
+            var root = new StackPanel();
+            _pageTunnel = root;
 
             // ── 状态卡 ──
             _card = MakeCard();
-            _mainStack.Children.Add(_card);
+            root.Children.Add(_card);
 
             var cardStack = new StackPanel();
             _card.Child = cardStack;
+
+            cardStack.Children.Add(new TextBlock
+            {
+                Text = "当前状态",
+                FontSize = Palette.FsTiny,
+                Foreground = Palette.MutedB,
+                Margin = new Thickness(0, 0, 0, 4)
+            });
 
             _lblBig = new TextBlock
             {
                 Text = "检查中",
                 FontSize = Palette.FsBig,
-                FontWeight = FontWeights.Bold,
+                FontWeight = FontWeights.SemiBold,
                 Foreground = Palette.MutedB,
                 TextWrapping = TextWrapping.Wrap,
                 Margin = new Thickness(0, 0, 0, 6)
@@ -244,7 +624,7 @@ namespace Ferry
                 Text = "",
                 FontSize = Palette.FsBody,
                 Foreground = Palette.MutedB,
-                TextWrapping = TextWrapping.Wrap,      // ← 自动换行，高度自动
+                TextWrapping = TextWrapping.Wrap,
                 Margin = new Thickness(0, 0, 0, 8)
             };
             cardStack.Children.Add(_lblDesc);
@@ -258,10 +638,17 @@ namespace Ferry
             };
             cardStack.Children.Add(_lblQuota);
 
+            cardStack.Children.Add(new Border
+            {
+                Height = 1,
+                Background = Palette.LineB,
+                Margin = new Thickness(0, 2, 0, 12)
+            });
+
             _rowBridge = MakeRow(cardStack);
             _rowProxy = MakeRow(cardStack);
 
-            // 「全局模式」行：左边文字 + 右边按钮，用 Grid 自动分配
+            // 「全局模式」行
             var tunRow = new Grid { Margin = new Thickness(0, 4, 0, 0) };
             tunRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             tunRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -286,13 +673,8 @@ namespace Ferry
             Grid.SetColumn(_btnGlobal, 1);
             tunRow.Children.Add(_btnGlobal);
 
-            // ── 移动热点行（两段式拨动开关）──
-            //
-            // 为什么放在全局模式下面：这两个是「共享出口」的两种形态 ——
-            // 全局模式解决「本机程序不认代理」，热点解决「别的设备也要上网」。
-            // 热点共享的是本机当前出口（全局模式下就是 FerryTun），
-            // 所以摆在它旁边最符合直觉。
-            var hsRow = new Grid { Margin = new Thickness(0, 8, 0, 0) };
+            // 「移动热点」行
+            var hsRow = new Grid { Margin = new Thickness(0, 10, 0, 0) };
             hsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             hsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             cardStack.Children.Add(hsRow);
@@ -314,10 +696,31 @@ namespace Ferry
             Grid.SetColumn(_swHotspot, 1);
             hsRow.Children.Add(_swHotspot);
 
+            // ── 主按钮 ──
+            var btnRow = new Grid { Margin = new Thickness(0, 14, 0, 0) };
+            btnRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            btnRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(12) });
+            btnRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            root.Children.Add(btnRow);
+
+            _btnOn = MakeButton("开始借网", true, 0);
+            _btnOn.FontSize = 14;
+            _btnOn.Padding = new Thickness(0, 11, 0, 11);
+            _btnOn.Click += delegate { DoStart(); };
+            Grid.SetColumn(_btnOn, 0);
+            btnRow.Children.Add(_btnOn);
+
+            _btnOff = MakeButton("停止并恢复直连", false, 0);
+            _btnOff.FontSize = 14;
+            _btnOff.Padding = new Thickness(0, 11, 0, 11);
+            _btnOff.Click += delegate { DoStop(); };
+            Grid.SetColumn(_btnOff, 2);
+            btnRow.Children.Add(_btnOff);
+
             // ── 激活卡 ──
             _actCard = MakeCard();
-            _actCard.Margin = new Thickness(0, 12, 0, 0);
-            _mainStack.Children.Add(_actCard);
+            _actCard.Margin = new Thickness(0, 14, 0, 0);
+            root.Children.Add(_actCard);
 
             var actStack = new StackPanel();
             _actCard.Child = actStack;
@@ -340,9 +743,10 @@ namespace Ferry
             {
                 FontFamily = new FontFamily(Palette.FontMono),
                 FontSize = 15,
-                Padding = new Thickness(10, 7, 10, 7),
-                BorderBrush = Palette.Line2B,
-                BorderThickness = new Thickness(1),
+                Padding = new Thickness(10, 8, 10, 8),
+                BorderThickness = new Thickness(0),
+                Background = Brushes.Transparent,
+                CaretBrush = Palette.TextB,
                 CharacterCasing = CharacterCasing.Upper,
                 MaxLength = 16,
                 HorizontalContentAlignment = HorizontalAlignment.Center,
@@ -352,8 +756,16 @@ namespace Ferry
             {
                 if (e.Key == System.Windows.Input.Key.Enter) { e.Handled = true; DoInlineActivate(); }
             };
-            Grid.SetColumn(_txtCode, 0);
-            actRow.Children.Add(_txtCode);
+            var codeBox = new Border
+            {
+                Background = Palette.Card2B,
+                BorderBrush = Palette.Line2B,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(9),
+                Child = _txtCode
+            };
+            Grid.SetColumn(codeBox, 0);
+            actRow.Children.Add(codeBox);
 
             _btnActivate = MakeButton("激活", true, 0);
             _btnActivate.Padding = new Thickness(20, 7, 20, 7);
@@ -372,92 +784,244 @@ namespace Ferry
             };
             actStack.Children.Add(_lblActHint);
 
-            // ── 主按钮 ──
-            var btnRow = new Grid { Margin = new Thickness(0, 14, 0, 0) };
-            btnRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            btnRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(12) });
-            btnRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            _mainStack.Children.Add(btnRow);
+            root.Children.Add(new TextBlock
+            {
+                Text = "全局模式会接管所有程序的流量（含游戏 / UDP）；" +
+                       "移动热点需要有线连接，把当前出口共享给其它设备。",
+                FontSize = Palette.FsTiny,
+                Foreground = Palette.IdleB,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(2, 14, 2, 0)
+            });
+        }
 
-            _btnOn = MakeButton("开始借网", true, 0);
-            _btnOn.FontSize = 14;
-            _btnOn.Padding = new Thickness(0, 11, 0, 11);
-            _btnOn.Click += delegate { DoStart(); };
-            Grid.SetColumn(_btnOn, 0);
-            btnRow.Children.Add(_btnOn);
+        // ══════════════════════ 日志 ══════════════════════
 
-            _btnOff = MakeButton("停止并恢复直连", false, 0);
-            _btnOff.FontSize = 14;
-            _btnOff.Padding = new Thickness(0, 11, 0, 11);
-            _btnOff.Click += delegate { DoStop(); };
-            Grid.SetColumn(_btnOff, 2);
-            btnRow.Children.Add(_btnOff);
-
-            // ── 次按钮 ──
-            var subRow = new Grid { Margin = new Thickness(0, 10, 0, 0) };
-            subRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            subRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            subRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            _mainStack.Children.Add(subRow);
-
-            _btnRefresh = MakeButton("刷新", false, 0);
-            _btnRefresh.FontSize = Palette.FsSmall;
-            _btnRefresh.Padding = new Thickness(22, 6, 22, 6);
-            _btnRefresh.Click += delegate { RefreshUi(); Log("已刷新"); };
-            Grid.SetColumn(_btnRefresh, 0);
-            subRow.Children.Add(_btnRefresh);
-
-            _btnSettings = MakeButton("设置", false, 0);
-            _btnSettings.FontSize = Palette.FsSmall;
-            _btnSettings.Padding = new Thickness(22, 6, 22, 6);
-            _btnSettings.Click += delegate { OpenSettings(); };
-            Grid.SetColumn(_btnSettings, 2);
-            subRow.Children.Add(_btnSettings);
-
-            // ── 日志 ──
-            var logCard = MakeCard();
-            logCard.Margin = new Thickness(0, 14, 0, 0);
-            logCard.Padding = new Thickness(12);
-            _mainStack.Children.Add(logCard);
+        void BuildLogPage()
+        {
+            var card = Ui.Card(10, 8);
+            var host = new Grid();
+            host.Children.Add(card);
 
             _log = new TextBox
             {
                 IsReadOnly = true,
                 AcceptsReturn = true,
-                // ⚠ 不能用 Wrap。
+                // 1.2.3 按用户要求改成自动换行、去掉底部横向滚动条。
                 //
-                // 2026-11-02 用户报「拖动窗口一顿一顿」。网络全部正常，
-                // 问题在这里：TextBox + TextWrapping.Wrap 时，**每次
-                // AppendText 都要从头重排整个文本**（因为换行位置取决于
-                // 控件宽度）。日志跑到几千行之后，每追加一行就是几十毫秒，
-                // 而心跳/刷新会持续追加 → 拖动窗口时不断撞上重排 → 一顿一顿。
-                //
-                // 日志是定宽的机器输出（时间戳 + 固定格式），本来就不需要
-                // 按窗口宽度折行；超长行走横向滚动条即可。
-                TextWrapping = TextWrapping.NoWrap,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                // 代价要知道：TextBox + Wrap 时每次 AppendText 都要按当前宽度
+                // 重排整个文本，行数越多越慢（2026-11-02 曾因此拖动窗口卡顿）。
+                // 所以下面把保留行数从 800 降到 400 —— 换行后的视觉行数大约翻倍，
+                // 400 行折完约等于原来的 800 行，手感回到同一水平。
+                TextWrapping = TextWrapping.Wrap,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                Height = 190,
                 FontFamily = new FontFamily(Palette.FontMono),
                 FontSize = Palette.FsMono,
-                Foreground = Palette.MutedB,
+                Foreground = Palette.TextB,
                 Background = Brushes.Transparent,
                 BorderThickness = new Thickness(0),
-                Padding = new Thickness(2)
+                Padding = new Thickness(8, 4, 8, 4)
             };
-            logCard.Child = _log;
+            card.Child = _log;
+            ScrollBars.ApplyTo(_log);          // 模板内部的滚动条才能吃到这个样式
+            _pageLog = host;
+        }
 
-            // ── 底部署名 ──
-            _mainStack.Children.Add(new TextBlock
+        // ══════════════════════ 测速 ══════════════════════
+
+        void BuildSpeedPage()
+        {
+            var root = new StackPanel();
+            _pageSpeed = root;
+
+            _speedSummary = new TextBlock
             {
-                Text = "渡口仅用于个人学习与内网连通性测试",
+                Text = "点右上角「一键测试」开始。",
+                FontSize = Palette.FsBody,
+                Foreground = Palette.MutedB,
+                Margin = new Thickness(2, 0, 0, 10)
+            };
+            root.Children.Add(_speedSummary);
+
+            _speed = new SpeedTestView(
+                delegate (string host, int port, int timeoutMs)
+                {
+                    int ms = 0;
+                    string route = "";
+                    string note = "";
+                    bool ok = _rt != null && _rt.Probe(host, port, timeoutMs, out ms, out route, out note);
+                    return new ProbeResult { Ok = ok, Ms = ms, Route = route, Note = note };
+                },
+                _speedSummary, _btnSpeedRun, Log);
+
+            root.Children.Add(_speed.Build());
+        }
+
+        // ══════════════════════ 设置 ══════════════════════
+
+        void BuildSettingsPage()
+        {
+            _settingsView = new SettingsView(_cfg, _cfgPath, _appDir, DoUninstall, DoUpdate);
+
+            var scroll = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Content = _settingsView.Build()
+            };
+            ScrollBars.ApplyTo(scroll);
+            _pageSettings = scroll;
+        }
+
+
+        /// <summary>关于页的「标签 — 值」一行。值用等宽字体，IP 和端口对齐好看。</summary>
+        void AddInfoRow(Grid g, int row, string label, string value)
+        {
+            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var l = new TextBlock
+            {
+                Text = label,
                 FontSize = Palette.FsSmall,
-                Foreground = Palette.IdleB,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Margin = new Thickness(0, 14, 0, 0)
+                Foreground = Palette.MutedB,
+                Margin = new Thickness(0, 4, 0, 4)
+            };
+            Grid.SetColumn(l, 0);
+            Grid.SetRow(l, row);
+            g.Children.Add(l);
+
+            var v = new TextBlock
+            {
+                Text = value,
+                FontFamily = new FontFamily(Palette.FontMono),
+                FontSize = Palette.FsSmall,
+                Foreground = Palette.TextB,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Margin = new Thickness(0, 4, 0, 4)
+            };
+            Grid.SetColumn(v, 1);
+            Grid.SetRow(v, row);
+            g.Children.Add(v);
+        }
+
+        // ══════════════════════ 关于 ══════════════════════
+
+        void BuildAboutPage()
+        {
+            var root = new StackPanel();
+            _pageAbout = root;
+
+            var card = Ui.Card(22, 20);
+            root.Children.Add(card);
+            var stack = new StackPanel();
+            card.Child = stack;
+
+            var head = new StackPanel { Orientation = Orientation.Horizontal };
+            stack.Children.Add(head);
+
+            var avatar = new Ellipse
+            {
+                Width = 56,
+                Height = 56,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            var img = AppAssets.Avatar;
+            if (img != null)
+            {
+                RenderOptions.SetBitmapScalingMode(avatar, BitmapScalingMode.HighQuality);
+                avatar.Fill = new ImageBrush(img) { Stretch = Stretch.UniformToFill };
+            }
+            else avatar.Fill = Palette.AccentB;
+            avatar.Clip = new EllipseGeometry(new Point(28, 28), 28, 28);
+            head.Children.Add(avatar);
+
+            var nameBox = new StackPanel
+            {
+                Margin = new Thickness(14, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            head.Children.Add(nameBox);
+            nameBox.Children.Add(new TextBlock
+            {
+                Text = "渡口 Ferry",
+                FontSize = 18,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = Palette.TextB
+            });
+            _lblVer = new TextBlock
+            {
+                Text = "v" + typeof(MainWindow).Assembly.GetName().Version.ToString(3),
+                FontSize = Palette.FsSmall,
+                Foreground = Palette.MutedB,
+                Margin = new Thickness(0, 3, 0, 0)
+            };
+            nameBox.Children.Add(_lblVer);
+
+            stack.Children.Add(new Border { Height = 1, Background = Palette.LineB, Margin = new Thickness(0, 16, 0, 14) });
+
+            stack.Children.Add(new TextBlock
+            {
+                Text = "校园网按账号禁网时，借一台能上网的内网主机当出口。" +
+                       "国内目标走渡口出口，境外交给本机代理，两条上游互为兜底。",
+                FontSize = Palette.FsBody,
+                Foreground = Palette.TextB,
+                TextWrapping = TextWrapping.Wrap,
+                LineHeight = 22
             });
 
-            Closing += OnWindowClosing;
+            // 连接信息：把「这台机器现在连的是谁」摊开，排查时不用去翻配置
+            stack.Children.Add(Ui.Divider(16, 4));
+            var info = new Grid { Margin = new Thickness(0, 6, 0, 0) };
+            info.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(96) });
+            info.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            stack.Children.Add(info);
+
+            AddInfoRow(info, 0, "门户地址", string.IsNullOrEmpty(_cfg.PortalUrl) ? "未配置" : _cfg.PortalUrl);
+            AddInfoRow(info, 1, "本地代理", "127.0.0.1:" + _cfg.SocksPort);
+            AddInfoRow(info, 2, "远端出口", string.IsNullOrEmpty(_cfg.RemoteHost)
+                ? "未配置" : _cfg.RemoteHost + ":" + _cfg.RelayPort);
+            AddInfoRow(info, 3, "账户", string.IsNullOrEmpty(_cfg.AccountIp) ? "未激活" : _cfg.AccountIp);
+
+            var ops = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 18, 0, 0) };
+            stack.Children.Add(ops);
+
+            _btnCheckUpdate = Ui.Secondary("检查更新");
+            _btnCheckUpdate.Click += delegate { CheckUpdate(true); };
+            ops.Children.Add(_btnCheckUpdate);
+
+            // 结果必须显示在按钮旁边。
+            // 以前这里只往日志写一行「已请求检查更新」，而日志在另一个页面 ——
+            // 用户点完看到的唯一变化就是那圈焦点虚线框，自然会认为「按钮没用」。
+            _lblUpdState = new TextBlock
+            {
+                Text = "",
+                FontSize = Palette.FsSmall,
+                Foreground = Palette.MutedB,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(12, 0, 0, 0)
+            };
+
+            var fb = Ui.Secondary("意见反馈");
+            fb.Margin = new Thickness(10, 0, 0, 0);
+            fb.Click += delegate
+            {
+                var dlg = new FeedbackWindow(_cfg) { Owner = this };
+                dlg.ShowDialog();
+            };
+            ops.Children.Add(fb);
+
+            // 状态文字放在两个按钮**后面**：夹在中间时「检查更新 / 红字 / 意见反馈」
+            // 会把一行拆成三段，红字看着像绑定在反馈按钮上。
+            ops.Children.Add(_lblUpdState);
+
+            root.Children.Add(new TextBlock
+            {
+                Text = "渡口仅用于个人学习与内网连通性测试。",
+                FontSize = Palette.FsTiny,
+                Foreground = Palette.IdleB,
+                Margin = new Thickness(2, 16, 0, 0)
+            });
         }
 
         /// <summary>
@@ -468,7 +1032,7 @@ namespace Ferry
         {
             return new Border
             {
-                Background = Palette.CardB,
+                Background = Palette.CardGradB,
                 BorderBrush = Palette.LineB,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(14),
@@ -504,9 +1068,12 @@ namespace Ferry
                 Cursor = System.Windows.Input.Cursors.Hand,
                 BorderThickness = new Thickness(primary ? 0 : 1),
                 BorderBrush = Palette.Line2B,
-                Background = primary ? Palette.AccentB : Palette.CardB,
-                Foreground = primary ? Brushes.White : Palette.TextB
+                Background = primary ? Palette.AccentB : Brushes.Transparent,
+                Foreground = primary ? Palette.OnAccentB : Palette.TextB
             };
+            // 1.2.0 起整套界面是圆角的，这里必须跟着走，
+            // 否则主按钮还是 WPF 默认的方角灰渐变，一眼看出是两套东西。
+            Ui.Round(b, 10);
             if (width > 0) b.Width = width;
             return b;
         }
@@ -515,10 +1082,24 @@ namespace Ferry
         {
             _tray = new WF.NotifyIcon();
             _tray.Text = "渡口 Ferry";
+            // 托盘图标优先用内嵌资源：早先只读安装目录的 app.ico，
+            // 那个文件一旦缺失（便携版、被清理工具删掉）就静默变成系统默认图标，
+            // 用户只会觉得「图标没换」。内嵌的永远跟着 exe 走。
             try
             {
-                var ico = Path.Combine(_appDir, "app.ico");
-                _tray.Icon = File.Exists(ico) ? new System.Drawing.Icon(ico) : System.Drawing.SystemIcons.Application;
+                System.IO.Stream s = System.Reflection.Assembly.GetExecutingAssembly()
+                    .GetManifestResourceStream("app.ico");
+                if (s != null)
+                {
+                    using (s) _tray.Icon = new System.Drawing.Icon(s);
+                }
+                else
+                {
+                    var ico = Path.Combine(_appDir, "app.ico");
+                    _tray.Icon = File.Exists(ico)
+                        ? new System.Drawing.Icon(ico)
+                        : System.Drawing.SystemIcons.Application;
+                }
             }
             catch (Exception) { _tray.Icon = System.Drawing.SystemIcons.Application; }
 
@@ -1393,18 +1974,53 @@ namespace Ferry
 
         // ── 更新 ──
 
-        void CheckUpdate()
+        /// <summary>自动检查（启动时 + 定时器）：静默，只有真的有新版本才弹窗。</summary>
+        void CheckUpdate() { CheckUpdate(false); }
+
+        /// <summary>
+        /// manual=true 表示用户点了「检查更新」：**任何**结果都要有可见反馈。
+        ///
+        /// 原来不分手动/自动，没新版本或连不上门户时直接 return，
+        /// 界面上什么都不会发生 —— 用户只能看到自己点出了一圈焦点虚线框。
+        /// </summary>
+        void CheckUpdate(bool manual)
         {
-            if (_cfg.PortalUrl.Length == 0) return;
+            if (_cfg.PortalUrl.Length == 0)
+            {
+                if (manual) SetUpdState("没有配置门户地址", Palette.BadB);
+                return;
+            }
+
+            if (manual)
+            {
+                SetUpdState("正在检查…", Palette.MutedB);
+                if (_btnCheckUpdate != null) _btnCheckUpdate.IsEnabled = false;
+            }
+
             ThreadPool.QueueUserWorkItem(delegate
             {
                 var v = Api.Version(_cfg.PortalUrl);
-                if (!v.Ok) return;
                 var mine = typeof(MainWindow).Assembly.GetName().Version.ToString();
-                if (Api.CompareVer(v.Latest, mine) <= 0) return;
 
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
+                    if (_btnCheckUpdate != null) _btnCheckUpdate.IsEnabled = true;
+
+                    if (!v.Ok)
+                    {
+                        if (manual) SetUpdState("检查失败：连不上门户", Palette.BadB);
+                        if (manual) Log("检查更新失败：连不上门户（" + _cfg.PortalUrl + "）");
+                        return;
+                    }
+
+                    if (Api.CompareVer(v.Latest, mine) <= 0)
+                    {
+                        if (manual) SetUpdState("已是最新 v" + mine, Palette.GoodB);
+                        return;
+                    }
+
+                    if (manual) SetUpdState("发现新版本 " + v.Latest, Palette.AccentB);
+
                     _latestVer = v.Latest;
                     _btnUpd.Content = "更新 " + v.Latest;
                     _btnUpd.Visibility = Visibility.Visible;
@@ -1420,8 +2036,17 @@ namespace Ferry
                         "选「否」就继续用当前版本，本次运行不再提醒。",
                         "有可用更新", MessageBoxButton.YesNo, MessageBoxImage.Information);
                     if (r == MessageBoxResult.Yes) DoUpdate(v.Latest);
+                    else if (manual) SetUpdState("已跳过 " + v.Latest, Palette.MutedB);
                 }));
             });
+        }
+
+        /// <summary>关于页「检查更新」右边的状态文字。</summary>
+        void SetUpdState(string text, Brush color)
+        {
+            if (_lblUpdState == null) return;
+            _lblUpdState.Text = text;
+            _lblUpdState.Foreground = color;
         }
 
         void UpdateLog(string step)
@@ -2053,7 +2678,6 @@ namespace Ferry
             // 有人把 SetBusy 挪进定时器路径后又踩同一个坑。
             SetEnabled(_btnOn, !b);
             SetEnabled(_btnOff, !b);
-            SetEnabled(_btnRefresh, !b);
             SetEnabled(_btnSettings, !b);
         }
 
@@ -2069,10 +2693,10 @@ namespace Ferry
 
             // 界面上只保留最近若干行。
             //
-            // 为什么必须截断：TextBox 的 AppendText 是追加到末尾，但 Scrolling
-            // 与布局会随行数增长而变慢；几千行之后每次追加都要几十毫秒。
-            // 而且日志卡本身只显示 190px 高，多的行看不见，纯属拖慢 UI。
-            if (_logLineCount > 800)
+            // 为什么必须截断：TextBox 的 AppendText 是追加到末尾，但布局会随行数
+            // 增长而变慢；1.2.3 起日志开了自动换行，同一段文字占的视觉行更多，
+            // 重排成本也跟着涨，所以上限从 800 收到 400。
+            if (_logLineCount > 400)
             {
                 _log.Clear();
                 _logLineCount = 0;

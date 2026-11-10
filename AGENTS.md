@@ -43,6 +43,7 @@
 | `tools/verify-lifecycle.cs` | **借网生命周期**（反复启停、Clash 开关、UDP、残局） | 动过 FerryRuntime / Ferry.cs |
 | `tools/verify-scenarios.cs` | **分流场景矩阵**（接管/节点模式 × 有无代理 × 代理挂掉） | 动过 Proxy.cs 的分流 |
 | `tools/verify-fallback.cs` | **失败分类**（Line/Target）、第二跳结果、窗口汇总、探测静默 | 动过 ConnectSmart / ConnectSocks |
+| `tools/verify-speedtest.cs` | **直连探测**：可达时耗时为真、坏域名/不可达端口安全返回 false、超时受控 | 动过 Probe / ProbeDirect / 测速页 |
 | `tools/verify-regression-guard.cs` | **历史修复不变量**（fake-ip、26 条防回环、clash-egress、1.1.0 直连 UDP、严格 IDNA…） | 任何一次改分流前后都要跑 |
 | `tools/run-verify.ps1` | **统一验证入口**：把整个 `src\*.cs` 和验证器一起编 | 见下方说明 |
 | `tools/verify-updatecheck.cs` | **检查更新链路**（版本接口、窗口构造、版本比较） | 动过 SettingsWindow / Api |
@@ -101,6 +102,40 @@ powershell -ExecutionPolicy Bypass -File tools\verify-android.ps1
    结果正好相反，访问打印机/摄像头全超时。
 
 
+## 二之三、界面结构（1.2.0 起：侧边栏 + 分页）
+
+```
+MainWindow（外壳：侧栏 + 标题行 + 页面容器 + 托盘）
+├─ NavRail            头像 / 五个导航项 / 底部账号与版本
+├─ 隧道  BuildTunnelPage   状态卡、全局模式、热点、借网按钮、密钥激活
+├─ 日志  BuildLogPage      整页日志（TextBox，NoWrap，别改成 Wrap）
+├─ 测速  SpeedTestView     固定 10 站，一键测延迟 / 失败率
+├─ 设置  SettingsView      原设置项（弹窗也复用这一份）
+└─ 关于  BuildAboutPage    版本、连接信息、检查更新、反馈
+```
+
+| 文件 | 职责 | 注意 |
+|---|---|---|
+| `Palette.cs` | 唯一配色与尺寸来源 | 深色主题：底 `#2F4436` / 面板 `#3D5747` / 嵌 `#44604F` |
+| `Ui.cs` | 控件工厂：卡片、按钮、复选框、链接、分隔线 | 圆角模板 + 悬停/按下/禁用触发器都在这里 |
+| `Icons.cs` | 24×24 线条图标几何 | 换色只改 `Stroke`，不要引位图 |
+| `NavRail.cs` | 侧栏（含 `AppAssets.Avatar` 内嵌头像） | 选中态 = 浅底 + 左侧 3px 高亮条 |
+| `SpeedTestView.cs` | 测速页 | 探测走 `FerryRuntime.Probe` → `ProxyServer.Probe` |
+| `SettingsView.cs` | 设置面板 | 弹窗 `SettingsWindow` 只是它的一层壳 |
+| `tools/make-sanae-assets.py` | 从立绘生成 `app.ico` / `avatar.png` / `palette.json` | 换立绘只改 `--src` 与裁切比例 |
+
+**四条界面硬规则（都是这次踩出来的）**
+
+1. **不要在深色主题上贴白色面板**。层次靠同一色系的三档明度 + 一圈更亮的描边，
+   白色块会像贴上去的 PPT，也和立绘完全不搭。所有颜色只能来自 `Palette`。
+2. **根容器必须有不透明背景**（`shell.Background = Palette.BgB`）。
+   `Window.Background` 只画窗口表面；离屏渲染渲染的是 `Content`，
+   透明区在 PNG 里会变成黑块 —— 深色主题下整条标题带发黑就是这么来的。
+3. **切页动效只动不透明度和平移**，不要改尺寸：改尺寸会让日志区重新折行，
+   几千行时就是肉眼可见的一卡。离屏渲染要先把 `_noAnim` 打开，否则截到中间态。
+4. **两个构建脚本都要带 `/resource:`**：`avatar.png` 是侧栏头像、
+   `app.ico` 是托盘兜底。少一个的症状分别是「头像变绿块」「托盘变系统图标」。
+
 ## 三、本地怎么跑
 
 ```powershell
@@ -111,7 +146,8 @@ powershell -ExecutionPolicy Bypass -File build-wpf.ps1 -Version 1.0.1
 
 # 界面截图（在远端测试机上渲染，别在用户自己电脑上弹窗）
 powershell -ExecutionPolicy Bypass -File tools\render-ui.ps1
-# → %TEMP%\ferry-ui-shots\shot-main.png / shot-settings.png / shot-feedback.png
+# → %TEMP%\ferry-ui-shots\shot-1-tunnel.png … shot-5-about.png
+#   加 shot-6-settings-window.png / shot-7-feedback.png（1.2.0 起七个页面全渲染）
 
 # 门户：本地起一个独立实例（不碰线上库）
 cd portal
@@ -227,7 +263,8 @@ ssh xt 'C:\ferry-update-test\渡口助手.exe /update'
    → 踩坑 55 / 56（历史），CHANGELOG `v0.14.0`
 
 10. **界面改动必须真渲染一次**。`tools/render-ui.ps1` 会把源码送到
-    10.113.66.6 编译 + `RenderTargetBitmap` 离屏渲染三个窗口，再拉回 PNG。
+    测试机编译 + `RenderTargetBitmap` 离屏渲染**七个界面**（1.2.0 起是五个页面
+    + 设置弹窗 + 反馈窗），再拉回 PNG。
     结构断言全过 ≠ 显示正常（WinForms 时代就有「按钮文字被卡片圆角裁掉、
     元素树里查不到」的先例）。
     → 踩坑 48 / 57

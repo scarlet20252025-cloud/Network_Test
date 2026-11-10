@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Net.Security;
+using System.Security.Authentication;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -902,6 +904,19 @@ namespace Ferry
         /// </summary>
         Socket ConnectSmart(string host, int port, int timeoutMs)
         {
+            string route;
+            return ConnectSmartRouted(host, port, timeoutMs, out route);
+        }
+
+        /// <summary>
+        /// 同 <see cref="ConnectSmart(string,int,int)"/>，额外说明「这一跳走的哪条上游」。
+        /// 只有测速页用得到：延迟要按「渡口 / 本机代理」分开看，
+        /// 否则用户看到 300ms 判断不出是自己的 Clash 慢还是渡口慢。
+        /// </summary>
+        Socket ConnectSmartRouted(string host, int port, int timeoutMs, out string route,
+                                  bool ignoreFailMemo = false)
+        {
+            route = "渡口";
             bool cn = IsDomestic(host);
             bool quiet = IsInfrastructureTarget(host, port);
 
@@ -915,8 +930,11 @@ namespace Ferry
             if (cn)
             {
                 // 刚失败过的目标直接走另一条 —— 否则每次重连都要重等一遍。
-                if (RecentlyFailed("ferry", host, port))
+                if (!ignoreFailMemo && RecentlyFailed("ferry", host, port))
+                {
+                    route = "本机代理";
                     return ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
+                }
 
                 SocksFailKind why;
                 var s1 = ConnectSocks(_socksPort, PreferIp(host), port, quickMs, _socksHost, out why);
@@ -926,6 +944,7 @@ namespace Ferry
                 // 这种「目标级」失败不能记成线路故障，否则该目标会被硬绕开 5 分钟。
                 if (why == SocksFailKind.Line) MarkFailed("ferry", host, port);
 
+                route = "本机代理";
                 var s2 = ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
                 NoteFallback("渡口→本机代理", why, s2 != null, quiet, host, port);
                 return s2;
@@ -934,9 +953,13 @@ namespace Ferry
             // 境外：交给用户本机的代理，**传原始域名**。
             // 不能用 PreferIp：国内 DNS 解析墙外域名拿到的是污染地址，
             // 传过去 Clash 就会去连那个假 IP（明明它自己有干净的解析）。
-            if (RecentlyFailed("clash", host, port))
+            if (!ignoreFailMemo && RecentlyFailed("clash", host, port))
+            {
+                route = "渡口";
                 return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+            }
 
+            route = "本机代理";
             SocksFailKind why2;
             var s3 = ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost, out why2);
             if (s3 != null) return s3;
@@ -945,9 +968,226 @@ namespace Ferry
             // 境外回退渡口只为救回「被判错成境外」的国内目标（判错一律往境外错）。
             // 真境外目标从大陆出口必然打不开 —— 这是产品边界，不是 bug
             // （docs/分流架构.md 六）。所以不值得等满 8 秒；2.5 秒足够国内目标握手。
+            route = "渡口";
             var s4 = ConnectSocks(_socksPort, host, port, quickMs, _socksHost);
             NoteFallback("本机代理→渡口", why2, s4 != null, quiet, host, port);
             return s4;
+        }
+
+        /// <summary>
+        /// 测速用的单次探测：按真实分流规则建一条连接，再**真正发一次 HTTP HEAD**，
+        /// 量到「首字节回来」为止。
+        ///
+        /// 为什么不能只量 SOCKS 握手（1.2.2 之前就是这么写的，结果测出一排 0ms）：
+        ///   Clash 这类代理对 CONNECT 会**立刻回 REP=0**，实际的上游连接是之后才建的。
+        ///   实测同一台机器：握手 1.1ms，真正拿到 github 的首字节是 268ms。
+        ///   只测握手等于测「本机代理进程有没有在监听」，跟线路质量没关系。
+        ///
+        /// 判定也看内容：必须读回 `HTTP/` 开头的状态行才算成功 ——
+        /// 有些代理会先接受再断开，只看 REP 会被骗过去。
+        /// ignoreFailMemo=true：测速要测「正常情况下会走哪条」，
+        /// 不能被刚才浏览失败留下的 5 分钟失败记忆带偏。
+        /// </summary>
+        public bool Probe(string host, int port, int timeoutMs, out int elapsedMs, out string route)
+        {
+            string note;
+            return Probe(host, port, timeoutMs, out elapsedMs, out route, out note);
+        }
+
+        public bool Probe(string host, int port, int timeoutMs,
+                          out int elapsedMs, out string route, out string note)
+        {
+            elapsedMs = 0;
+            route = "";
+            note = "";
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            var s = ConnectSmartRouted(host, port, timeoutMs, out route, true);
+            if (s == null)
+            {
+                sw.Stop();
+                elapsedMs = (int)sw.ElapsedMilliseconds;
+                note = "连不上";
+                return false;
+            }
+
+            try { return ProbeOnSocket(s, host, port, timeoutMs, sw, out elapsedMs, out note); }
+            finally { try { s.Close(); } catch (Exception) { } }
+        }
+
+        /// <summary>
+        /// 直连探测：不经任何代理，直接连目标再握手。
+        ///
+        /// 用于「还没开始借网」的测速 —— 那时 Proxy 实例根本不存在，
+        /// 以前 FerryRuntime.Probe 会直接返回 false，界面整表显示「超时」，
+        /// 用户以为线路挂了。直连测出来的数字本身有意义：它是借网前后的对比基线。
+        ///
+        /// 用 BeginConnect + WaitOne 而不是同步 Connect：同步 Connect 在
+        /// DNS 被污染/丢包时能卡十几秒，把整个测速线程拖住。
+        ///
+        /// note 带回**失败原因**（DNS / 拒绝 / 超时 / TLS / 网络）：
+        /// 只写「超时」的话，用户和排查的人都分不清是 DNS 挂了、端口被封还是网关拦截。
+        /// </summary>
+        public static bool ProbeDirect(string host, int port, int timeoutMs, out int elapsedMs)
+        {
+            string note;
+            return ProbeDirect(host, port, timeoutMs, out elapsedMs, out note);
+        }
+
+        public static bool ProbeDirect(string host, int port, int timeoutMs,
+                                       out int elapsedMs, out string note)
+        {
+            elapsedMs = 0;
+            note = "";
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Socket s = null;
+            try
+            {
+                s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                s.NoDelay = true;
+                var ar = s.BeginConnect(host, port, null, null);
+                bool done = ar.AsyncWaitHandle.WaitOne(timeoutMs);
+                if (!done)
+                {
+                    sw.Stop();
+                    elapsedMs = (int)sw.ElapsedMilliseconds;
+                    note = "超时";
+                    try { s.Close(); } catch (Exception) { }
+                    return false;
+                }
+                s.EndConnect(ar);
+                return ProbeOnSocket(s, host, port, timeoutMs, sw, out elapsedMs, out note);
+            }
+            catch (SocketException se)
+            {
+                sw.Stop();
+                elapsedMs = (int)sw.ElapsedMilliseconds;
+                note = Classify(se);
+                return false;
+            }
+            catch (Exception)
+            {
+                sw.Stop();
+                elapsedMs = (int)sw.ElapsedMilliseconds;
+                note = "网络";
+                return false;
+            }
+            finally
+            {
+                if (s != null) { try { s.Close(); } catch (Exception) { } }
+            }
+        }
+
+        /// <summary>把 SocketException 翻成界面上能看懂的短词。</summary>
+        static string Classify(SocketException e)
+        {
+            switch (e.SocketErrorCode)
+            {
+                case SocketError.HostNotFound:
+                case SocketError.NoData:
+                case SocketError.TryAgain:
+                    return "DNS";
+                case SocketError.ConnectionRefused:
+                    return "拒绝";
+                case SocketError.TimedOut:
+                    return "超时";
+                case SocketError.NetworkUnreachable:
+                case SocketError.HostUnreachable:
+                    return "不可达";
+                default:
+                    return "网络";
+            }
+        }
+
+        /// <summary>
+        /// 在一条已建好的连接上做协议级握手：
+        ///   443 → TLS 握手成功即算通；其余端口 → 发明文 HTTP HEAD 并校验状态行。
+        /// sw 从**建连之前**起算，所以对外报的耗时 = 建连 + 握手。
+        /// </summary>
+        static bool ProbeOnSocket(Socket s, string host, int port, int timeoutMs,
+                                  System.Diagnostics.Stopwatch sw, out int elapsedMs, out string note)
+        {
+            elapsedMs = 0;
+            note = "";
+            try
+            {
+                int remain = timeoutMs - (int)sw.ElapsedMilliseconds;
+                if (remain < 600) remain = 600;
+                s.ReceiveTimeout = remain;
+                s.SendTimeout = remain;
+
+                if (port == 443)
+                {
+                    // 为什么不发明文 HTTP HEAD（1.2.5 及以前）：很多校园网 / 企业网关
+                    // **直接封 80 出站**，明文请求发出去连 RST 都没有，测速整表「超时」，
+                    // 用户以为线路废了。浏览器访问的都是 443，用它测才等于真实体验。
+                    //
+                    // 证书校验一律放过：测的是「能不能连上、要多久」，不是证书链
+                    // （Cloudflare 用 IP 当 SNI 本来就对不上）。
+                    try
+                    {
+                        using (var ns = new NetworkStream(s, false))
+                        using (var ssl = new SslStream(ns, false, delegate { return true; }))
+                        {
+                            var ar = ssl.BeginAuthenticateAsClient(
+                                host, null, SslProtocols.Tls12, false, null, null);
+                            if (!ar.AsyncWaitHandle.WaitOne(remain))
+                            {
+                                sw.Stop();
+                                elapsedMs = (int)sw.ElapsedMilliseconds;
+                                note = "超时";
+                                return false;
+                            }
+                            ssl.EndAuthenticateAsClient(ar);
+                            sw.Stop();
+                            elapsedMs = (int)sw.ElapsedMilliseconds;
+                            return true;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // 握手阶段失败基本就是被中间设备掐了（RST / 非 TLS 响应）
+                        sw.Stop();
+                        elapsedMs = (int)sw.ElapsedMilliseconds;
+                        note = "TLS";
+                        return false;
+                    }
+                }
+
+                using (var ns = new NetworkStream(s, false))
+                {
+                    var req = Encoding.ASCII.GetBytes(
+                        "HEAD / HTTP/1.0\r\nHost: " + host +
+                        "\r\nUser-Agent: FerryProbe\r\nConnection: close\r\n\r\n");
+                    ns.Write(req, 0, req.Length);
+                    ns.Flush();
+
+                    var buf = new byte[16];
+                    int n = ns.Read(buf, 0, buf.Length);
+                    sw.Stop();
+                    elapsedMs = (int)sw.ElapsedMilliseconds;
+                    if (n < 5) { note = "无响应"; return false; }
+                    // 必须是合法的状态行：「HTTP/」
+                    bool http = buf[0] == (byte)'H' && buf[1] == (byte)'T' &&
+                                buf[2] == (byte)'T' && buf[3] == (byte)'P' && buf[4] == (byte)'/';
+                    if (!http) note = "非 HTTP";
+                    return http;
+                }
+            }
+            catch (SocketException se)
+            {
+                sw.Stop();
+                elapsedMs = (int)sw.ElapsedMilliseconds;
+                note = Classify(se);
+                return false;
+            }
+            catch (Exception)
+            {
+                sw.Stop();
+                elapsedMs = (int)sw.ElapsedMilliseconds;
+                if (note.Length == 0) note = "网络";
+                return false;
+            }
         }
 
         /// <summary>国内目标连渡口最多等这么久（见 ConnectSmart 注释）。</summary>

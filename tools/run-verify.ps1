@@ -49,8 +49,18 @@ $srcs = Get-ChildItem (Join-Path $root 'ferry-client\src') -Filter *.cs |
 
 $argList = @('/nologo', '/target:exe', "/main:$mainClass", '/codepage:65001',
              "/out:$exe") + $refs + @($verifier) + $srcs
-& $compiler $argList
-if ($LASTEXITCODE -ne 0) { throw "compile failed: $Name (exit $LASTEXITCODE)" }
+# Keep csc output. Without this, a compile failure only says "exit 1" and the
+# actual CSxxxx message is lost - that cost a full debugging round once.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$cout = & $compiler $argList 2>&1 | Out-String
+$ccode = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+if ($ccode -ne 0) {
+  $log = Join-Path $env:TEMP ($Name + '-build.log')
+  Set-Content -Path $log -Value $cout -Encoding UTF8
+  throw "compile failed: $Name (exit $ccode), see $log"
+}
 
 # Some verifiers (verify-regression-guard etc.) read source/doc files by paths
 # relative to Environment.CurrentDirectory. The exe lives in %TEMP%, so run it

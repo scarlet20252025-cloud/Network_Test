@@ -31,6 +31,7 @@ $rdir = 'C:/ferry-ui'
 $tmp = Join-Path $env:TEMP ('ferry-ui-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force $tmp | Out-Null
 Copy-Item $src (Join-Path $tmp 'src') -Recurse
+Copy-Item (Join-Path $root 'ferry-client\avatar.png') $tmp
 Copy-Item (Join-Path $kit 'shot.cs')   $tmp
 Copy-Item (Join-Path $kit 'build.ps1') $tmp
 

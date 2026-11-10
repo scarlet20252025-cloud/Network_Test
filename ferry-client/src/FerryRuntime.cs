@@ -51,6 +51,32 @@ namespace Ferry
         public bool TunRunning { get { return _tun != null && _tun.Running; } }
 
         /// <summary>
+        /// 测速探测：走客户端自己的分流逻辑建一条连接，返回成败、耗时和实际走的上游。
+        /// 代理没起来时返回 false —— 调用方据此提示「先开始借网」。
+        /// </summary>
+        public bool Probe(string host, int port, int timeoutMs, out int elapsedMs, out string route)
+        {
+            string note;
+            return Probe(host, port, timeoutMs, out elapsedMs, out route, out note);
+        }
+
+        public bool Probe(string host, int port, int timeoutMs,
+                          out int elapsedMs, out string route, out string note)
+        {
+            elapsedMs = 0;
+            route = "";
+            note = "";
+            var p = _proxy;
+            if (p != null && p.Running)
+                return p.Probe(host, port, timeoutMs, out elapsedMs, out route, out note);
+
+            // 还没开始借网：测直连裸链路。以前这里直接返回 false，
+            // 界面上整表「超时」，用户会以为线路坏了（而且按钮那边还会空引用崩一次）。
+            route = "直连";
+            return ProxyServer.ProbeDirect(host, port, timeoutMs, out elapsedMs, out note);
+        }
+
+        /// <summary>
         /// TUN 是「被主动跳过」而不是「启动失败」。
         ///
         /// 为什么需要区分：界面原来只看 TunError 是否为空 ——

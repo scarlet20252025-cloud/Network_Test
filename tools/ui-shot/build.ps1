@@ -20,6 +20,9 @@ $refs = @(
   "$msil\System.Xaml\v4.0_4.0.0.0__b77a5c561934e089\System.Xaml.dll"
 ) | ForEach-Object { "/r:$_" }
 
-& $csc /nologo /target:exe "/out:$Out" /codepage:65001 /platform:anycpu $refs $srcs
+$avatar = Join-Path $base 'avatar.png'
+$resArg = if (Test-Path $avatar) { "/resource:$avatar,avatar.png" } else { '' }
+
+& $csc /nologo /target:exe "/out:$Out" /codepage:65001 /platform:anycpu $refs $resArg $srcs
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 Write-Host ("OK: " + $Out)
