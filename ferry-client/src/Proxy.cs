@@ -10,6 +10,18 @@ using System.Threading.Tasks;
 namespace Ferry
 {
     /// <summary>
+    /// 一次上游连接失败的性质（1.1.1）。
+    ///
+    /// Line   = 上游 SOCKS5 本身不可用（连不上 / 握手失败 / 没回 REP）——线路级故障。
+    /// Target = 上游活着，并且明确回了 REP≠0（RFC 1928：它代连目标失败）——目标级不可达。
+    ///
+    /// 为什么必须分开：旧代码把两种都当成「这条线路坏了」，于是「目标从出口到不了」
+    /// 也被记进 5 分钟失败记忆、每条连接打一行日志。表现在界面上就是满屏
+    /// 「国内目标连不上，改走本机代理」，而服务端其实是健康的。见 docs/分流架构.md 五之四。
+    /// </summary>
+    enum SocksFailKind { None, Line, Target }
+
+    /// <summary>
     /// 本地双协议代理：同一个端口既能接 HTTP 也能接 SOCKS5，上游是 `ssh -D` 的 SOCKS 端口。
     ///
     /// 为什么必须双协议同端口（这是整个项目最反直觉的一处）：
@@ -46,8 +58,27 @@ namespace Ferry
         int _clashPort;
         string _clashHost = "127.0.0.1";
 
-        /// <summary>已经记过日志的告警 key（见 LogOnce）。</summary>
-        readonly HashSet<string> _loggedOnce = new HashSet<string>();
+        /// <summary>一次性告警的上次输出时间（见 LogOnce）。带时间窗，不再整表清空。</summary>
+        readonly Dictionary<string, DateTime> _loggedOnce =
+            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>一次性告警的重发间隔。超过后允许同一类问题再出现一次，便于发现「一直没好」。</summary>
+        const int LogOnceWindowSec = 300;
+
+        /// <summary>回退日志的汇总窗口。窗口内只打一行，不再每条连接写一行。</summary>
+        const int FallbackLogWindowSec = 60;
+
+        /// <summary>每条回退方向的窗口计数（见 NoteFallback）。</summary>
+        class FallbackBucket
+        {
+            public int Total, Line, Target, Ok, Fail, Silent, Reported;
+            public DateTime Since = DateTime.UtcNow;
+            public readonly List<string> Samples = new List<string>();
+        }
+
+        readonly Dictionary<string, FallbackBucket> _fallback =
+            new Dictionary<string, FallbackBucket>(StringComparer.Ordinal);
+        readonly object _fallbackLock = new object();
 
         TcpListener _listener;
 
@@ -860,11 +891,19 @@ namespace Ferry
 
         /// <summary>
         /// 按目标决定走哪条上游。连不上就换另一条（互为兜底），所以任何一侧挂了
-        /// 都不至于整个断网。
+        /// 都不至于整个断网。两条上游是**互斥分支 + 一次互换**，不是三级串联。
+        ///
+        /// 1.1.1：把「连不上」分成线路级 / 目标级（见 SocksFailKind），只有线路级
+        /// 才写失败记忆；改道后的结果也记下来，日志按窗口汇总而不是每条一行。
+        ///
+        /// 全局模式（UseTun=true）**不改变这里**：TUN 只决定「谁进隧道」，分流仍在
+        /// 这一层做一次（AGENTS.md 硬规则）。1.0.16 曾在 TUN 模式下关掉分流，结果
+        /// 当时规则是 MATCH,ferry，境外全被送进度口出口 → 境外全 502。别再改回去。
         /// </summary>
         Socket ConnectSmart(string host, int port, int timeoutMs)
         {
             bool cn = IsDomestic(host);
+            bool quiet = IsInfrastructureTarget(host, port);
 
             if (_clashPort <= 0)
                 return ConnectSocks(_socksPort, PreferIp(host), port, timeoutMs, _socksHost);
@@ -879,11 +918,17 @@ namespace Ferry
                 if (RecentlyFailed("ferry", host, port))
                     return ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
 
-                var s1 = ConnectSocks(_socksPort, PreferIp(host), port, quickMs, _socksHost);
+                SocksFailKind why;
+                var s1 = ConnectSocks(_socksPort, PreferIp(host), port, quickMs, _socksHost, out why);
                 if (s1 != null) return s1;
-                MarkFailed("ferry", host, port);
-                LogOnce("国内目标连不上，改走本机代理", host);
-                return ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
+
+                // 上游明确回了 REP≠0 说明它还活着，只是这个目标从出口不可达。
+                // 这种「目标级」失败不能记成线路故障，否则该目标会被硬绕开 5 分钟。
+                if (why == SocksFailKind.Line) MarkFailed("ferry", host, port);
+
+                var s2 = ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
+                NoteFallback("渡口→本机代理", why, s2 != null, quiet, host, port);
+                return s2;
             }
 
             // 境外：交给用户本机的代理，**传原始域名**。
@@ -892,11 +937,17 @@ namespace Ferry
             if (RecentlyFailed("clash", host, port))
                 return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
 
-            var s2 = ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost);
-            if (s2 != null) return s2;
-            MarkFailed("clash", host, port);
-            LogOnce("本机代理连不上，改走渡口", host);
-            return ConnectSocks(_socksPort, host, port, timeoutMs, _socksHost);
+            SocksFailKind why2;
+            var s3 = ConnectSocks(_clashPort, host, port, timeoutMs, _clashHost, out why2);
+            if (s3 != null) return s3;
+            if (why2 == SocksFailKind.Line) MarkFailed("clash", host, port);
+
+            // 境外回退渡口只为救回「被判错成境外」的国内目标（判错一律往境外错）。
+            // 真境外目标从大陆出口必然打不开 —— 这是产品边界，不是 bug
+            // （docs/分流架构.md 六）。所以不值得等满 8 秒；2.5 秒足够国内目标握手。
+            var s4 = ConnectSocks(_socksPort, host, port, quickMs, _socksHost);
+            NoteFallback("本机代理→渡口", why2, s4 != null, quiet, host, port);
+            return s4;
         }
 
         /// <summary>国内目标连渡口最多等这么久（见 ConnectSmart 注释）。</summary>
@@ -929,15 +980,26 @@ namespace Ferry
         }
 
         /// <summary>
-        /// 同一类告警只记一次（按 key 去重）。
+        /// 同一类告警按时间窗只记一次（1.0.24 起；1.1.1 修掉三个去重缺陷）。
         ///
         /// 为什么：分流是**每条连接**都要判的。浏览器打开一个页面会建几十条连接，
         /// 代理挂掉时如果每条都写一行日志，日志文件几分钟就几 MB，真正的错误反而
-        /// 被冲掉了。去重之后「某个目标一直走不通」这件事仍然看得见。
+        /// 被冲掉了。
+        ///
+        /// 旧实现的三个问题：① `HashSet` 无时间窗，一旦记过就永远不再提醒；
+        /// ② 表满 500 条直接 `Clear()`，同一批告警会从头再刷一遍（踩坑 68）；
+        /// ③ 对 IP 字面量取后两段，`223.6.6.6` 和 `223.5.5.5` 都被压成 `6.6`/`5.5`
+        /// 之类，不同目标被过度合并。现在改成都按完整一级域名 / 完整 IP，
+        /// 加 5 分钟窗口，并且只淘汰过期项、不整表清空。
+        ///
+        /// 注意：回退告警从 1.1.1 起走 `NoteFallback` 的窗口汇总，`LogOnce` 保留给
+        /// 其它一次性告警使用（别把这套去重机制删掉）。
         /// </summary>
         static string RootDomain(string host)
         {
             if (string.IsNullOrEmpty(host)) return host;
+            IPAddress ip;
+            if (IPAddress.TryParse(host, out ip)) return host;   // IP 没有「一级域名」
             int dot = host.LastIndexOf('.');
             if (dot <= 0) return host;
             int prev = host.LastIndexOf('.', dot - 1);
@@ -947,17 +1009,99 @@ namespace Ferry
 
         void LogOnce(string what, string key)
         {
-            // 按一级域名去重：一次开几十个页面时，同一类问题会以几十个不同
-            // 子域名的形式出现（img1.cdn.example.com / img2.cdn.example.com…），
-            // 按完整 host 去重等于没去重，表刷满 500 条后又从头开始刷屏。
             string id = what + "|" + RootDomain(key);
+            bool emit = false;
+            DateTime now = DateTime.UtcNow;
             lock (_loggedOnce)
             {
-                if (_loggedOnce.Contains(id)) return;
-                if (_loggedOnce.Count > 500) _loggedOnce.Clear();   // 别无限长
-                _loggedOnce.Add(id);
+                DateTime last;
+                if (!_loggedOnce.TryGetValue(id, out last) ||
+                    (now - last).TotalSeconds >= LogOnceWindowSec)
+                {
+                    _loggedOnce[id] = now;
+                    emit = true;
+                    if (_loggedOnce.Count > 1000)
+                    {
+                        var dead = new List<string>();
+                        foreach (var kv in _loggedOnce)
+                            if ((now - kv.Value).TotalSeconds >= LogOnceWindowSec) dead.Add(kv.Key);
+                        foreach (var k in dead) _loggedOnce.Remove(k);
+                    }
+                }
             }
-            _log(what + "：" + key);
+            if (emit) _log(what + "：" + key);
+        }
+
+        /// <summary>
+        /// DNS / 系统连通性探测类目标。这类流量在禁网时失败是常态，只影响日志样本
+        /// 采集，**不改变选路、不改变失败记忆**（静默 ≠ 放行）。
+        ///
+        /// 为什么需要：TUN 开着 `dns-hijack: any:53` + fake-ip，客户端发往公共 DNS
+        /// 的探测会进本地代理走 TCP SOCKS5，必然连不上；旧实现给每个目标打一行
+        /// 「国内目标连不上」，把真正的业务故障冲掉。见 docs/分流架构.md 四。
+        /// </summary>
+        static bool IsInfrastructureTarget(string host, int port)
+        {
+            if (port == 53 || port == 853 || port == 8853) return true;
+            if (string.IsNullOrEmpty(host)) return false;
+            return _dnsProbeIps.Contains(host) ||
+                   host.EndsWith(".msftconnecttest.com", StringComparison.OrdinalIgnoreCase) ||
+                   host.EndsWith(".msftncsi.com", StringComparison.OrdinalIgnoreCase) ||
+                   host.Equals("connect.rom.miui.com", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static readonly HashSet<string> _dnsProbeIps =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "223.5.5.5", "223.6.6.6", "119.29.29.29", "182.254.116.116",
+                "120.53.53.53", "1.12.12.12", "114.114.114.114", "114.114.115.115",
+                "180.76.76.76", "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1"
+            };
+
+        /// <summary>
+        /// 汇总一条回退告警：窗口内只打一行，并且**带上第二跳的结果**。
+        ///
+        /// 旧实现只说「改走本机代理」，至于改过去通没通完全没有记录，排障时无法区分
+        /// 「优雅降级」和「两条都死」（CHANGELOG 1.0.37 那次困惑就是这么来的）。
+        /// 第一次回退立即给一条反馈，之后每 FallbackLogWindowSec 秒汇总一次。
+        /// </summary>
+        void NoteFallback(string route, SocksFailKind why, bool secondOk,
+                          bool quiet, string host, int port)
+        {
+            string line = null;
+            lock (_fallbackLock)
+            {
+                FallbackBucket b;
+                if (!_fallback.TryGetValue(route, out b))
+                {
+                    b = new FallbackBucket();
+                    _fallback[route] = b;
+                }
+                b.Total++;
+                if (why == SocksFailKind.Target) b.Target++; else b.Line++;
+                if (secondOk) b.Ok++; else b.Fail++;
+                if (quiet) b.Silent++;
+                else if (b.Samples.Count < 3 && !string.IsNullOrEmpty(host))
+                    b.Samples.Add(host + ":" + port);
+
+                // 纯探测流量不单独触发首次输出，只在汇总里以「探测流量 N 次」出现。
+                bool first = b.Reported == 0 && !quiet;
+                bool due = (DateTime.UtcNow - b.Since).TotalSeconds >= FallbackLogWindowSec;
+                if (first || due)
+                {
+                    line = "分流回退〔" + route + "〕" + b.Total + " 次"
+                         + "（目标级 " + b.Target + " / 线路级 " + b.Line + "）"
+                         + "，第二跳成功 " + b.Ok + " / 失败 " + b.Fail
+                         + (b.Silent > 0 ? "，探测流量 " + b.Silent + " 次" : "")
+                         + (b.Samples.Count > 0 ? "；示例 " + string.Join("、", b.Samples.ToArray()) : "")
+                         + "（" + FallbackLogWindowSec + " 秒汇总）";
+                    b.Reported++;
+                    b.Total = b.Line = b.Target = b.Ok = b.Fail = b.Silent = 0;
+                    b.Samples.Clear();
+                    b.Since = DateTime.UtcNow;
+                }
+            }
+            if (line != null) _log(line);
         }
 
         /// <summary>
@@ -1432,10 +1576,28 @@ namespace Ferry
         ///
         /// 为什么直连模式要单独一路：SSH 隧道转发时远端看到的源 IP 全是
         /// 127.0.0.1，服务端没法按机器限速。直连才能让服务端识别是谁。
+        ///
+        /// 兼容入口：不需要失败原因的调用方（bypass / UDP / TestProxy）继续用这个重载。
         /// </summary>
         public static Socket ConnectSocks(int socksPort, string host, int port, int timeoutMs,
                                           string socksHost = "127.0.0.1")
         {
+            SocksFailKind ignored;
+            return ConnectSocks(socksPort, host, port, timeoutMs, socksHost, out ignored);
+        }
+
+        /// <summary>
+        /// 同上，但把失败性质带出来（1.1.1）。区分依据只有一个：**上游有没有回 SOCKS5 REP**。
+        /// 回了 REP≠0 = 上游活着、代连目标失败（Target）；没回 / 握手失败 / 连不上 = Line。
+        ///
+        /// 为什么不按 REP 的具体码细分：不同中继实现给的码不一致，而「上游是否活着」
+        /// 这个判据在所有实现里都成立，也更贴近「要不要改道 / 要不要记失败记忆」的决策。
+        /// REP=0x05（Connection refused）在本项目里几乎都是「目标/端口从出口不可达」。
+        /// </summary>
+        public static Socket ConnectSocks(int socksPort, string host, int port, int timeoutMs,
+                                          string socksHost, out SocksFailKind fail)
+        {
+            fail = SocksFailKind.Line;   // 默认线路级；只有收到 REP≠0 才改判目标级
             Socket s = null;
             try
             {
@@ -1479,7 +1641,15 @@ namespace Ferry
                 ns.Write(req.ToArray(), 0, req.Count);
 
                 var head = new byte[4];
-                if (!ReadExact(ns, head, 4) || head[1] != 0x00) { s.Close(); return null; }
+                if (!ReadExact(ns, head, 4)) { s.Close(); return null; }
+                if (head[1] != 0x00)
+                {
+                    // 上游完成了握手并明确回复「代连目标失败」——线路是好的，
+                    // 坏的是这个目标 / 端口。别把它算成线路故障。
+                    fail = SocksFailKind.Target;
+                    s.Close();
+                    return null;
+                }
 
                 // 吃掉 BND.ADDR + BND.PORT
                 int skip;
@@ -1497,6 +1667,7 @@ namespace Ferry
                 if (skip > 0 && !ReadExact(ns, junk, skip)) { s.Close(); return null; }
 
                 s.ReceiveTimeout = 120000;
+                fail = SocksFailKind.None;
                 return s;
             }
             catch (Exception)

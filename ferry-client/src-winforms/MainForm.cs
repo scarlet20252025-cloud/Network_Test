@@ -1423,7 +1423,7 @@ namespace Ferry
                 bool tunUp = rt != null && rt.TunRunning;
                 if (tunUp)
                 {
-                    SetText(_rowTun, "全局模式    已开启（UDP / 游戏都走渡口）", Theme.Good);
+                    SetText(_rowTun, "全局模式    已开启（TUN 接管；TCP 仍按目标分流）", Theme.Good);
                     SetText(_btnGlobal, "关闭全局模式", Color.White);
                     _btnGlobal.BackColor = Theme.Idle;
                 }

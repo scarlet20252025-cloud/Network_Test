@@ -1003,7 +1003,7 @@ namespace Ferry
                             // 留原样还有个好处：认代理的程序照常走 Clash（它有规则、
                             // 有订阅、有测速），不认代理的程序（游戏、DSH）走 TUN，
                             // 两条路各司其职。停止借网时也不用还原别人的设置。
-                            Log("全局模式已接管全部流量 —— 系统代理保持原样，留给其它代理软件");
+                            Log("全局模式已用 TUN 接管流量（TCP 仍按目标分流）—— 系统代理保持原样，留给其它代理软件");
                         }
                         else
                         {
@@ -1039,11 +1039,13 @@ namespace Ferry
                             // TUN 模式下我们**故意不碰系统代理**（留给了 Clash 等），
                             // 原来这里还打印「系统代理已切到 xxx」，是句假话 ——
                             // 排查共存问题时会把人也带偏（2026-11-02 实测踩到）。
-                            Log("TUN 已接管全部流量；系统代理保持原样（未改动）");
+                            Log("TUN 已接管本机流量；系统代理保持原样（未改动）");
                         else
                             Log("系统代理已切到 " + _rt.BorrowServer);
                         if (_rt.TunRunning)
-                            Log("全局转发已生效：所有程序（含游戏 / UDP）都走渡口");
+                            // 1.1.1：别写「所有程序都走渡口」。TUN 保证的是所有程序
+                            // **进隧道**，TCP 出站仍由本地代理按目标分流给用户自己的 Clash。
+                            Log("全局转发已生效：所有程序（含游戏 / UDP）都进隧道；TCP 仍按目标分流");
                         else if (_rt.TunSkipped)
                             Log("全局转发未启用：" + _rt.TunSkipReason);
                         if (exitIp.Length > 0) { _exitVia = exitIp; Log("出口 IP：" + exitIp); }
@@ -1865,7 +1867,10 @@ namespace Ferry
             if (tunUp)
             {
                 // 真的在跑 —— 这是唯一能说「已开启」的情况
-                SetText(_rowTun, "全局模式    已开启（UDP / 游戏都走渡口）");
+                // 1.1.1：别写成「全部流量都走渡口」。TUN 负责**接管**（不认代理的
+                // 程序、UDP / 游戏也进隧道），TCP 仍由本地代理按目标分流到用户自己的
+                // Clash。旧文案让人以为开了全局模式就不分流了（见 docs/分流架构.md 五）。
+                SetText(_rowTun, "全局模式    已开启（TUN 接管；TCP 仍按目标分流）");
                 SetFg(_rowTun, Palette.GoodB);
                 SetContent(_btnGlobal, "关闭全局模式");
                 SetBg(_btnGlobal, Palette.IdleB);
