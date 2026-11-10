@@ -7,10 +7,13 @@ using System.Text;
 using System.Threading;
 using Ferry;
 
-// 1.0.29：验证「一个上游关联服务所有本地关联」。
+// 验证 UDP 关联：**每条流独占一个上游**（1.0.42 起的正确行为）。
 //
-// 关键指标：开 6 个客户端 UDP 关联时，**上游的 TCP 连接数应该只有 1 条**，
-// 而不是 6 条（那是 1.0.28 的行为，也是远端偶发拒连的原因）。
+// 历史别搞反：1.0.29 曾改成「所有流共享一条上游」，后来证明是错的 ——
+// 共享只有一个 UDP socket，回包只能广播给所有活跃流，A 应用的回包发给 B/C/D，
+// 热点一开本机和手机都不正常。现在每条 UdpRelay 有自己的 UpCtrl / UpSock /
+// UpEp，靠 45s/90s 空闲回收 + 512 上限防止堆积（1.0.28 撞上限是因为不回收）。
+// 静态字段 _upCtrl / _upEp 早已不存在，旧断言「只该有 1 条控制连接」已作废。
 static class SharedUpCheck
 {
     static int fails;
@@ -119,20 +122,25 @@ static class SharedUpCheck
         Console.WriteLine("   associations that got a DNS answer: " + okCount + "/" + ports.Count);
         Ok(okCount >= Math.Min(3, ports.Count), "UDP actually flows through the shared upstream");
 
-        // ── 2) 上游只该有 1 条控制连接 ──
+        // ── 2) 每条活跃流都要有自己的上游控制连接（不再广播回包）──
         var t = typeof(ProxyServer);
-        var ctrl = t.GetField("_upCtrl", BindingFlags.NonPublic | BindingFlags.Static);
-        var upEp = t.GetField("_upEp", BindingFlags.NonPublic | BindingFlags.Static);
-        Ok(ctrl != null && ctrl.GetValue(null) != null, "shared upstream control conn exists");
-        Console.WriteLine("   shared upstream endpoint: " + upEp.GetValue(null));
-
-        string all;
-        lock (logs) all = logs.ToString();
-        int readyLines = 0;
-        foreach (var line in all.Split('\n'))
-            if (line.Contains("UDP 上游已就绪")) readyLines++;
-        Console.WriteLine("   'upstream ready' lines: " + readyLines);
-        Ok(readyLines == 1, "upstream was established exactly once for all 6 streams");
+        var relayField = t.GetField("_relays", BindingFlags.NonPublic | BindingFlags.Static);
+        Ok(relayField != null, "_relays flow table exists");
+        var relays = relayField == null ? null : relayField.GetValue(null) as System.Collections.IList;
+        Ok(relays != null, "flow table readable");
+        if (relays != null)
+        {
+            int withCtrl = 0;
+            var relayType = relays.Count > 0 ? relays[0].GetType() : t.GetNestedType("UdpRelay", BindingFlags.NonPublic);
+            var upCtrlField = relayType == null ? null : relayType.GetField("UpCtrl");
+            Ok(upCtrlField != null, "UdpRelay has its own UpCtrl field");
+            if (upCtrlField != null)
+                foreach (var r in relays)
+                    if (upCtrlField.GetValue(r) != null) withCtrl++;
+            Console.WriteLine("   relays=" + relays.Count + " with per-flow UpCtrl=" + withCtrl);
+            Ok(withCtrl >= Math.Min(3, ports.Count),
+               "each active flow owns an upstream control connection (no broadcast)");
+        }
 
         // ── 3) 全部关掉后，上游回收 ──
         foreach (var k in keeps) { try { k.Close(); } catch { } }

@@ -42,7 +42,8 @@ static class TunCfgCheck
         var fb = typeof(TunMode).GetField("_bypassPort", BindingFlags.NonPublic | BindingFlags.Instance);
         Ok(fb != null, "_bypassPort field exists");
         if (fb != null) fb.SetValue(tun, 10805);
-        var yaml = (string)mi.Invoke(tun, new object[] { 10801, "", 1080 });
+        // 1.1.0 起 udpHost 会写进配置，不再只是日志参数；传真实的远端中继地址。
+        var yaml = (string)mi.Invoke(tun, new object[] { 10801, "10.13.24.1", 1080 });
         var path = Path.Combine(dir, "tun-config.yaml");
         File.WriteAllText(path, yaml);
         Console.WriteLine("   wrote " + path + " (" + yaml.Length + " bytes)");
@@ -79,11 +80,36 @@ static class TunCfgCheck
         Ok(udpRule > 0 && udpRule < pn, "A: UDP rule before PROCESS-NAME (mihomo PROCESS-NAME ignores protocol)");
         Ok(yaml.TrimEnd().EndsWith("MATCH,ferry"), "A: MATCH is the last rule");
 
+        // ── 1.1.0：UDP 出口直连远端 + 固定 select（见 CHANGELOG v1.1.0）──
+        // 这两条是 40% 丢包的修复本体，必须钉死，别让下一个人在
+        // 「1080 没有 UDP 监听」的旧注释下把它改回 127.0.0.1 + fallback。
+        int udpBlock = yaml.IndexOf("- name: ferry-udp");
+        string udpSeg = udpBlock > 0 ? yaml.Substring(udpBlock, 160) : "";
+        Ok(udpBlock > 0, "1.1.0: ferry-udp proxy exists");
+        Ok(udpSeg.Contains("server: 10.13.24.1"), "1.1.0: UDP proxy points at remote relay");
+        Ok(udpSeg.Contains("port: 1080"), "1.1.0: UDP proxy uses relay port");
+        Ok(udpSeg.Contains("udp: true"), "1.1.0: UDP proxy keeps udp:true");
+        Ok(yaml.Contains("proxies: [ferry-udp]"), "1.1.0: UDP group is single-member");
+        Ok(CountOf(yaml, "type: fallback") == 1,
+            "1.1.0: only clash-egress stays fallback (UDP drift removed)");
+        Ok(!yaml.Contains("timeout: 2000"), "1.1.0: UDP health-check timeout removed");
+
+        // 参数校验：非法地址要在生成阶段就失败，不能拼出坏 YAML。
+        try
+        {
+            mi.Invoke(tun, new object[] { 10801, "bad host!", 1080 });
+            Ok(false, "1.1.0: invalid udpHost rejected");
+        }
+        catch (TargetInvocationException e)
+        {
+            Ok(e.InnerException is ArgumentException, "1.1.0: invalid udpHost rejected");
+        }
+
         // ── 场景 B：没有检测到本机 Clash（这就是用户机 23:44 的情形）──
         var tun2 = new TunMode(cfg, dir, delegate (string s) { });
         if (f != null) f.SetValue(tun2, 0);
         if (fb != null) fb.SetValue(tun2, 10805);
-        var yaml2 = (string)mi.Invoke(tun2, new object[] { 10801, "", 1080 });
+        var yaml2 = (string)mi.Invoke(tun2, new object[] { 10801, "10.13.24.1", 1080 });
         File.WriteAllText(Path.Combine(dir, "tun-config-noclash.yaml"), yaml2);
         Ok(CountOf(yaml2, "- PROCESS-NAME,") == 26,
             "B: clashPort=0 STILL writes 26 PROCESS-NAME rules (the actual bug)");

@@ -21,14 +21,32 @@ class VerifyTunExclude
     static void Main()
     {
         Console.OutputEncoding = Encoding.UTF8;
-        var asm = Assembly.LoadFrom("渡口助手.exe");
+        // 两种模式：仓库根目录有构建好的 exe 就检查 exe；没有就用当前编译进来的源码
+        // （run-verify.ps1 把整个 src 和本验证器编进同一个程序集）。
+        // 旧版无条件 LoadFrom("渡口助手.exe")，在源码模式下直接 FileNotFoundException，
+        // 连一行输出都没有。
+        Assembly asm = typeof(Ferry.TunMode).Assembly;
+        if (System.IO.File.Exists("渡口助手.exe"))
+        {
+            try { asm = Assembly.LoadFrom(System.IO.Path.GetFullPath("渡口助手.exe")); }
+            catch (Exception e) { Console.WriteLine("   加载 exe 失败，改用源码：" + e.Message); }
+        }
         var t = asm.GetType("Ferry.TunMode");
         if (t == null) { Console.WriteLine("找不到 Ferry.TunMode"); Environment.Exit(2); }
         var m = t.GetMethod("BuildConfig",
             BindingFlags.NonPublic | BindingFlags.Instance);
         if (m == null) { Console.WriteLine("找不到 BuildConfig"); Environment.Exit(2); }
 
-        var inst = Activator.CreateInstance(t, true);
+        // TunMode 自 1.0.x 起只有 TunMode(Cfg, string, Action<string>) 这个构造，
+        // Activator.CreateInstance(t, true) 会抛 MissingMethodException。
+        var cfgType = asm.GetType("Ferry.Cfg");
+        if (cfgType == null) { Console.WriteLine("找不到 Ferry.Cfg"); Environment.Exit(2); }
+        var ctor = t.GetConstructor(new Type[] { cfgType, typeof(string), typeof(Action<string>) });
+        object inst = ctor == null
+            ? Activator.CreateInstance(t, true)
+            : ctor.Invoke(new object[] { Activator.CreateInstance(cfgType),
+                                         System.IO.Path.GetTempPath(),
+                                         (Action<string>)delegate (string s) { } });
         string yaml = (string)m.Invoke(inst, new object[] { 10801, "10.13.24.1", 10802 });
 
         // 抽出 route-exclude-address 段

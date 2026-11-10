@@ -66,12 +66,15 @@ static class RawSocksTest
         Ok(fake.Hits > 0, "foreign went to local proxy");
         Ok(fake.Targets.IndexOf("104.244.42.197") >= 0, "local proxy saw the foreign ip");
 
-        // ③ 域名：本地解析后传 IP（不是把域名丢给上游）
+        // ③ 境外域名：必须把**原始域名**交给 Clash（1.0.23 / 踩坑 73）。
+        // 旧断言要求「本地解析成 IP 再传」，但 TUN 开着 dns-hijack:any:53 时
+        // 本地解析只能拿到 fake-ip，而且国内 DNS 给墙外域名的是污染地址；
+        // 传 IP 会让 Clash 去连假 IP。所以这条断言的方向是反的，已校正。
         fake.Reset();
         var r3 = SocksConnect(rt.HttpPort, "www.google.com", 80);
         Console.WriteLine("   domain socks rep = " + r3 + "   clash hits = " + fake.Hits + "  targets =" + fake.Targets);
-        Ok(fake.Targets.IndexOf("google.com", StringComparison.OrdinalIgnoreCase) < 0,
-           "domain was resolved locally (upstream saw an IP)");
+        Ok(fake.Targets.IndexOf("google.com", StringComparison.OrdinalIgnoreCase) >= 0,
+           "foreign domain forwarded as raw domain (not a possibly polluted IP)");
 
         rt.Stop();
         fake.Stop();

@@ -69,8 +69,16 @@ static class TunSplitCheck
 
         // 境外不能被盖住
         foreach (var s in new[] { "104.16.132.229", "8.8.8.8", "31.13.92.37",
-                                  "140.82.121.4", "20.205.243.166", "1.1.1.1", "162.159.1.1" })
+                                  "140.82.121.4", "20.205.243.166", "162.159.1.1" })
             Ok(!CoveredInFile(parsed, IPAddress.Parse(s)), s + " NOT covered");
+
+        // 1.1.1.1 是 /16 位图的已知精度损失：1.1.0.0/24 属国内、1.1.1.0/24 是
+        // Cloudflare，同一个 /16。AsCidrRules() 是粗粒度 /16 导出（生产分流已不
+        // 用它，TUN 层是 MATCH,ferry），必然盖住 1.1.1.1 —— 这不是 bug。
+        // **生产判定走 CnIpRanges.Contains()**，那里有 IsKnownForeign 例外，
+        // 必须把 1.1.1.1 判成境外，否则 Cloudflare DNS 会被送去渡口而连不上。
+        Ok(CnIpRanges.Contains(IPAddress.Parse("1.1.1.1")) == false,
+           "1.1.1.1 excluded by Contains() despite coarse /16 export");
 
         var dir = @"C:\ferry-test\tunsplit";
         Directory.CreateDirectory(dir);

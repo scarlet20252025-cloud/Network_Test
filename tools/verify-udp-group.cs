@@ -2,12 +2,14 @@ using System;
 using System.Reflection;
 using System.Text;
 
-// 验证 TunMode.BuildConfig 生成的 YAML 里，UDP 组是 fallback 且 DIRECT 在第一位。
+// 验证 TunMode.BuildConfig 生成的 YAML：UDP 出口固定单成员 select + 直连远端。
 //
-// 为什么要这个工具：这条改动是「游戏延迟回归」的修复核心 ——
-// 1.0.26 把 DIRECT 从 ferry-udp-group 里拿掉，导致所有 UDP 都被强制绕远端，
-// 游戏往返路径从「本机 → 目标」变成「本机 → pcs → 目标 → pcs → 本机」。
-// YAML 是拼字符串拼出来的，光读代码容易改错，必须把真实产物拿出来断言。
+// 历史：1.0.26 曾把 DIRECT 放进 ferry-udp-group 做 fallback；1.1.0 实测发现
+// fallback 每 10 秒重判会让会话在两条分支间漂移，断网时段约 40% 丢包，
+// 改成固定 select [ferry-udp] 且直连远端 SOCKS5 后 0% 丢包。
+// 「远端 1080 不监听 UDP」是早期把「裸发固定端口」和「socks5 UDP ASSOCIATE」
+// 混为一谈的误判，见 docs/UDP丢包分层诊断-20261110.md §4.3。
+// YAML 是拼字符串拼出来的，必须把真实产物拿出来断言 —— 别照旧注释把 fallback 加回来。
 static class VerifyUdpGroup
 {
     static int fails;
@@ -68,7 +70,7 @@ static class VerifyUdpGroup
         Ok(yaml != null && yaml.Length > 200, "拿到 YAML 文本", yaml == null ? "" : (yaml.Length + " 字节"));
         if (yaml == null) { Console.WriteLine("FAILED"); Environment.Exit(1); }
 
-        // ── 核心断言：ferry-udp-group ──
+        // ── 核心断言（1.1.0 起）：UDP 组固定单成员 select，出口直连远端 ──
         int gi = yaml.IndexOf("name: ferry-udp-group");
         Ok(gi > 0, "存在 ferry-udp-group");
         if (gi > 0)
@@ -79,24 +81,22 @@ static class VerifyUdpGroup
             foreach (var line in block.Split('\n'))
                 if (line.Trim().Length > 0) Console.WriteLine("    " + line.TrimEnd());
 
-            Ok(block.Contains("type: fallback"), "组类型是 fallback（直连不通能自动降级）");
-            // 断言必须只看 proxies: 那一行。
-            // 之前写成在整个 block 里找 "DIRECT"，会先命中 rules 段里的
-            // IP-CIDR,10.0.0.0/8,DIRECT —— 那是无关的 DIRECT，导致假失败。
-            string proxiesLine = null;
-            foreach (var line in block.Split('\n'))
-                if (line.Trim().StartsWith("proxies:")) { proxiesLine = line.Trim(); break; }
-            Ok(proxiesLine != null, "找到 proxies 行", proxiesLine);
-            int di = proxiesLine == null ? -1 : proxiesLine.IndexOf("DIRECT");
-            int ui = proxiesLine == null ? -1 : proxiesLine.IndexOf("ferry-udp");
-            Ok(di > 0 && ui > 0, "DIRECT 与 ferry-udp 都在列表里");
-            Ok(di > 0 && ui > 0 && di < ui, "DIRECT 排在第一位（= 默认走直连）");
-            Ok(block.Contains("generate_204"), "有测活地址（禁网时才知道该切隧道）");
+            Ok(block.Contains("type: select"), "组类型是 select（固定出口，不漂移）");
+            Ok(!block.Contains("type: fallback"), "没有 fallback 漂移");
+            Ok(block.Contains("proxies: [ferry-udp]"), "只列 ferry-udp 一个成员");
+            Ok(!block.Contains("generate_204"), "没有会周期性重判的测活地址");
         }
 
-        // ── 反回归：确认没有被写死成只走 ferry-udp ──
-        Ok(!yaml.Contains("proxies: [ferry-udp]"),
-           "没有「只列 ferry-udp」的写法（那是 1.0.26 的 bug）");
+        Ok(yaml.Contains("proxies: [ferry-udp]"), "整个配置里 UDP 组是单成员");
+        int udpProxy = yaml.IndexOf("- name: ferry-udp");
+        int udpNext = udpProxy > 0 ? yaml.IndexOf("- name:", udpProxy + 10) : -1;
+        string udpSeg = udpProxy > 0
+            ? yaml.Substring(udpProxy, (udpNext > 0 ? udpNext : yaml.Length) - udpProxy)
+            : "";
+        Ok(udpSeg.Contains("server: 10.13.24.1"), "UDP 出口直连远端中继");
+        Ok(udpSeg.Contains("port: 1080"), "UDP 出口用中继控制端口");
+        Ok(udpSeg.Contains("udp: true"), "保留 socks5 UDP ASSOCIATE");
+        Ok(!udpSeg.Contains("127.0.0.1"), "UDP 出口不再绕本地代理");
 
         Console.WriteLine(fails == 0 ? "ALL PASS" : (fails + " FAILED"));
         Environment.Exit(fails == 0 ? 0 : 1);

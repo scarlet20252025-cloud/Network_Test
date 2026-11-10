@@ -6,8 +6,10 @@ using System.Text;
 using System.Threading;
 using Ferry;
 
-// 验证 1.0.16 的两个修复：
-//   ① fake-ip（198.18.x.x）不再被当成「境外」，也不会被传给上游
+// 验证两件事：
+//   ① fake-ip（198.18.x.x）判为**境外**、且不被替换成真实 IP 传给上游
+//      （踩坑 72：1.0.21 曾把 fake-ip 当国内，结果每个境外请求先撞一次超时，
+//        全网变慢。1.0.16 的旧断言「fake-ip 应判国内」是错的行为，已作废。）
 //   ② 节点模式（AllowTun=false）下不启用 TUN
 static class FixCheck
 {
@@ -36,10 +38,11 @@ static class FixCheck
         foreach (var s in new string[] { "183.2.172.177", "104.16.132.229", "10.13.24.1", "198.17.1.1", "198.20.1.1" })
             Ok(!(bool)isFake.Invoke(null, new object[] { IPAddress.Parse(s) }), s + " is NOT fake-ip");
 
-        // IsDomestic 对 fake-ip 要返回 true
+        // fake-ip 只是占位符，不含任何地理信息，一律当境外（踩坑 72）。
+        // 千万别把它改回 true —— 那就是「全网变慢」那次的错误行为。
         var inst = Activator.CreateInstance(t, new object[] { 18800, 1080, "10.13.24.1", (Action<string>)delegate (string s) { } });
         var isDom = t.GetMethod("IsDomestic", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        Ok((bool)isDom.Invoke(inst, new object[] { "198.18.0.1" }), "IsDomestic(198.18.0.1) == true (fake-ip treated as domestic)");
+        Ok(!(bool)isDom.Invoke(inst, new object[] { "198.18.0.1" }), "IsDomestic(198.18.0.1) == false (fake-ip is foreign)");
 
         // PreferIp 对 fake-ip 要保留原值（不把假 IP 传下去）
         var prefer = t.GetMethod("PreferIp", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);

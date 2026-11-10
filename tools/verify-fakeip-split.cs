@@ -63,7 +63,9 @@ static class SlowFixCheck
         var fc = typeof(TunMode).GetField("_clashPort", BindingFlags.NonPublic | BindingFlags.Instance);
         var bm = typeof(TunMode).GetMethod("BuildConfig", BindingFlags.NonPublic | BindingFlags.Instance);
         if (fc != null) fc.SetValue(tun, 7897);
-        var yaml = (string)bm.Invoke(tun, new object[] { 10801, "", 1080 });
+        // 1.1.0 起 BuildConfig 会校验 udpHost，空串会抛异常。
+        // 传真实的远端中继地址（与 verify-tunconfig.cs / 线上一致）。
+        var yaml = (string)bm.Invoke(tun, new object[] { 10801, "10.13.24.1", 1080 });
         Console.WriteLine("   yaml " + yaml.Length + " bytes");
 
         Ok(yaml.Contains("MATCH,ferry"), "MATCH,ferry present");
