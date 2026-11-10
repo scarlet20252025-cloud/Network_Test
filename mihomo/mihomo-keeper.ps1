@@ -73,13 +73,17 @@ $SshPortCandidates = @(10800, 10801, 10808, 10809)
 
 # UDP 线路：走**本地**代理（客户端自己的 SOCKS，10800/10801）。
 #
-# 以前这里写的是 10.13.24.1:1080，实际一直是坏的：远端 ferry-socks5-server
-# 并不在 1080 监听 UDP —— 它按 RFC 1928，每建立一条 ASSOCIATE 就新开一个
-# 随机 UDP socket，端口放在回复的 BND 里。直接往 1080 发报文只会收到
-# ICMP port unreachable（2026-10-27 实测确认）。
+# 远端 ferry-socks5-server 按 RFC 1928 工作：1080 是控制端口，不监听 UDP；
+# 每建立一条 ASSOCIATE 才新开一个随机 UDP socket，端口放在回复的 BND.PORT 里。
+# 直接往 1080 **裸发** UDP 报文只会收到 ICMP port unreachable（2026-10-27 实测）。
 #
-# 现在客户端本地 SOCKS 补上了 UDP ASSOCIATE（1.0.8），所以 mihomo 只要把 UDP
-# 交给 127.0.0.1:<本地端口>，由客户端去和上游协商真实端口即可。
+# ⚠ 别把这条结论读成「mihomo 指向 10.13.24.1:1080 也不通」：那是两回事。
+#   socks5 + udp:true 会先做 ASSOCIATE 再往 BND 端口发包，直连远端是合法的。
+#   客户端 TUN 那条路已在 v1.1.0 改成直连远端（见 CHANGELOG v1.1.0 第二节）。
+#   这里 keeper 走的是 SSH -D 隧道，没有远端 SOCKS5 中继可用，仍必须走本地。
+#
+# 本地 SOCKS 补上了 UDP ASSOCIATE（1.0.8），mihomo 只要把 UDP 交给
+# 127.0.0.1:<本地端口>，由客户端去和上游协商真实端口即可。
 $UdpHost = '127.0.0.1'
 $UdpPort = 0   # 渲染时换成探测到的本地 SOCKS 端口，见 Build-Config
 

@@ -281,14 +281,22 @@ namespace Ferry
             return list;
         }
 
-        /// <param name="udpHost">上游 UDP 中继地址（仅用于日志/诊断，不写进配置）。
-        /// UDP 现在统一走本地代理的 ASSOCIATE，见 ferry-udp 那段注释。</param>
-        /// <param name="udpPort">同上。</param>
+        /// <param name="udpHost">远端 UDP 中继地址，直接写入 mihomo 的 UDP SOCKS5 出口。</param>
+        /// <param name="udpPort">远端 UDP 中继端口，直接写入 mihomo 的 UDP SOCKS5 出口。</param>
         string BuildConfig(int socksPort, string udpHost, int udpPort)
         {
+            if (string.IsNullOrWhiteSpace(udpHost))
+                throw new ArgumentException("UDP 中继地址不能为空", "udpHost");
+            if (udpPort < 1 || udpPort > 65535)
+                throw new ArgumentOutOfRangeException("udpPort", "UDP 中继端口无效");
+            // udpHost 会原样拼进 YAML：只允许域名/IPv4 字符，避免配置注入或
+            // 生成出 mihomo -t 校验不过的配置。宁可在生成阶段就失败，
+            // 也别等 TUN 起来后才发现 UDP 出口是坏的（那种失败没有报错）。
+            if (!System.Text.RegularExpressions.Regex.IsMatch(udpHost, @"^[A-Za-z0-9.\-]+$"))
+                throw new ArgumentException("UDP 中继地址含非法字符", "udpHost");
             var sb = new StringBuilder();
             sb.AppendLine("# 渡口 TUN 配置（由客户端运行时生成，不要手改）");
-            sb.AppendLine("# 上游指向客户端自己已经跑起来的 SOCKS 端口，TUN 只负责截流量。");
+            sb.AppendLine("# TCP 走客户端本地 SOCKS；UDP 直连远端中继，见 ferry-udp 段注释。");
             sb.AppendLine();
             sb.AppendLine("mode: rule");
             sb.AppendLine("log-level: warning");
@@ -431,20 +439,31 @@ namespace Ferry
             sb.AppendLine("    port: " + socksPort.ToString());
             sb.AppendLine("    udp: false");
             sb.AppendLine();
-            sb.AppendLine("  # UDP：远端 Python 中继（唯一支持 UDP ASSOCIATE 的线路）");
-            // UDP 必须指向**本地代理**，不能指远端 1080。
+            sb.AppendLine("  # UDP：直连远端 SOCKS5 中继（1.1.0，见 CHANGELOG）");
+            // UDP 出口直连远端，不再经本地 ProxyServer 的 UDP ASSOCIATE 转发层。
             //
-            // 远端的 UDP 是「每条 TCP ASSOCIATE 临时开一个随机端口」，1080
-            // 上根本没有 UDP 监听 —— 直发过去只会收到 ICMP port unreachable。
-            // 之前就写错了这一行，所有 UDP 包石沉大海，游戏只能靠重传，
-            // 表现是延迟从几十毫秒突然跳到 130ms+。
+            // 为什么以前写成 127.0.0.1:<socksPort>（1.0.8 ~ 1.0.63）：
+            //   远端中继按 RFC 1928 工作 —— 每条 TCP ASSOCIATE 临时开一个随机
+            //   UDP 端口，端口号放在回复的 BND.PORT 里，1080 上**没有** UDP 监听。
+            //   早期把「直接往固定端口 1080 发裸 UDP 会收到 ICMP port unreachable」
+            //   误当成「mihomo 指向 10.13.24.1:1080 也不通」，于是加了本地转发层。
+            //   2026-11-10 分层诊断把这两件事区分清楚了：mihomo 的
+            //   socks5 + udp:true 会先做 ASSOCIATE 再往 BND 端口发包（实测 BND
+            //   10.13.24.1:55732/55734），直连完全合法。留着本地那层反而多一跳，
+            //   NTP 单发直接超时。mihomo-keeper.ps1 里那段旧注释说的正是被澄清的误判。
             //
-            // 本地代理实现了完整的 UDP ASSOCIATE（向上游要动态端口再转发），
-            // 所以这里指向它：[游戏 → TUN → maxho → 本地代理 → 上游中继]。
+            // 40% 丢包的真正根因不是这一跳，而是下面的 ferry-udp-group 用了
+            // fallback：禁网时段 DIRECT 永久失败，10 秒一次重判让 UDP 会话在两条
+            // 候选间漂移。实测修前 60/100 收包 p50 45.9ms，修后 100/100 p50 39.7ms。
+            //
+            // udpHost/udpPort 来自 Cfg（默认 RemoteHost:1080），由 FerryRuntime 传入。
+            // ⚠ 服务端回复的 BND.ADDR 是 0.0.0.0，客户端必须按控制连接的对端地址
+            //   还原（踩坑 84：hev 曾把它 connect 成回环，UDP 全进本机）。换用不做
+            //   这层还原的内核时要显式配 udp-address，别改成裸发 1080。
             sb.AppendLine("  - name: ferry-udp");
             sb.AppendLine("    type: socks5");
-            sb.AppendLine("    server: 127.0.0.1");
-            sb.AppendLine("    port: " + socksPort.ToString());
+            sb.AppendLine("    server: " + udpHost);
+            sb.AppendLine("    port: " + udpPort.ToString());
             sb.AppendLine("    udp: true");
             sb.AppendLine();
             // 直通上游：翻墙客户端自己连机场的出站走这里。
@@ -488,8 +507,9 @@ namespace Ferry
                 // 还在往直连上撞，表现为「刚断网那半分钟，翻墙完全不通」。
                 // 10 秒把最坏等待压到 10 秒内，代价是每分钟多 3 次轻量
                 // HEAD 请求（generate_204 无正文，可忽略）。
-                // 和下面 ferry-udp-group 的 interval 保持一致，两个 fallback
-                // 用同一个判据、同一个节奏，行为更好预测。
+                // 1.1.0 起下面的 ferry-udp-group 已改成固定 select，不再有
+                // fallback 节奏；这里是 TCP 侧唯一剩下的 fallback，判据仍用
+                // generate_204，因为它问的正是「物理出口能不能直连」。
                 sb.AppendLine("    interval: 10");
                 sb.AppendLine("    timeout: 3000");
             }
@@ -515,33 +535,20 @@ namespace Ferry
             // 0.9.30 完全没问题」，根因就在这里 —— 不是 0.9.30 做对了什么，
             // 而是它的 UDP 压根没走隧道。
             sb.AppendLine("    proxies: [DIRECT, ferry-udp]");
-            // 自动档：先试直连，直连不通（校园网禁网时段）才落到隧道。
+            // UDP 组固定只走 ferry-udp（1.1.0）。
             //
-            // 为什么用 fallback 而不是直接给 DIRECT：
-            //   禁网时段 UDP 直连必然失败，那时如果还硬走 DIRECT，
-            //   游戏/语音就彻底不通了 —— 而用户开渡口正是为了这个时候能用。
-            //   fallback 按 url 测活，正好同时满足两种场景。
+            // 原来是 fallback [DIRECT, ferry-udp] + 10 秒健康检查：禁网时段物理
+            // 网卡没过 Portal 认证，DIRECT 永久失败，mihomo 周期性重判会让 UDP
+            // 会话在两条分支间漂移，约 40% 的包落到不通的那条。改成单成员
+            // select 后路径固定，和 TCP 侧的 `ferry` 组处理方式一致。
             //
-            // fallback 的确切语义（从 mihomo 二进制的日志字符串确认过）：
-            //   按列表顺序检查，用第一个不失败的；持续做健康检查
-            //   （"Start New Health Checking"），失败就换下一个
-            //   （"first failed" / "failed count: %d"）。
-            //   所以 [DIRECT, ferry-udp] = 有网走直连、禁网自动落隧道、
-            //   网络恢复又切回来，不需要额外逻辑。
-            //
-            // 测活地址和 clash-egress 用同一个国内 generate_204：
-            //   有网时 DIRECT 通、禁网时不通，判据和「能不能直连」一致。
-            //
-            // interval 用 10 秒而不是 30 秒：禁网那一刻，DIRECT 已经不通了，
-            // 但 fallback 要等下一轮健康检查才会切走 —— 这中间的空白期里
-            // 游戏 UDP 还在往直连上撞。10 秒把最坏等待压到 10 秒以内，
-            // 代价是每分钟多 6 次轻量 HEAD 请求（generate_204 无正文，可忽略）。
+            // 代价（必须知道）：有网时段国内 UDP 也会绕一趟远端，不再走 DIRECT。
+            // 渡口的典型场景就是禁网时段，那时 DIRECT 本来就不可用，所以是净收益。
+            // ferry-udp-manual 组虽然还列着 DIRECT，但 rules 只引用本组；
+            // 真要恢复「有网走直连」，改的是这里，不是那个手动档。
             sb.AppendLine("  - name: ferry-udp-group");
-            sb.AppendLine("    type: fallback");
-            sb.AppendLine("    proxies: [DIRECT, ferry-udp]");
-            sb.AppendLine("    url: 'http://connect.rom.miui.com/generate_204'");
-            sb.AppendLine("    interval: 10");
-            sb.AppendLine("    timeout: 2000");
+            sb.AppendLine("    type: select");
+            sb.AppendLine("    proxies: [ferry-udp]");
             sb.AppendLine();
             sb.AppendLine("rules:");
             // 规则顺序是设计的一部分，别随手调：

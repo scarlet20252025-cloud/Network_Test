@@ -363,10 +363,8 @@ async def _open_via_clash(host, port):
             req += ipobj.packed
         else:
             try:
-                hb = host.encode('idna') if not host.isascii() else host.encode('ascii')
-            except Exception:
-                hb = host.encode('ascii', 'ignore')
-            if len(hb) > 255:
+                hb = encode_socks5_domain(host)
+            except ValueError:
                 w.close()
                 return None
             req.append(3)
@@ -649,6 +647,42 @@ async def pipe(reader, writer, label, counter, limiter=None):
             pass
 
 
+# ───────── 域名编解码（TCP CONNECT / Clash 出站 / UDP 头共用）─────────
+# 位置在 _race_clash 之后，但模块加载完才进事件循环，调用时必然已定义。
+# 两份副本（relay / wireguard）保持同一位置，方便逐行对账。
+
+def decode_socks5_domain(raw):
+    """解 SOCKS5 ATYP=3 的域名字节；非法 IDNA 一律拒绝，不做静默降级。
+
+    为什么不能用 ascii + ignore 兜底：那会把非法字节**直接删掉**，
+    含 0xFF 的 evil.example 变体会被改成 evil.example —— 连接被发到另一台主机。
+    对借网中继而言这既是分流绕过，也是把数据投递给了错误目标。
+    宁可回 SOCKS5 失败让客户端另作决定，也不能猜一个域名出来。
+    """
+    try:
+        host = raw.decode('idna')
+    except UnicodeError as e:
+        raise ValueError('SOCKS5 域名不是有效 IDNA') from e
+    if not host:
+        raise ValueError('SOCKS5 域名为空')
+    return host
+
+
+def encode_socks5_domain(host):
+    """把 Unicode 主机名编回 SOCKS5 域名字节；非法/超长一律拒绝。
+
+    与 decode 对称：旧代码在这里用 ascii + ignore 兜底，
+    会把带变音符号的国际化域名悄悄改成另一个域名。
+    """
+    try:
+        hb = host.encode('idna') if not host.isascii() else host.encode('ascii')
+    except UnicodeError as e:
+        raise ValueError('主机名不是有效 IDNA') from e
+    if not hb or len(hb) > 255:
+        raise ValueError('SOCKS5 域名为空或超过 255 字节')
+    return hb
+
+
 # ────────────────────────── UDP 中继 ──────────────────────────
 
 def parse_socks5_udp(data):
@@ -683,10 +717,11 @@ def parse_socks5_udp(data):
         if n == 0 or len(data) < off + 1 + n:
             raise ValueError('UDP 头域名不完整')
         raw = data[off + 1:off + 1 + n]
+        # 与 TCP CONNECT 共用同一套严格解码：两条通路对同一域名必须得出
+        # 同一结论，否则「TCP 拒绝、UDP 放行」又是一次分流绕过。
         try:
-            # idna 编码器不支持 errors='replace'；非法 IDNA 直接丢弃。
-            host = raw.decode('idna')
-        except UnicodeError as e:
+            host = decode_socks5_domain(raw)
+        except ValueError as e:
             raise ValueError('UDP 头域名不是有效 IDNA') from e
         off += 1 + n
     elif atyp == 4:                                 # IPv6
@@ -992,13 +1027,18 @@ async def handle(client_reader, client_writer, nets, udp_enabled):
         elif atyp == 3:
             n = (await client_reader.readexactly(1))[0]
             raw = await client_reader.readexactly(n)
-            # SOCKS5 的域名是 IDNA 编码。注意 'idna' 是**编码名**，
-            # 不能当 errors 参数用 —— 写成 decode('idna','ignore') 会抛
-            # "Unsupported error handling: ignore"，连接直接断。
+            # 非法 IDNA 宁可回 SOCKS5 失败：静默删字节会把连接指向另一台主机。
+            # 注意 'idna' 是**编码名**，不能当 errors 参数用 ——
+            # 写成 decode('idna','ignore') 会抛 "Unsupported error handling"。
             try:
-                host = raw.decode('idna')
-            except Exception:
-                host = raw.decode('ascii', 'ignore')
+                host = decode_socks5_domain(raw)
+            except ValueError as e:
+                log('%s 域名非法，拒绝 CONNECT: %s' % (peer_ip, e))
+                # 0x04 = Host unreachable：域名没法安全还原，别让客户端重试成别的主机
+                client_writer.write(b'\x05\x04\x00\x01' + b'\x00' * 6)
+                await client_writer.drain()
+                client_writer.close()
+                return
         elif atyp == 4:
             raw = await client_reader.readexactly(16)
             host = str(ipaddress.ip_address(raw))
