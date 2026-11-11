@@ -29,16 +29,16 @@ function Stat($label, $gapMs, $n) {
         if ($gapMs -gt 0) { Start-Sleep -Milliseconds $gapMs }
     }
     if ($t.Count -eq 0) {
-        Write-Output ("  {0,-20} 全部失败（丢 {1}/{2}）" -f $label, $lost, $n)
+        Write-Host ("  {0,-20} 全部失败（丢 {1}/{2}）" -f $label, $lost, $n)
         return $null
     }
     $s = $t | Sort-Object
     $p50 = $s[[math]::Floor($s.Count * 0.5)]
     $p95 = $s[[math]::Min($s.Count - 1, [math]::Floor($s.Count * 0.95))]
     $avg = [math]::Round(($s | Measure-Object -Average).Average, 1)
-    Write-Output ("  {0,-20} n={1,2} min={2,3} p50={3,3} p95={4,3} avg={5,5} max={6,3}  丢{7}" -f `
+    Write-Host ("  {0,-20} n={1,2} min={2,3} p50={3,3} p95={4,3} avg={5,5} max={6,3}  丢{7}" -f `
         $label, $s.Count, $s[0], $p50, $p95, $avg, $s[$s.Count-1], $lost)
-    return @{ p50 = $p50; p95 = $p95 }
+    return [pscustomobject]@{ p50 = $p50; p95 = $p95 }
 }
 
 Write-Output ("=== 延迟分布  目标 " + $Target + " ===")

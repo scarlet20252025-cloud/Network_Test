@@ -48,7 +48,7 @@ static class UdpRelayCheck
 
     static void Main()
     {
-        // ── 1) 生成的配置里 ferry-udp 必须指向本地 ──
+        // ── 1) 生成的配置里 ferry-udp 必须直连远端 SOCKS5 relay ──
         var dir = @"C:\ferry-test\udpcheck";
         System.IO.Directory.CreateDirectory(dir);
         var cfg = new Cfg();
@@ -61,9 +61,9 @@ static class UdpRelayCheck
         Ok(i > 0, "ferry-udp block exists");
         var block = yaml.Substring(i, Math.Min(160, yaml.Length - i));
         Console.WriteLine("   " + block.Replace("\n", " | ").Replace("\r", ""));
-        Ok(block.Contains("server: 127.0.0.1"),
-           "ferry-udp points to 127.0.0.1 (not the remote host)");
-        Ok(block.Contains("port: 10801"), "ferry-udp uses the local proxy port");
+        Ok(block.Contains("server: 10.13.24.1"),
+           "ferry-udp points to the remote relay host");
+        Ok(block.Contains("port: 1080"), "ferry-udp uses the remote relay port");
         Ok(block.Contains("udp: true"), "udp enabled on the outbound");
 
         // ── 2) 真的发一个 UDP DNS 查询，看能不能收到应答 ──

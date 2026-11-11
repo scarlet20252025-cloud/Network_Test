@@ -295,20 +295,26 @@ powershell -ExecutionPolicy Bypass -File tools\build-apk-remote.ps1    # BUILD S
   - 所以**没有照抄**，保留逐条的访问日志（含域名/字节数/via）
   - 工具：`tools/bench-log-flush.py`（自带反向对照）
 
-- [ ] **P0 · CS2 延迟实测 —— 仍未闭环，需要用户配合**
-  - 用户 11:27 报：`延迟 77ms / 抖动 177ms / 错过 10.5%`；11:45 说「有的时候还是有点卡」
-  - **本轮新数据（重要）**：13:00 同一时刻对比 100 包
-    ```
-    网关 10.141.56.1 : p50=4  p90=12 p99=36  max=36    >100ms=0
-    pcs  10.13.24.1  : 第一次 p50=11 p90=136 p99=934 max=934 >100ms=11/100
-                       第二次 p50=4  p90=9  p99=16  max=16  >100ms=0
-    ```
-    → **间歇性、成簇出现**，不是稳定劣化；同一次会话内两次差两个数量级
-  - 64Hz 经 echo 服务实测（128 包）：`p50=5.6 p90=13.5 p99=34.0 max=34.2 丢失 0`
-  - 待确认：卡的时候走的是**直连还是借网**？两者性质完全不同
-  - 下一步：找一个能复现卡顿的窗口，同时跑 `tools/measure-64hz.py`
-    与 ping pcs，看尖峰是否成簇、是否与某个客户端的大流量对齐
+- [ ] **P0 · CS2 延迟实测 —— 当前链路已完成一轮 64Hz 基线，坏窗口仍需现场复现**
+  - 历史坏窗口：网关 p50=4、p90=12、max=36；pcs 第一次 p50=11、p90=136、p99=934、max=934（>100ms 为 11/100），第二次 p50=4、p90=9、p99=16、max=16。特征是间歇性、成簇出现，不能归因于稳定的连接池饱和。
+  - 本轮（2026-11-10，部署前）：网关连续探测 p50=3ms，120ms 间隔 p50=8ms；没有省电型节奏差异。pcs 生产 relay 的 TCP CONNECT + HTTP 响应为 100/100，UDP ASSOCIATE + 域名回显为 100/100，DNS UDP 探测为 10/10。部署前 PID 15332 的脚本 SHA-256 与当时仓库 relay 版本一致：`45D90F6D8BC674C1936B239BF68B986C6276BFA7933B3473CAF54302CC1EA720`。
+  - 本轮 256 包 64Hz 纯 TCP 链路：p50=6.2ms、p90=17.1ms、p99=42.4ms、max=48.1ms、丢失 0/256；超过 40ms 的包为 3/256（1%）。测试使用临时 SYSTEM 任务，测完已停止并删除，19100 已关闭；该结果是部署前基线。
+  - 用户于 2026-11-11 提供慢窗口截图：国内走渡口，站点测速约 435–1310ms；境外经本机代理，Cloudflare 175ms、Google 2678ms 且 2/3 失败。实现每站测 3 次并显示成功样本平均值，不是中位数；少量秒级尾延迟会显著抬高显示值。测速为 TCP 建连 + TLS 握手，游戏 UDP 延迟不能代表该 TCP 路径。
+  - USTC 测速截图显示 RTT 61ms、抖动 2415ms，截图表中近期吞吐峰值约 967Mbps。时间戳约 01:20:28，与 Ferry 日志 01:20:22 的 4 次“渡口→本机代理”线路级回退、01:20:33 测速国内 746ms/失败 1 次相邻；01:21 起 Mihomo 连续报告 `clash-egress` 多次失败并触发健康检查。该窗口出现多出口 TCP 重试，测速负载导致排队/抖动是候选原因，但尚未用空载/满载 RTT 对照证明因果。
+  - 同目标 `www.baidu.com:443` 对照：pcs 本机直连 TLS 1.2 为 5/5、总耗时 45–61ms；直连 pcs SOCKS `10.13.24.1:1080` TLS 1.2 为 5/5 HTTP 200，4 次 71–91ms、1 次 2.60s；本机渡口 `10801` TLS 1.2 也为 5/5 HTTP 200，4 次 64–97ms、1 次 1.30s。本机 Clash `7897` 的 TLS 探测 5/5、p50=177ms。relay 域名解析路径 5/5 为 88–116ms，固定百度 IP 路径仍出现 2.57s 慢尾，排除 DNS 是唯一原因。PCS 对目标固定 IP 的直连 TLS 1.2 又为 5/5、22–57ms。
+  - 远端运行参数只读确认：部署前 PID 15332 监听 1080，`--clash-proxy` 为默认关闭。原 `_open_upstream` 对目标 TCP `open_connection` 使用 2.5s 单次超时并重试；注释记录曾观察到上游 SYN 偶发丢失。2.57s relay 慢样本与超时重试时长相符。隔离 trace 后确认慢尾发生在 pcs relay 到目标的 TCP 建连首尝试，而不是 DNS 或本机到 pcs 的 SOCKS 握手。
+  - 2026-11-11 21:28 隔离复现（不碰生产 1080）：将当前 relay 复制到 pcs 临时 `11080`，开启新增但默认关闭的 `--trace-upstream`，经 SSH 临时转发对 `www.baidu.com:443` 做 20 次 SOCKS/TLS 分层探测。结果 20/20 成功，SOCKS 请求阶段 p50=374ms、p95=2787ms，TLS p50=508ms；relay trace 明确出现两次 `direct attempt=1 fail elapsed=2.504–2.506 error=TimeoutError`，随后 `attempt=2 ok elapsed=35–38ms`，其余首尝试约 31–42ms。DNS 首次解析 7ms，后续均为缓存命中。隔离进程、端口转发和临时目录已清理。
+  - 2026-11-11 21:51–21:53 隔离 A/B：只把单次 direct attempt 从 2.5s 改为 1.0s，保留最多 3 次重试和其他逻辑。百度 `60/60` 成功，请求 p50=209ms、p95=1213ms；trace 中 4 次首尝试在 1.012–1.014s 超时，第二次约 19ms 成功。腾讯 `20/20`，请求 p95=1113ms；阿里 `19/20`，唯一失败为本地 SSH 转发端口 `EADDRINUSE@tcp`，发生在 SOCKS 前且不是 relay 失败。由此选择 1.0s，风险是极慢但可达的单次 TCP 建连可能在三次尝试内都被提前判定失败；当前样本未出现该情况。
+  - 已在本地 relay 增加默认关闭的 `--trace-upstream` 分段观测和自包含验证器 `tools/verify-upstream-trace.py`，并将阈值提为 `DIRECT_ATTEMPT_TIMEOUT = 1.0`；仅记录 DNS/每次 direct attempt 及异常，不改变路由或最大重试次数。`py_compile`、观测模拟、`verify-regression-guard`、`verify-fallback`、`verify-pump`、`verify-udprelay` 均通过。
+  - 2026-11-11 22:01 已部署至生产 `C:\Users\PCserver\AppData\Local\Ferry\ferry-socks5-server.py`：保留备份 `ferry-socks5-server.py.bak-20261111-220143`，按既有 `FerrySocks5` 任务执行 End→Run；活动 hash `96DA07D7969164531C06DC03F1182032CAB20BB86EC9885D4ECE24960F45017D`，新 PID `6832` 监听 `0.0.0.0:1080`，任务运行且阈值标记存在。部署后本机 10801 对百度 `20/20`，SOCKS 请求 p50=93ms、p95=1088ms；UDP ASSOCIATE/DNS 回包 `ALL PASS`。
+  - 初始未统一 TLS 的小样本曾有 `ECONNRESET`，统一 TLS 1.2 后 5 次对照均成功，不能据初始结果单独归因本机客户端。当前证据支持经 SOCKS relay 访问时存在偶发 TCP/TLS 尾延迟；PCS 直连及 UDP 低延迟不能排除 relay 目标连接/网络路径抖动，连接上限也没有触顶证据。
+  - 结论：当前基线排除 pcs relay 连接池硬上限和本机无线省电为即时根因；历史尖峰仍表现为上游/无线或跨段队列的间歇性问题。本机当前只有 `verge-mihomo` PID 17184 监听 7897，由 `Clash Verge` 任务启动；没有 `mihomo-keeper` 进程或任务，因此仓库 keeper 模板不是本轮在线流量的实际配置来源。实测 mihomo 出站使用本机 `10.141.57.14` 直接连接目标，没有连接 `10.13.24.1:1080` 或本机 Ferry 端口；当前 Clash 配置是 `mixed-port=7897`、`mode=rule`、`tun.enable=false`、系统代理开启，活动 profile 选中香港 IEPL 节点。pcs/Ferry 基线不能直接代表当前 Clash 游戏链路。当前活动目标 TCP 建连也正常：`14.116.174.67:443` 为 32/32、p50 12.8ms、p95 32.1ms；`103.28.54.102:27019` 和 `125.94.54.107:14564` 各 16/16，p95 分别 29.9ms 和 34.2ms。若用户再次报告卡顿，需要在坏窗口同时采集 64Hz RTT、pcs ping、当前 mihomo 路径和流量负载。
 
+- [x] **UDP relay 与连接上限回归复核（2026-11-10）**
+  - 双副本 parser（relay/wireguard）全部通过：4 个合法 + 7 个非法 UDP 头、2 个合法 + 2 个非法域名用例均符合严格拒绝规则。
+  - `verify-tunconfig`、`verify-connqueue`、`verify-udpassoc-cap`、`verify-udp-group`、`verify-regression-guard`、`verify-fallback`、`verify-pump` 全部 PASS。
+  - `verify-udprelay` 原先的两条失败是旧断言，错误要求 `127.0.0.1:10801`；已改为断言当前远端 `10.13.24.1:1080`，真实 UDP 测试随即 ALL PASS。
+  - 工作树只增加这条验证器断言修正；未改客户端运行逻辑、TUN 配置或远端服务。
 - [ ] **手机 WiFi 掉线问题**
   - 10-30 07:10 观察到：`Wifi is connected` 但 `wlan0` 没有 IP，
     `ip route` 只剩 tun0 一条

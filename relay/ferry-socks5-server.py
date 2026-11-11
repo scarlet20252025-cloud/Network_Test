@@ -259,6 +259,11 @@ _rate_conf_mtime = -1.0
 CLASH_PROXY = None              # (host, port) or None (disabled)
 CLASH_FALLBACK_TIMEOUT = 0.9    # direct attempt timeout
 DIRECT_HEAD_START = 0.20        # how long direct may win exclusively
+TRACE_UPSTREAM = False           # opt-in only: detailed outbound timing logs
+# A single lost SYN used to cost 2.5s before the retry.  Isolated A/B
+# (60x baidu + 20x qq + 19x aliyun; one local tunnel EADDRINUSE excluded)
+# showed the same retry recovery with a 1.0s cap and a much smaller tail.
+DIRECT_ATTEMPT_TIMEOUT = 1.0
 
 # Timing budget (measured on the real link):
 #   domestic sites complete the TCP connect in ~100ms -> 0.20s head start
@@ -330,6 +335,12 @@ def _resolve_clash_proxy(spec):
         except ValueError:
             return None
     return None
+
+
+def _trace_upstream(msg):
+    """Optional outbound timing trace; off in production unless explicitly enabled."""
+    if TRACE_UPSTREAM:
+        log('upstream trace: %s' % msg)
 
 
 async def _open_via_clash(host, port):
@@ -435,8 +446,11 @@ async def _open_upstream(host, port, peer_ip):
     # 线程池满了之后正常域名也跟着排队，表现为 8 秒超时 + SOCKS5 REP5。
     # 2026-11-05 实测：pcs 本机串行直连 0%% 失败，经中继 4~8%% 失败。
     _orig_host = host
+    _trace_t0 = time.monotonic()
     _cached_ip = _dns_cache_get(host)
     if _cached_ip:
+        _trace_upstream('%s:%d dns=cache ip=%s elapsed=%.3f' %
+                        (_orig_host, port, _cached_ip, time.monotonic() - _trace_t0))
         host = _cached_ip
     else:
         # 必须用我们自己的线程池解析，不能把域名直接丢给
@@ -445,32 +459,47 @@ async def _open_upstream(host, port, peer_ip):
         # 一群解析不出来的境外域名就能把它占满，正常域名跟着排队，
         # 最后表现为 8 秒超时 + SOCKS5 REP5。
         # 2026-11-05 实测：间隔 2 秒 12/12 成功；间隔 0.12 秒 4~12% 失败。
+        _dns_t0 = time.monotonic()
         try:
             _loop = asyncio.get_event_loop()
             _resolved = await _loop.run_in_executor(
                 _dns_executor_global(), _resolve_sync, host, port)
             if _resolved:
                 _dns_cache_put(host, _resolved)
+                _trace_upstream('%s:%d dns=resolve ip=%s elapsed=%.3f' %
+                                (_orig_host, port, _resolved, time.monotonic() - _dns_t0))
                 host = _resolved
-        except Exception:
-            pass
+            else:
+                _trace_upstream('%s:%d dns=no-result elapsed=%.3f' %
+                                (_orig_host, port, time.monotonic() - _dns_t0))
+        except Exception as e:
+            _trace_upstream('%s:%d dns=error elapsed=%.3f error=%s' %
+                            (_orig_host, port, time.monotonic() - _dns_t0,
+                             _exc_text(e)))
 
     if not CLASH_PROXY:
         # 2026-11-05: pcs upstream drops ~5-10% of SYNs (measured on plain
         # socket too). SOCKS5 has not replied yet, so retry transparently.
-        _t = 2.5          # shorten single attempt: 3 x 2.5s beats 1 x 8s
+        _t = DIRECT_ATTEMPT_TIMEOUT
         _tries = 0
         while True:
             _tries += 1
+            _attempt_t0 = time.monotonic()
             try:
                 r, w = await asyncio.wait_for(
                     asyncio.open_connection(host, port, family=socket.AF_INET),
                     timeout=_t)
+                _trace_upstream('%s:%d direct attempt=%d ok elapsed=%.3f' %
+                                (_orig_host, port, _tries,
+                                 time.monotonic() - _attempt_t0))
                 break
-            except Exception:
+            except Exception as e:
+                _trace_upstream('%s:%d direct attempt=%d fail elapsed=%.3f error=%s' %
+                                (_orig_host, port, _tries,
+                                 time.monotonic() - _attempt_t0, _exc_text(e)))
                 if _tries >= 3:
                     raise
-                _t = 2.5
+                _t = DIRECT_ATTEMPT_TIMEOUT
         if host == _orig_host:
             try:
                 _pr = w.get_extra_info('peername')
@@ -1249,6 +1278,8 @@ async def main():
     ap.add_argument('--clash-proxy', default='off',
                     help='local proxy used when direct fails, e.g. 127.0.0.1:7890. '
                          'auto (default) = probe common ports; off = disable')
+    ap.add_argument('--trace-upstream', action='store_true',
+                    help='log DNS and direct outbound attempt timing (default off)')
     args = ap.parse_args()
 
     nets = []
@@ -1260,8 +1291,9 @@ async def main():
     rate_bps = int(max(0.0, args.rate_mb) * 1024 * 1024)
     RATES = RateTable(rate_bps)
 
-    global CLASH_PROXY
+    global CLASH_PROXY, TRACE_UPSTREAM
     CLASH_PROXY = _resolve_clash_proxy(args.clash_proxy)
+    TRACE_UPSTREAM = bool(args.trace_upstream)
 
     conf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), RATE_CONF_NAME)
 
